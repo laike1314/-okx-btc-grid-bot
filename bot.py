@@ -1,53 +1,86 @@
+import os
+import json
+import hmac
+import base64
+import hashlib
+from datetime import datetime, timezone
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 
-urls = [
-    "https://openapi.okx.com/api/v5/market/ticker?instId=BTC-USDT",
-    "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT",
-    "https://us.okx.com/api/v5/market/ticker?instId=BTC-USDT",
-    "https://eea.okx.com/api/v5/market/ticker?instId=BTC-USDT",
-]
+BASE_URL = "https://openapi.okx.com"
 
-for url in urls:
-    print("\n==============================")
-    print("测试:", url)
+API_KEY = os.environ["OKX_API_KEY"]
+SECRET_KEY = os.environ["OKX_SECRET_KEY"]
+PASSPHRASE = os.environ["OKX_PASSPHRASE"]
 
-    try:
-        req = Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            }
+
+def iso_time():
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+timestamp = iso_time()
+path = "/api/v5/account/balance"
+
+message = timestamp + "GET" + path
+
+sign = base64.b64encode(
+    hmac.new(
+        SECRET_KEY.encode(),
+        message.encode(),
+        hashlib.sha256,
+    ).digest()
+).decode()
+
+headers = {
+    "Content-Type": "application/json",
+    "x-simulated-trading": "1",
+    "OK-ACCESS-KEY": API_KEY,
+    "OK-ACCESS-SIGN": sign,
+    "OK-ACCESS-TIMESTAMP": timestamp,
+    "OK-ACCESS-PASSPHRASE": PASSPHRASE,
+}
+
+req = Request(
+    BASE_URL + path,
+    headers=headers,
+    method="GET",
+)
+
+print("================================")
+print(" OKX Demo 私有 API 测试")
+print("================================")
+
+try:
+    with urlopen(req, timeout=15) as response:
+        body = response.read().decode(
+            "utf-8",
+            errors="replace"
         )
 
-        with urlopen(req, timeout=15) as response:
-            data = response.read().decode(
-                "utf-8",
-                errors="replace"
-            )
+        print("HTTP:", response.status)
+        print(body)
 
-            print("HTTP:", response.status)
-            print(data[:500])
+except HTTPError as e:
+    print("HTTP:", e.code)
 
-    except HTTPError as e:
-        print("HTTP:", e.code)
+    try:
+        body = e.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+        print("OKX 返回:")
+        print(body)
+    except Exception:
+        pass
 
-        try:
-            body = e.read().decode(
-                "utf-8",
-                errors="replace"
-            )
-            print(body[:500])
-        except Exception:
-            pass
+except Exception as e:
+    print(type(e).__name__)
+    print(str(e))
 
-    except URLError as e:
-        print("网络错误:", e)
-
-    except Exception as e:
-        print("错误:", type(e).__name__)
-        print(str(e))
-
-print("\n==============================")
-print("域名诊断完成")
-print("==============================")
+print("================================")
+print("测试结束")
+print("================================")
