@@ -35,9 +35,11 @@ sign = base64.b64encode(
     ).digest()
 ).decode()
 
-headers = {
+headers = {headers = {
     "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0",
     "x-simulated-trading": "1",
+}
     "OK-ACCESS-KEY": API_KEY,
     "OK-ACCESS-SIGN": sign,
     "OK-ACCESS-TIMESTAMP": timestamp,
