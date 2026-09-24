@@ -60,8 +60,22 @@ def request(method, path, params=None, body=None, private=False):
         method=method.upper()
     )
 
+    try:
     with urlopen(req, timeout=15) as response:
         return json.loads(response.read().decode())
+except Exception as e:
+    print("\n===== OKX API ERROR =====")
+    print(type(e).__name__)
+    print(str(e))
+
+    if hasattr(e, "read"):
+        try:
+            print(e.read().decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+
+    print("=========================\n")
+    raise
 
 
 def main():
