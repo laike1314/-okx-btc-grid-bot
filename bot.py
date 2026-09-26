@@ -20,6 +20,32 @@ import requests
 
 # OKX BTC 永续自动交易模拟盘
 
+#
+
+# 核心规则：
+
+# 1. 只使用已经收盘的 5m K线
+
+# 2. 必须连续 3 根K线确认同一方向
+
+# 3. 3根中任何一根 WAIT / 反向，都不下单
+
+# 4. 开仓后忽略后续方向变化
+
+# 5. 持仓只由 TP / SL 平仓
+
+# 6. 平仓后至少等待 5 分钟再寻找下一次开仓
+
+# 7. 杠杆根据信号强度在 5x~20x 自动调整
+
+# 8. 输出每笔平仓的已实现盈亏、手续费和净盈亏
+
+# ============================================================
+
+# ============================================================
+
+# OKX API
+
 # ============================================================
 
 API_KEY = os.getenv("OKX_API_KEY")
@@ -46,9 +72,13 @@ TD_MODE = "cross"
 
 BAR = "5m"
 
-# 每20秒检查
+# 每20秒检查一次
 
 LOOP_SECONDS = 20
+
+# 平仓后至少等待一个完整5分钟周期
+
+POST_CLOSE_COOLDOWN_SECONDS = 5 * 60
 
 # ============================================================
 
@@ -86,7 +116,7 @@ ATR_SL_MULTIPLIER = 1.5
 
 RISK_REWARD = 1.8
 
-# 每笔最多使用账户权益8%作为保证金
+# 每笔交易最多使用账户权益 8% 作为保证金
 
 MAX_MARGIN_PCT = 0.08
 
@@ -96,29 +126,29 @@ MIN_LEVERAGE = 5
 
 MAX_LEVERAGE = 20
 
-# 最低信号分数
+# 单根K线最低信号分数
 
 MIN_SIGNAL_SCORE = 4
 
-# 连续亏损保护
+# 必须连续几根K线确认
 
-MAX_CONSECUTIVE_LOSSES = 3
-
-LOSS_COOLDOWN_SECONDS = 30 * 60
+CONFIRM_CANDLES = 3
 
 # ============================================================
 
-# 全局变量
+# 全局状态
 
 # ============================================================
 
 instrument = None
 
+# 最近已经处理过的确认K线
+
 last_processed_candle = None
 
-cooldown_until = 0
+# 平仓后冷却截止时间
 
-consecutive_losses = 0
+trade_cooldown_until = 0
 
 # 已经显示过的成交ID
 
@@ -126,7 +156,7 @@ reported_close_trades = set()
 
 # ============================================================
 
-# 配置检查
+# 基础配置检查
 
 # ============================================================
 
@@ -140,33 +170,73 @@ def check_config():
 
     if not API_KEY:
 
-        raise Exception("缺少环境变量 OKX_API_KEY")
+        raise Exception(
+
+            "缺少环境变量 OKX_API_KEY"
+
+        )
 
     if not SECRET_KEY:
 
-        raise Exception("缺少环境变量 OKX_SECRET_KEY")
+        raise Exception(
+
+            "缺少环境变量 OKX_SECRET_KEY"
+
+        )
 
     if not PASSPHRASE:
 
-        raise Exception("缺少环境变量 OKX_PASSPHRASE")
+        raise Exception(
 
-    print("OKX_API_KEY    : 已读取")
+            "缺少环境变量 OKX_PASSPHRASE"
 
-    print("OKX_SECRET_KEY : 已读取")
+        )
 
-    print("OKX_PASSPHRASE : 已读取")
+    print(
 
-    print("模拟盘         : 是")
+        "OKX_API_KEY    : 已读取"
 
-    print("交易品种       :", INST_ID)
+    )
 
-    print("K线            :", BAR)
+    print(
+
+        "OKX_SECRET_KEY : 已读取"
+
+    )
+
+    print(
+
+        "OKX_PASSPHRASE : 已读取"
+
+    )
+
+    print(
+
+        "模拟盘         : 是"
+
+    )
+
+    print(
+
+        "交易品种       :",
+
+        INST_ID
+
+    )
+
+    print(
+
+        "K线            :",
+
+        BAR
+
+    )
 
     print()
 
 # ============================================================
 
-# 获取 OKX 服务器时间
+# OKX服务器时间
 
 # ============================================================
 
@@ -188,7 +258,9 @@ def get_server_time():
 
         raise Exception(
 
-            "获取服务器时间失败: " + str(result)
+            "获取服务器时间失败: "
+
+            + str(result)
 
         )
 
@@ -220,7 +292,7 @@ def get_server_time():
 
 # ============================================================
 
-# OKX 签名
+# 签名
 
 # ============================================================
 
@@ -266,7 +338,7 @@ def make_signature(
 
 # ============================================================
 
-# 私有 API
+# 私有API
 
 # ============================================================
 
@@ -298,17 +370,29 @@ def private_request(
 
     headers = {
 
-        "Content-Type": "application/json",
+        "Content-Type":
 
-        "OK-ACCESS-KEY": API_KEY,
+            "application/json",
 
-        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-KEY":
 
-        "OK-ACCESS-TIMESTAMP": timestamp,
+            API_KEY,
 
-        "OK-ACCESS-PASSPHRASE": PASSPHRASE,
+        "OK-ACCESS-SIGN":
 
-        "x-simulated-trading": SIMULATED_TRADING
+            signature,
+
+        "OK-ACCESS-TIMESTAMP":
+
+            timestamp,
+
+        "OK-ACCESS-PASSPHRASE":
+
+            PASSPHRASE,
+
+        "x-simulated-trading":
+
+            SIMULATED_TRADING
 
     }
 
@@ -346,7 +430,11 @@ def private_request(
 
     if result.get("code") != "0":
 
-        print("OKX API 错误:")
+        print(
+
+            "OKX API 错误:"
+
+        )
 
         print(
 
@@ -366,7 +454,7 @@ def private_request(
 
 # ============================================================
 
-# 公共 API
+# 公共API
 
 # ============================================================
 
@@ -398,13 +486,17 @@ def public_get(path):
 
 # ============================================================
 
-# Decimal 工具
+# Decimal工具
 
 # ============================================================
 
 def D(value):
 
-    return Decimal(str(value))
+    return Decimal(
+
+        str(value)
+
+    )
 
 def decimal_to_string(
 
@@ -414,7 +506,11 @@ def decimal_to_string(
 
 ):
 
-    q = Decimal("1").scaleb(-places)
+    q = Decimal("1").scaleb(
+
+        -places
+
+    )
 
     return format(
 
@@ -490,7 +586,7 @@ def size_to_lot(
 
 # ============================================================
 
-# 获取合约信息
+# 合约信息
 
 # ============================================================
 
@@ -526,15 +622,45 @@ def get_instrument():
 
     print("=" * 60)
 
-    print("instId :", instrument.get("instId"))
+    print(
 
-    print("ctVal  :", instrument.get("ctVal"))
+        "instId :",
 
-    print("lotSz  :", instrument.get("lotSz"))
+        instrument.get("instId")
 
-    print("minSz  :", instrument.get("minSz"))
+    )
 
-    print("tickSz :", instrument.get("tickSz"))
+    print(
+
+        "ctVal  :",
+
+        instrument.get("ctVal")
+
+    )
+
+    print(
+
+        "lotSz  :",
+
+        instrument.get("lotSz")
+
+    )
+
+    print(
+
+        "minSz  :",
+
+        instrument.get("minSz")
+
+    )
+
+    print(
+
+        "tickSz :",
+
+        instrument.get("tickSz")
+
+    )
 
     print()
 
@@ -596,7 +722,7 @@ def get_contract_value():
 
 # ============================================================
 
-# 获取账户余额
+# 账户
 
 # ============================================================
 
@@ -656,12 +782,6 @@ def get_account_balance():
 
     return D("0")
 
-# ============================================================
-
-# 获取账户配置
-
-# ============================================================
-
 def get_account_config():
 
     result = private_request(
@@ -704,7 +824,11 @@ def get_account_config():
 
 # ============================================================
 
-def set_leverage(leverage):
+def set_leverage(
+
+    leverage
+
+):
 
     leverage = max(
 
@@ -722,11 +846,17 @@ def set_leverage(leverage):
 
     body_data = {
 
-        "instId": INST_ID,
+        "instId":
 
-        "lever": str(leverage),
+            INST_ID,
 
-        "mgnMode": TD_MODE
+        "lever":
+
+            str(leverage),
+
+        "mgnMode":
+
+            TD_MODE
 
     }
 
@@ -774,11 +904,15 @@ def set_leverage(leverage):
 
 # ============================================================
 
-# 获取 K 线
+# K线
 
 # ============================================================
 
-def get_candles(limit=150):
+def get_candles(
+
+    limit=150
+
+):
 
     path = (
 
@@ -792,7 +926,11 @@ def get_candles(limit=150):
 
     )
 
-    result = public_get(path)
+    result = public_get(
+
+        path
+
+    )
 
     rows = result.get(
 
@@ -812,19 +950,33 @@ def get_candles(limit=150):
 
         candles.append({
 
-            "ts": int(row[0]),
+            "ts":
 
-            "open": D(row[1]),
+                int(row[0]),
 
-            "high": D(row[2]),
+            "open":
 
-            "low": D(row[3]),
+                D(row[1]),
 
-            "close": D(row[4]),
+            "high":
 
-            "volume": D(row[5]),
+                D(row[2]),
 
-            "confirm": row[8]
+            "low":
+
+                D(row[3]),
+
+            "close":
+
+                D(row[4]),
+
+            "volume":
+
+                D(row[5]),
+
+            "confirm":
+
+                row[8]
 
         })
 
@@ -878,7 +1030,7 @@ def ema(
 
 # ============================================================
 
-# EMA 序列
+# EMA序列
 
 # ============================================================
 
@@ -930,7 +1082,11 @@ def ema_series(
 
         ) + previous
 
-        result.append(current)
+        result.append(
+
+            current
+
+        )
 
         previous = current
 
@@ -976,15 +1132,31 @@ def calculate_rsi(
 
         if change > 0:
 
-            gains.append(change)
+            gains.append(
 
-            losses.append(D("0"))
+                change
+
+            )
+
+            losses.append(
+
+                D("0")
+
+            )
 
         else:
 
-            gains.append(D("0"))
+            gains.append(
 
-            losses.append(abs(change))
+                D("0")
+
+            )
+
+            losses.append(
+
+                abs(change)
+
+            )
 
     avg_gain = (
 
@@ -1056,7 +1228,9 @@ def calculate_rsi(
 
         / (
 
-            D("1") + rs
+            D("1")
+
+            + rs
 
         )
 
@@ -1068,7 +1242,11 @@ def calculate_rsi(
 
 # ============================================================
 
-def calculate_macd(closes):
+def calculate_macd(
+
+    closes
+
+):
 
     fast_series = ema_series(
 
@@ -1092,7 +1270,11 @@ def calculate_macd(closes):
 
     macd_values = []
 
-    for i in range(len(closes)):
+    for i in range(
+
+        len(closes)
+
+    ):
 
         if (
 
@@ -1102,7 +1284,11 @@ def calculate_macd(closes):
 
         ):
 
-            macd_values.append(None)
+            macd_values.append(
+
+                None
+
+            )
 
         else:
 
@@ -1144,7 +1330,13 @@ def calculate_macd(closes):
 
     macd = clean_macd[-1]
 
-    return macd, signal
+    return (
+
+        macd,
+
+        signal
+
+    )
 
 # ============================================================
 
@@ -1182,7 +1374,11 @@ def calculate_atr(
 
         low = current["low"]
 
-        previous_close = previous["close"]
+        previous_close = (
+
+            previous["close"]
+
+        )
 
         tr = max(
 
@@ -1236,43 +1432,35 @@ def calculate_atr(
 
 # ============================================================
 
-# 交易信号
+# 单根K线评分
 
 # ============================================================
 
-def calculate_signal(candles):
+def calculate_single_candle_signal(
 
-    closed = [
+    closed,
 
-        c
+    index
 
-        for c in candles
+):
 
-        if c["confirm"] == "1"
-
-    ]
-
-    if len(closed) < 60:
-
-        return {
-
-            "signal": "WAIT",
-
-            "score": 0
-
-        }
-
-    closes = [
+    current_closes = [
 
         c["close"]
 
-        for c in closed
+        for c in closed[:index + 1]
 
     ]
 
+    price = (
+
+        closed[index]["close"]
+
+    )
+
     fast = ema(
 
-        closes,
+        current_closes,
 
         EMA_FAST
 
@@ -1280,7 +1468,7 @@ def calculate_signal(candles):
 
     slow = ema(
 
-        closes,
+        current_closes,
 
         EMA_SLOW
 
@@ -1288,7 +1476,7 @@ def calculate_signal(candles):
 
     rsi = calculate_rsi(
 
-        closes,
+        current_closes,
 
         RSI_PERIOD
 
@@ -1296,77 +1484,77 @@ def calculate_signal(candles):
 
     macd_data = calculate_macd(
 
-        closes
+        current_closes
 
     )
 
-    atr = calculate_atr(
+    if (
 
-        closed,
+        fast is None
 
-        ATR_PERIOD
+        or slow is None
 
-    )
+        or rsi is None
 
-    if None in (
-
-        fast,
-
-        slow,
-
-        rsi,
-
-        atr
+        or macd_data is None
 
     ):
 
         return {
 
-            "signal": "WAIT",
+            "direction":
 
-            "score": 0
+                "WAIT",
 
-        }
+            "score":
 
-    if macd_data is None:
-
-        return {
-
-            "signal": "WAIT",
-
-            "score": 0
+                0
 
         }
 
-    macd, macd_signal = macd_data
+    macd, macd_signal = (
 
-    price = closes[-1]
+        macd_data
+
+    )
 
     long_score = 0
 
     short_score = 0
 
-    # EMA
+    # --------------------------------------------------------
+
+    # EMA趋势
+
+    # --------------------------------------------------------
 
     if fast > slow:
 
         long_score += 2
 
-    if fast < slow:
+    elif fast < slow:
 
         short_score += 2
 
-    # 价格
+    # --------------------------------------------------------
+
+    # 价格位置
+
+    # --------------------------------------------------------
 
     if price > fast:
 
         long_score += 1
 
-    if price < fast:
+    elif price < fast:
 
         short_score += 1
 
+    # --------------------------------------------------------
+
     # RSI
+
+    # --------------------------------------------------------
 
     if (
 
@@ -1392,7 +1580,11 @@ def calculate_signal(candles):
 
         short_score += 1
 
+    # --------------------------------------------------------
+
     # MACD
+
+    # --------------------------------------------------------
 
     if (
 
@@ -1414,7 +1606,11 @@ def calculate_signal(candles):
 
         short_score += 2
 
-    # 最终信号
+    # --------------------------------------------------------
+
+    # 本根K线最终方向
+
+    # --------------------------------------------------------
 
     if (
 
@@ -1424,7 +1620,7 @@ def calculate_signal(candles):
 
     ):
 
-        signal = "LONG"
+        direction = "LONG"
 
         score = long_score
 
@@ -1436,13 +1632,13 @@ def calculate_signal(candles):
 
     ):
 
-        signal = "SHORT"
+        direction = "SHORT"
 
         score = short_score
 
     else:
 
-        signal = "WAIT"
+        direction = "WAIT"
 
         score = max(
 
@@ -1454,25 +1650,407 @@ def calculate_signal(candles):
 
     return {
 
-        "signal": signal,
+        "direction":
 
-        "score": score,
+            direction,
 
-        "price": price,
+        "score":
 
-        "ema_fast": fast,
+            score,
 
-        "ema_slow": slow,
+        "price":
 
-        "rsi": rsi,
+            price,
 
-        "macd": macd,
+        "ema_fast":
 
-        "macd_signal": macd_signal,
+            fast,
 
-        "atr": atr,
+        "ema_slow":
 
-        "candle_ts": closed[-1]["ts"]
+            slow,
+
+        "rsi":
+
+            rsi,
+
+        "macd":
+
+            macd,
+
+        "macd_signal":
+
+            macd_signal,
+
+        "ts":
+
+            closed[index]["ts"]
+
+    }
+
+# ============================================================
+
+# 三根K线确认信号
+
+# ============================================================
+
+def calculate_signal(
+
+    candles
+
+):
+
+    closed = [
+
+        c
+
+        for c in candles
+
+        if c["confirm"] == "1"
+
+    ]
+
+    # 至少需要80根已收盘K线
+
+    if len(closed) < 80:
+
+        return {
+
+            "signal":
+
+                "WAIT",
+
+            "score":
+
+                0
+
+        }
+
+    # --------------------------------------------------------
+
+    # ATR
+
+    # --------------------------------------------------------
+
+    atr = calculate_atr(
+
+        closed,
+
+        ATR_PERIOD
+
+    )
+
+    if (
+
+        atr is None
+
+        or atr <= 0
+
+    ):
+
+        return {
+
+            "signal":
+
+                "WAIT",
+
+            "score":
+
+                0
+
+        }
+
+    # --------------------------------------------------------
+
+    # 最近3根K线分别判断
+
+    # --------------------------------------------------------
+
+    results = []
+
+    first_index = (
+
+        len(closed)
+
+        - CONFIRM_CANDLES
+
+    )
+
+    for i in range(
+
+        first_index,
+
+        len(closed)
+
+    ):
+
+        result = (
+
+            calculate_single_candle_signal(
+
+                closed,
+
+                i
+
+            )
+
+        )
+
+        results.append(
+
+            result
+
+        )
+
+    print()
+
+    print(
+
+        "最近3根确认K线:"
+
+    )
+
+    for number, result in enumerate(
+
+        results,
+
+        start=1
+
+    ):
+
+        print(
+
+            f"第{number}根: "
+
+            f"{result['direction']} "
+
+            f"分数={result['score']}"
+
+        )
+
+    directions = [
+
+        r["direction"]
+
+        for r in results
+
+    ]
+
+    latest = results[-1]
+
+    # ========================================================
+
+    # 三根全部 LONG
+
+    # ========================================================
+
+    if all(
+
+        direction == "LONG"
+
+        for direction in directions
+
+    ):
+
+        print(
+
+            "✅ 三根K线一致确认 LONG"
+
+        )
+
+        # 使用三根里面最低的分数
+
+        # 作为最终信号强度
+
+        final_score = min(
+
+            r["score"]
+
+            for r in results
+
+        )
+
+        return {
+
+            "signal":
+
+                "LONG",
+
+            "score":
+
+                final_score,
+
+            "price":
+
+                latest["price"],
+
+            "ema_fast":
+
+                latest["ema_fast"],
+
+            "ema_slow":
+
+                latest["ema_slow"],
+
+            "rsi":
+
+                latest["rsi"],
+
+            "macd":
+
+                latest["macd"],
+
+            "macd_signal":
+
+                latest["macd_signal"],
+
+            "atr":
+
+                atr,
+
+            "candle_ts":
+
+                latest["ts"]
+
+        }
+
+    # ========================================================
+
+    # 三根全部 SHORT
+
+    # ========================================================
+
+    if all(
+
+        direction == "SHORT"
+
+        for direction in directions
+
+    ):
+
+        print(
+
+            "✅ 三根K线一致确认 SHORT"
+
+        )
+
+        final_score = min(
+
+            r["score"]
+
+            for r in results
+
+        )
+
+        return {
+
+            "signal":
+
+                "SHORT",
+
+            "score":
+
+                final_score,
+
+            "price":
+
+                latest["price"],
+
+            "ema_fast":
+
+                latest["ema_fast"],
+
+            "ema_slow":
+
+                latest["ema_slow"],
+
+            "rsi":
+
+                latest["rsi"],
+
+            "macd":
+
+                latest["macd"],
+
+            "macd_signal":
+
+                latest["macd_signal"],
+
+            "atr":
+
+                atr,
+
+            "candle_ts":
+
+                latest["ts"]
+
+        }
+
+    # ========================================================
+
+    # 三根不一致
+
+    # ========================================================
+
+    print(
+
+        "⏸️ 最近3根没有形成明确一致方向。"
+
+    )
+
+    print(
+
+        "⏸️ 空仓等待，不下单。"
+
+    )
+
+    return {
+
+        "signal":
+
+            "WAIT",
+
+        "score":
+
+            max(
+
+                r["score"]
+
+                for r in results
+
+            ),
+
+        "price":
+
+            latest.get("price"),
+
+        "ema_fast":
+
+            latest.get("ema_fast"),
+
+        "ema_slow":
+
+            latest.get("ema_slow"),
+
+        "rsi":
+
+            latest.get("rsi"),
+
+        "macd":
+
+            latest.get("macd"),
+
+        "macd_signal":
+
+            latest.get("macd_signal"),
+
+        "atr":
+
+            atr,
+
+        "candle_ts":
+
+            latest["ts"]
 
     }
 
@@ -1482,7 +2060,11 @@ def calculate_signal(candles):
 
 # ============================================================
 
-def choose_leverage(signal_info):
+def choose_leverage(
+
+    signal_info
+
+):
 
     score = signal_info["score"]
 
@@ -1506,7 +2088,7 @@ def choose_leverage(signal_info):
 
 # ============================================================
 
-# 获取当前持仓
+# 当前持仓
 
 # ============================================================
 
@@ -1568,7 +2150,7 @@ def get_position():
 
 # ============================================================
 
-# 计算下单数量
+# 计算下单张数
 
 # ============================================================
 
@@ -1594,7 +2176,15 @@ def calculate_order_size(
 
         equity
 
-        * D(str(MAX_MARGIN_PCT))
+        * D(
+
+            str(
+
+                MAX_MARGIN_PCT
+
+            )
+
+        )
 
     )
 
@@ -1614,7 +2204,11 @@ def calculate_order_size(
 
     )
 
-    ct_val = get_contract_value()
+    ct_val = (
+
+        get_contract_value()
+
+    )
 
     contracts = (
 
@@ -1632,7 +2226,11 @@ def calculate_order_size(
 
     )
 
-    min_size = get_min_size()
+    min_size = (
+
+        get_min_size()
+
+    )
 
     if contracts < min_size:
 
@@ -1640,19 +2238,59 @@ def calculate_order_size(
 
     print()
 
-    print("仓位计算")
+    print(
 
-    print("账户权益 :", equity)
+        "仓位计算"
 
-    print("使用保证金:", margin)
+    )
 
-    print("杠杆     :", leverage)
+    print(
 
-    print("名义价值 :", notional)
+        "账户权益 :",
 
-    print("合约面值 :", ct_val)
+        equity
 
-    print("下单张数 :", contracts)
+    )
+
+    print(
+
+        "使用保证金:",
+
+        margin
+
+    )
+
+    print(
+
+        "杠杆     :",
+
+        leverage
+
+    )
+
+    print(
+
+        "名义价值 :",
+
+        notional
+
+    )
+
+    print(
+
+        "合约面值 :",
+
+        ct_val
+
+    )
+
+    print(
+
+        "下单张数 :",
+
+        contracts
+
+    )
 
     print()
 
@@ -1696,63 +2334,93 @@ def place_order(
 
         + direction.lower()
 
-        + str(int(time.time()))
+        + str(
+
+            int(
+
+                time.time()
+
+            )
+
+        )
 
     )[-32:]
 
     attach_algo = {
 
-        "tpTriggerPx": decimal_to_string(
+        "tpTriggerPx":
 
-            take_profit,
+            decimal_to_string(
 
-            2
+                take_profit,
 
-        ),
+                2
 
-        "tpOrdPx": "-1",
+            ),
 
-        "tpTriggerPxType": "mark",
+        "tpOrdPx":
 
-        "slTriggerPx": decimal_to_string(
+            "-1",
 
-            stop_loss,
+        "tpTriggerPxType":
 
-            2
+            "mark",
 
-        ),
+        "slTriggerPx":
 
-        "slOrdPx": "-1",
+            decimal_to_string(
 
-        "slTriggerPxType": "mark"
+                stop_loss,
+
+                2
+
+            ),
+
+        "slOrdPx":
+
+            "-1",
+
+        "slTriggerPxType":
+
+            "mark"
 
     }
 
     body_data = {
 
-        "instId": INST_ID,
+        "instId":
 
-        "tdMode": TD_MODE,
+            INST_ID,
 
-        "clOrdId": cl_ord_id,
+        "tdMode":
 
-        "side": side,
+            TD_MODE,
 
-        "ordType": "market",
+        "clOrdId":
 
-        "sz": decimal_to_string(
+            cl_ord_id,
 
-            size,
+        "side":
 
-            8
+            side,
 
-        ),
+        "ordType":
 
-        "attachAlgoOrds": [
+            "market",
 
-            attach_algo
+        "sz":
 
-        ]
+            decimal_to_string(
+
+                size,
+
+                8
+
+            ),
+
+        "attachAlgoOrds":
+
+            [attach_algo]
 
     }
 
@@ -1766,21 +2434,63 @@ def place_order(
 
     print("=" * 60)
 
-    print("准备开仓")
+    print(
+
+        "准备开仓"
+
+    )
 
     print("=" * 60)
 
-    print("方向       :", direction)
+    print(
 
-    print("杠杆       :", leverage, "x")
+        "方向       :",
 
-    print("数量       :", size)
+        direction
 
-    print("参考入场价 :", entry_price)
+    )
 
-    print("止损       :", stop_loss)
+    print(
 
-    print("止盈       :", take_profit)
+        "杠杆       :",
+
+        leverage,
+
+        "x"
+
+    )
+
+    print(
+
+        "数量       :",
+
+        size
+
+    )
+
+    print(
+
+        "参考入场价 :",
+
+        entry_price
+
+    )
+
+    print(
+
+        "止损       :",
+
+        stop_loss
+
+    )
+
+    print(
+
+        "止盈       :",
+
+        take_profit
+
+    )
 
     print()
 
@@ -1842,7 +2552,11 @@ def place_order(
 
     order = data[0]
 
-    if order.get("sCode") != "0":
+    if order.get(
+
+        "sCode"
+
+    ) != "0":
 
         raise Exception(
 
@@ -1866,7 +2580,11 @@ def place_order(
 
     print()
 
-    print("✅ 开仓订单已提交")
+    print(
+
+        "✅ 开仓订单已提交"
+
+    )
 
     print(
 
@@ -1875,208 +2593,6 @@ def place_order(
         order.get("ordId")
 
     )
-
-    print()
-
-# ============================================================
-
-# 查询订单成交
-
-# ============================================================
-
-def get_order_fills(ord_id):
-
-    if not ord_id:
-
-        return []
-
-    path = (
-
-        "/api/v5/trade/fills"
-
-        f"?instType={INST_TYPE}"
-
-        f"&instId={INST_ID}"
-
-        f"&ordId={ord_id}"
-
-        "&limit=100"
-
-    )
-
-    result = private_request(
-
-        "GET",
-
-        path
-
-    )
-
-    if result.get("code") != "0":
-
-        return []
-
-    return result.get(
-
-        "data",
-
-        []
-
-    )
-
-# ============================================================
-
-# 报告某一笔平仓订单盈亏
-
-# ============================================================
-
-def report_order_pnl(
-
-    ord_id,
-
-    retries=6
-
-):
-
-    if not ord_id:
-
-        return
-
-    fills = []
-
-    # 给 OKX 几秒时间生成成交记录
-
-    for _ in range(retries):
-
-        time.sleep(1)
-
-        fills = get_order_fills(
-
-            ord_id
-
-        )
-
-        if fills:
-
-            break
-
-    if not fills:
-
-        print()
-
-        print(
-
-            "⚠️ 暂时没有查到这笔平仓的成交记录。"
-
-        )
-
-        print(
-
-            "稍后自动检查最近平仓记录。"
-
-        )
-
-        print()
-
-        return
-
-    total_pnl = D("0")
-
-    total_fee = D("0")
-
-    for fill in fills:
-
-        total_pnl += D(
-
-            fill.get(
-
-                "fillPnl",
-
-                "0"
-
-            )
-
-            or "0"
-
-        )
-
-        total_fee += D(
-
-            fill.get(
-
-                "fee",
-
-                "0"
-
-            )
-
-            or "0"
-
-        )
-
-        trade_id = str(
-
-            fill.get(
-
-                "tradeId",
-
-                ""
-
-            )
-
-        )
-
-        if trade_id:
-
-            reported_close_trades.add(
-
-                trade_id
-
-            )
-
-    net_pnl = (
-
-        total_pnl
-
-        + total_fee
-
-    )
-
-    print()
-
-    print("=" * 60)
-
-    print("📊 本次平仓结果")
-
-    print("=" * 60)
-
-    print("订单ID         :", ord_id)
-
-    print("已实现盈亏     :", total_pnl, "USDT")
-
-    print("手续费         :", total_fee, "USDT")
-
-    print("扣手续费净盈亏 :", net_pnl, "USDT")
-
-    if net_pnl > 0:
-
-        print()
-
-        print("🟢 这笔交易：盈利")
-
-    elif net_pnl < 0:
-
-        print()
-
-        print("🔴 这笔交易：亏损")
-
-    else:
-
-        print()
-
-        print("⚪ 这笔交易：基本持平")
-
-    print("=" * 60)
 
     print()
 
@@ -2091,6 +2607,8 @@ def close_position(
     position
 
 ):
+
+    global trade_cooldown_until
 
     pos = D(
 
@@ -2108,11 +2626,15 @@ def close_position(
 
         return
 
-    position_side = position.get(
+    position_side = (
 
-        "posSide",
+        position.get(
 
-        "net"
+            "posSide",
+
+            "net"
+
+        )
 
     )
 
@@ -2146,23 +2668,35 @@ def close_position(
 
     body_data = {
 
-        "instId": INST_ID,
+        "instId":
 
-        "tdMode": TD_MODE,
+            INST_ID,
 
-        "side": side,
+        "tdMode":
 
-        "ordType": "market",
+            TD_MODE,
 
-        "sz": decimal_to_string(
+        "side":
 
-            size,
+            side,
 
-            8
+        "ordType":
 
-        ),
+            "market",
 
-        "reduceOnly": True
+        "sz":
+
+            decimal_to_string(
+
+                size,
+
+                8
+
+            ),
+
+        "reduceOnly":
+
+            True
 
     }
 
@@ -2190,13 +2724,29 @@ def close_position(
 
     print("=" * 60)
 
-    print("准备平仓")
+    print(
+
+        "准备平仓"
+
+    )
 
     print("=" * 60)
 
-    print("当前持仓:", pos)
+    print(
 
-    print("平仓方向:", side)
+        "当前持仓:",
+
+        pos
+
+    )
+
+    print(
+
+        "平仓方向:",
+
+        side
+
+    )
 
     print()
 
@@ -2258,7 +2808,11 @@ def close_position(
 
     order = data[0]
 
-    if order.get("sCode") != "0":
+    if order.get(
+
+        "sCode"
+
+    ) != "0":
 
         raise Exception(
 
@@ -2288,11 +2842,31 @@ def close_position(
 
     print()
 
-    print("✅ 平仓订单已提交")
+    print(
 
-    print("平仓订单ID:", ord_id)
+        "✅ 平仓订单已提交"
 
-    print()
+    )
+
+    print(
+
+        "平仓订单ID:",
+
+        ord_id
+
+    )
+
+    # 平仓后至少等待5分钟
+
+    trade_cooldown_until = (
+
+        time.time()
+
+        + POST_CLOSE_COOLDOWN_SECONDS
+
+    )
+
+    time.sleep(2)
 
     report_order_pnl(
 
@@ -2302,13 +2876,223 @@ def close_position(
 
 # ============================================================
 
-# 检查 TP / SL 自动平仓
+# 查询某个平仓订单的真实盈亏
+
+# ============================================================
+
+def report_order_pnl(
+
+    ord_id
+
+):
+
+    if not ord_id:
+
+        return
+
+    for attempt in range(5):
+
+        try:
+
+            path = (
+
+                "/api/v5/trade/fills"
+
+                f"?instType={INST_TYPE}"
+
+                f"&instId={INST_ID}"
+
+                f"&ordId={ord_id}"
+
+                "&limit=100"
+
+            )
+
+            result = private_request(
+
+                "GET",
+
+                path
+
+            )
+
+            if result.get(
+
+                "code"
+
+            ) != "0":
+
+                return
+
+            fills = result.get(
+
+                "data",
+
+                []
+
+            )
+
+            if fills:
+
+                total_pnl = D("0")
+
+                total_fee = D("0")
+
+                for fill in fills:
+
+                    total_pnl += D(
+
+                        fill.get(
+
+                            "fillPnl",
+
+                            "0"
+
+                        )
+
+                        or "0"
+
+                    )
+
+                    total_fee += D(
+
+                        fill.get(
+
+                            "fee",
+
+                            "0"
+
+                        )
+
+                        or "0"
+
+                    )
+
+                net_pnl = (
+
+                    total_pnl
+
+                    + total_fee
+
+                )
+
+                print()
+
+                print("=" * 60)
+
+                print(
+
+                    "📊 本次平仓结果"
+
+                )
+
+                print("=" * 60)
+
+                print(
+
+                    "订单ID         :",
+
+                    ord_id
+
+                )
+
+                print(
+
+                    "已实现盈亏     :",
+
+                    total_pnl,
+
+                    "USDT"
+
+                )
+
+                print(
+
+                    "手续费         :",
+
+                    total_fee,
+
+                    "USDT"
+
+                )
+
+                print(
+
+                    "扣手续费净盈亏 :",
+
+                    net_pnl,
+
+                    "USDT"
+
+                )
+
+                if net_pnl > 0:
+
+                    print(
+
+                        "🟢 本次交易：盈利"
+
+                    )
+
+                elif net_pnl < 0:
+
+                    print(
+
+                        "🔴 本次交易：亏损"
+
+                    )
+
+                else:
+
+                    print(
+
+                        "⚪ 本次交易：持平"
+
+                    )
+
+                print("=" * 60)
+
+                print()
+
+                return
+
+        except Exception as e:
+
+            print(
+
+                "查询本次平仓盈亏失败:",
+
+                str(e)
+
+            )
+
+        time.sleep(1)
+
+    print(
+
+        "⚠️ 暂时没有查到该平仓订单的成交盈亏。"
+
+    )
+
+# ============================================================
+
+# 查询最近平仓成交
+
+#
+
+# 用来捕捉：
+
+# 1. TP自动平仓
+
+# 2. SL自动平仓
 
 # ============================================================
 
 def report_recent_closed_trades():
 
     global reported_close_trades
+
+    global trade_cooldown_until
 
     path = (
 
@@ -2330,7 +3114,11 @@ def report_recent_closed_trades():
 
     )
 
-    if result.get("code") != "0":
+    if result.get(
+
+        "code"
+
+    ) != "0":
 
         return
 
@@ -2342,7 +3130,11 @@ def report_recent_closed_trades():
 
     )
 
-    for fill in reversed(fills):
+    for fill in reversed(
+
+        fills
+
+    ):
 
         trade_id = str(
 
@@ -2360,7 +3152,11 @@ def report_recent_closed_trades():
 
             continue
 
-        if trade_id in reported_close_trades:
+        if trade_id in (
+
+            reported_close_trades
+
+        ):
 
             continue
 
@@ -2410,7 +3206,11 @@ def report_recent_closed_trades():
 
         print("=" * 60)
 
-        print("📊 检测到平仓成交")
+        print(
+
+            "📊 检测到平仓成交"
+
+        )
 
         print("=" * 60)
 
@@ -2440,7 +3240,7 @@ def report_recent_closed_trades():
 
         print(
 
-            "平仓盈亏     :",
+            "已实现盈亏   :",
 
             fill_pnl,
 
@@ -2502,6 +3302,56 @@ def report_recent_closed_trades():
 
         )
 
+        # TP / SL自动平仓后
+
+        # 从成交时间开始冷却5分钟
+
+        fill_time = fill.get(
+
+            "ts"
+
+        )
+
+        if fill_time:
+
+            try:
+
+                fill_time_sec = (
+
+                    int(fill_time)
+
+                    / 1000
+
+                )
+
+                cooldown = (
+
+                    fill_time_sec
+
+                    + POST_CLOSE_COOLDOWN_SECONDS
+
+                )
+
+                trade_cooldown_until = max(
+
+                    trade_cooldown_until,
+
+                    cooldown
+
+                )
+
+            except Exception:
+
+                trade_cooldown_until = max(
+
+                    trade_cooldown_until,
+
+                    time.time()
+
+                    + POST_CLOSE_COOLDOWN_SECONDS
+
+                )
+
 # ============================================================
 
 # 处理交易信号
@@ -2512,9 +3362,11 @@ def process_signal():
 
     global last_processed_candle
 
-    global cooldown_until
+    # --------------------------------------------------------
 
-    # 每轮先检查 TP / SL 是否已经平仓
+    # 每20秒检查一次有没有TP/SL自动平仓
+
+    # --------------------------------------------------------
 
     try:
 
@@ -2524,11 +3376,17 @@ def process_signal():
 
         print(
 
-            "查询最近平仓记录失败:",
+            "查询最近平仓失败:",
 
             str(e)
 
         )
+
+    # --------------------------------------------------------
+
+    # 获取K线
+
+    # --------------------------------------------------------
 
     candles = get_candles(
 
@@ -2539,6 +3397,12 @@ def process_signal():
     if not candles:
 
         return
+
+    # --------------------------------------------------------
+
+    # 三根K线确认
+
+    # --------------------------------------------------------
 
     signal_info = calculate_signal(
 
@@ -2556,13 +3420,13 @@ def process_signal():
 
         print(
 
-            "K线数量不足，继续等待。"
+            "K线不足，等待..."
 
         )
 
         return
 
-    # 同一根确认K线只处理一次
+    # 一根确认K线只处理一次
 
     if (
 
@@ -2580,19 +3444,21 @@ def process_signal():
 
     )
 
-    now = time.time()
-
     print()
-
-    print("=" * 60)
-
-    print("新确认K线")
 
     print("=" * 60)
 
     print(
 
-        "交易信号:",
+        "新确认K线"
+
+    )
+
+    print("=" * 60)
+
+    print(
+
+        "最终信号:",
 
         signal_info["signal"]
 
@@ -2600,123 +3466,19 @@ def process_signal():
 
     print(
 
-        "信号分数:",
+        "确认分数:",
 
         signal_info["score"]
 
     )
 
-    if signal_info["signal"] != "WAIT":
-
-        print(
-
-            "价格:",
-
-            signal_info["price"]
-
-        )
-
-        print(
-
-            "EMA9:",
-
-            signal_info["ema_fast"]
-
-        )
-
-        print(
-
-            "EMA21:",
-
-            signal_info["ema_slow"]
-
-        )
-
-        print(
-
-            "RSI:",
-
-            signal_info["rsi"]
-
-        )
-
-        print(
-
-            "MACD:",
-
-            signal_info["macd"]
-
-        )
-
-        print(
-
-            "MACD Signal:",
-
-            signal_info["macd_signal"]
-
-        )
-
-        print(
-
-            "ATR:",
-
-            signal_info["atr"]
-
-        )
-
     # ========================================================
 
-    # 连续亏损冷却
-
-    # ========================================================
-
-    if now < cooldown_until:
-
-        remain = int(
-
-            cooldown_until
-
-            - now
-
-        )
-
-        print(
-
-            f"🛑 风控冷却中，还剩 {remain} 秒"
-
-        )
-
-        return
-
-    # ========================================================
-
-    # 获取当前持仓
+    # 先检查当前是否有持仓
 
     # ========================================================
 
     position = get_position()
-
-    # ========================================================
-
-    # WAIT
-
-    # ========================================================
-
-    if signal_info["signal"] == "WAIT":
-
-        print(
-
-            "没有足够强的交易信号，不交易。"
-
-        )
-
-        return
-
-    # ========================================================
-
-    # 已经有仓位
-
-    # ========================================================
 
     if position:
 
@@ -2734,7 +3496,7 @@ def process_signal():
 
         if pos != 0:
 
-            current_pos_side = (
+            position_side = (
 
                 position.get(
 
@@ -2744,13 +3506,21 @@ def process_signal():
 
             )
 
-            if current_pos_side == "long":
+            if position_side == "long":
 
-                current_direction = "LONG"
+                current_direction = (
 
-            elif current_pos_side == "short":
+                    "LONG"
 
-                current_direction = "SHORT"
+                )
+
+            elif position_side == "short":
+
+                current_direction = (
+
+                    "SHORT"
+
+                )
 
             else:
 
@@ -2774,65 +3544,101 @@ def process_signal():
 
             )
 
+            print(
+
+                "当前信号:",
+
+                signal_info["signal"]
+
+            )
+
             # =================================================
 
-            # 信号反转
+            # 非常重要：
+
+            #
+
+            # 持仓期间完全忽略方向变化
+
+            #
+
+            # 不再出现：
+
+            # LONG -> SHORT -> 立即平仓
 
             # =================================================
 
-            if (
+            print(
 
-                current_direction
+                "已有持仓，忽略后续方向变化。"
 
-                != signal_info["signal"]
+            )
 
-            ):
+            print(
 
-                print(
+                "本仓位只由 TP / SL 负责退出。"
 
-                    "⚠️ 信号反转，先平掉当前仓位。"
-
-                )
-
-                close_position(
-
-                    position
-
-                )
-
-                time.sleep(2)
-
-                print(
-
-                    "本轮不立即反向开仓。"
-
-                )
-
-                print(
-
-                    "等待下一根确认K线。"
-
-                )
-
-            else:
-
-                print(
-
-                    "已有同方向仓位。"
-
-                )
-
-                print(
-
-                    "本轮不重复开仓。"
-
-                )
+            )
 
             return
 
     # ========================================================
 
-    # 没有持仓 -> 开仓
+    # 没有持仓
+
+    # ========================================================
+
+    now = time.time()
+
+    # --------------------------------------------------------
+
+    # 平仓后的5分钟冷却
+
+    # --------------------------------------------------------
+
+    if now < trade_cooldown_until:
+
+        remain = int(
+
+            trade_cooldown_until
+
+            - now
+
+        )
+
+        print(
+
+            f"🛑 平仓冷却中，还剩 {remain} 秒。"
+
+        )
+
+        return
+
+    # --------------------------------------------------------
+
+    # 没有明确三根K线信号
+
+    # --------------------------------------------------------
+
+    if signal_info["signal"] == "WAIT":
+
+        print(
+
+            "⏸️ 没有明确的三根K线一致信号。"
+
+        )
+
+        print(
+
+            "⏸️ 空仓等待，不下单。"
+
+        )
+
+        return
+
+    # ========================================================
+
+    # 确认信号后准备开仓
 
     # ========================================================
 
@@ -2848,9 +3654,17 @@ def process_signal():
 
     )
 
-    price = signal_info["price"]
+    price = signal_info[
 
-    atr = signal_info["atr"]
+        "price"
+
+    ]
+
+    atr = signal_info[
+
+        "atr"
+
+    ]
 
     stop_distance = (
 
@@ -2872,17 +3686,17 @@ def process_signal():
 
         print(
 
-            "ATR无效，取消本次交易。"
+            "ATR无效，跳过交易。"
 
         )
 
         return
 
-    direction = signal_info[
+    direction = (
 
-        "signal"
+        signal_info["signal"]
 
-    ]
+    )
 
     # ========================================================
 
@@ -2954,7 +3768,7 @@ def process_signal():
 
     # ========================================================
 
-    # 价格对齐 tick
+    # 调整到OKX最小价格跳动
 
     # ========================================================
 
@@ -3048,17 +3862,29 @@ def process_signal():
 
     place_order(
 
-        direction=direction,
+        direction=
 
-        size=size,
+            direction,
 
-        leverage=leverage,
+        size=
 
-        entry_price=price,
+            size,
 
-        stop_loss=stop_loss,
+        leverage=
 
-        take_profit=take_profit
+            leverage,
+
+        entry_price=
+
+            price,
+
+        stop_loss=
+
+            stop_loss,
+
+        take_profit=
+
+            take_profit
 
     )
 
@@ -3072,7 +3898,11 @@ def startup_check():
 
     print("=" * 60)
 
-    print("启动 OKX BTC 自动交易模拟盘")
+    print(
+
+        "启动 OKX BTC 自动交易模拟盘"
+
+    )
 
     print("=" * 60)
 
@@ -3156,7 +3986,11 @@ def main():
 
     print("=" * 60)
 
-    print("策略参数")
+    print(
+
+        "策略参数"
+
+    )
 
     print("=" * 60)
 
@@ -3173,6 +4007,16 @@ def main():
         "K线周期        :",
 
         BAR
+
+    )
+
+    print(
+
+        "信号确认K线    :",
+
+        CONFIRM_CANDLES,
+
+        "根"
 
     )
 
@@ -3258,9 +4102,25 @@ def main():
 
     print(
 
-        "最低信号分数   :",
+        "持仓退出方式   :",
 
-        MIN_SIGNAL_SCORE
+        "TP / SL"
+
+    )
+
+    print(
+
+        "反向信号平仓   :",
+
+        "关闭"
+
+    )
+
+    print(
+
+        "平仓后等待     :",
+
+        "5分钟"
 
     )
 
@@ -3292,7 +4152,11 @@ def main():
 
             print("=" * 60)
 
-            print("⚠️ 本轮运行出现异常")
+            print(
+
+                "⚠️ 本轮运行出现异常"
+
+            )
 
             print("=" * 60)
 
@@ -3304,13 +4168,7 @@ def main():
 
             print(
 
-                "不会立即退出。"
-
-            )
-
-            print(
-
-                "等待下一轮继续运行。"
+                "不会立即退出，等待下一轮。"
 
             )
 
