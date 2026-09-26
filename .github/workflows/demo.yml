@@ -27,4 +27,4 @@ jobs:
           OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
           OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
         run: |
-          python bot.py
+          python -u bot.py
