@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 import requests
 
 # ============================================================
-# OKX 全市场永续强行情自动交易机器人 V2.3
+# OKX 全市场永续强行情自动交易机器人 V2.5
 # - 仅模拟盘：SIMULATED_TRADING=1
 # - USDT 本位永续：SWAP / -USDT-SWAP
 # - 单向持仓 net_mode
@@ -25,7 +25,8 @@ import requests
 # - ATR 止损 + RR 止盈
 # - 单次只允许一个持仓
 # - 每日达到目标或达到日亏损上限后停止开新仓
-# - 主订单必须 fully filled；TP/SL 未确认则紧急平仓
+# - 主订单先 fully filled，再按真实成交均价独立计算并设置TP/SL
+# - TP/SL 未确认则紧急平仓
 # ============================================================
 
 BASE_URL = os.getenv("OKX_BASE_URL", "https://openapi.okx.com")
@@ -75,16 +76,23 @@ MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 LOSS_COOLDOWN_SECONDS = int(os.getenv("LOSS_COOLDOWN_SECONDS", "1800"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "8"))
 
+# ---------- 手续费 ----------
+# 市价开仓 + TP/SL触发后的市价平仓，按吃单费率估算双边交易成本。
+FEE_CACHE_SECONDS = int(os.getenv("FEE_CACHE_SECONDS", "300"))
+DEFAULT_TAKER_FEE = float(os.getenv("DEFAULT_TAKER_FEE", "0.0005"))
+
 # ---------- 文件 ----------
-STATE_FILE = os.getenv("STATE_FILE", "multi_coin_bot_state_v23.json")
+STATE_FILE = os.getenv("STATE_FILE", "multi_coin_bot_state_v25.json")
 REQUEST_TIMEOUT = 12
 
 session = requests.Session()
-session.headers.update({"User-Agent": "OKX-MultiCoin-Bot-V2.3"})
+session.headers.update({"User-Agent": "OKX-MultiCoin-Bot-V2.5"})
 
 _print_lock = threading.Lock()
 _rate_lock = threading.Lock()
 _last_market_request = 0.0
+_fee_cache = {}
+_fee_cache_lock = threading.Lock()
 
 
 def log(msg):
@@ -368,6 +376,12 @@ def get_instruments():
             max_lev = 0
         if max_lev <= 0:
             continue
+        # OKX instruments 返回 groupId；用于精确获取当前账户适用手续费率。
+        # instFamily 对 USDT 本位永续通常形如 XXX-USDT。
+        if not x.get("instFamily"):
+            parts = inst_id.split("-")
+            if len(parts) >= 2:
+                x["instFamily"] = "-".join(parts[:-1])
         result[inst_id] = x
     return result
 
@@ -411,6 +425,79 @@ def set_leverage(inst_id, leverage, max_allowed):
     except Exception as e:
         log(f"设置杠杆失败：{inst_id} → {leverage}x：{e}")
         return None
+
+
+# ============================================================
+# 手续费
+# ============================================================
+
+def get_taker_fee(inst_id, instrument):
+    """读取当前账户对该 USDT 永续适用的吃单费率。
+
+    OKX 当前接口对 SWAP 使用 instFamily 或 groupId；优先使用 instrument 返回的
+    groupId，其次使用 instFamily。若接口暂时不可用，使用保守默认值并明确日志。
+    """
+    now = time.time()
+    cache_key = str(instrument.get("groupId") or instrument.get("instFamily") or inst_id)
+    with _fee_cache_lock:
+        cached = _fee_cache.get(cache_key)
+        if cached and now - cached["ts"] < FEE_CACHE_SECONDS:
+            return cached["taker"], cached.get("maker", 0.0), cached.get("source", "cache")
+
+    params = {"instType": INST_TYPE}
+    if instrument.get("groupId"):
+        params["groupId"] = str(instrument["groupId"])
+    else:
+        family = instrument.get("instFamily") or ""
+        if not family and inst_id.endswith("-SWAP"):
+            family = inst_id[:-5]
+        if family:
+            params["instFamily"] = family
+
+    try:
+        data = okx_request("GET", "/api/v5/account/trade-fee", params=params, private=True)["data"]
+        if not data:
+            raise RuntimeError("trade-fee返回为空")
+
+        row = data[0]
+        fee_group = row.get("feeGroup") or []
+        target_group = str(instrument.get("groupId") or "")
+        selected = None
+        if target_group:
+            for fg in fee_group:
+                if str(fg.get("groupId") or "") == target_group:
+                    selected = fg
+                    break
+        if selected is None and fee_group:
+            selected = fee_group[0]
+
+        if selected:
+            taker_raw = selected.get("taker")
+            maker_raw = selected.get("maker")
+        else:
+            taker_raw = row.get("takerU") or row.get("taker")
+            maker_raw = row.get("makerU") or row.get("maker")
+
+        taker = float(taker_raw or 0)
+        maker = float(maker_raw or 0)
+        with _fee_cache_lock:
+            _fee_cache[cache_key] = {"ts": now, "taker": taker, "maker": maker, "source": "OKX"}
+        return taker, maker, "OKX"
+    except Exception as e:
+        log(f"读取手续费失败 {inst_id}：{e}；使用保守默认吃单费率 {DEFAULT_TAKER_FEE * 100:.4f}%")
+        with _fee_cache_lock:
+            _fee_cache[cache_key] = {"ts": now, "taker": DEFAULT_TAKER_FEE, "maker": 0.0, "source": "fallback"}
+        return DEFAULT_TAKER_FEE, 0.0, "fallback"
+
+
+def fee_cost(notional, rate):
+    # OKX费率返回可能为负数（代表平台扣费），正数可能代表返佣。
+    # 对风控而言，负数按成本计；正数则按返佣抵扣。
+    return float(notional) * (-float(rate))
+
+
+def round_trip_fee_estimate(entry_notional, exit_notional, taker_rate):
+    return fee_cost(entry_notional, taker_rate) + fee_cost(exit_notional, taker_rate)
 
 
 # ============================================================
@@ -554,6 +641,7 @@ def analyze_5m(inst_id, instrument, ticker):
         "tickSz": float(instrument["tickSz"]),
         "reasons": reasons_long if direction == "LONG" else reasons_short,
         "ticker": ticker,
+        "instrument": instrument,
     }
 
 
@@ -654,7 +742,7 @@ def theoretical_leverage(score):
     return 7
 
 
-def build_trade_plan(candidate, equity, actual_leverage):
+def build_trade_plan(candidate, equity, actual_leverage, taker_fee_rate=0.0):
     price = candidate["price"]
     atr_v = candidate["atr"]
     direction = candidate["direction"]
@@ -667,33 +755,48 @@ def build_trade_plan(candidate, equity, actual_leverage):
     if stop_distance <= 0:
         return None
 
+    # 先按方向取整止损，再根据“实际止损”重新计算TP，避免tickSz造成RR缩水。
     if direction == "LONG":
-        sl_raw = price - stop_distance
-        tp_raw = price + stop_distance * RISK_REWARD
-        sl = float(floor_decimal(sl_raw, tick_sz))
-        tp = float(floor_decimal(tp_raw, tick_sz))
-        if sl <= 0 or tp <= price or sl >= price:
+        sl = float(floor_decimal(price - stop_distance, tick_sz))
+        if sl <= 0 or sl >= price:
+            return None
+        actual_stop_distance = price - sl
+        tp = float(ceil_decimal(price + actual_stop_distance * RISK_REWARD, tick_sz))
+        if tp <= price:
             return None
     else:
-        sl_raw = price + stop_distance
-        tp_raw = price - stop_distance * RISK_REWARD
-        sl = float(ceil_decimal(sl_raw, tick_sz))
-        tp = float(ceil_decimal(tp_raw, tick_sz))
-        if tp <= 0 or tp >= price or sl <= price:
+        sl = float(ceil_decimal(price + stop_distance, tick_sz))
+        if sl <= price:
+            return None
+        actual_stop_distance = sl - price
+        tp = float(floor_decimal(price - actual_stop_distance * RISK_REWARD, tick_sz))
+        if tp <= 0 or tp >= price:
             return None
 
-    if direction == "LONG":
-        rr = (tp - price) / (price - sl)
-    else:
-        rr = (price - tp) / (sl - price)
+    # 双边手续费：开仓一次 + 止损/止盈平仓一次。
+    # 市价开仓及 tpOrdPx/slOrdPx=-1 的触发平仓，按吃单费率估算。
+    entry_notional_per_contract = price * ct_val
+    stop_exit_notional_per_contract = sl * ct_val
+    tp_exit_notional_per_contract = tp * ct_val
+
+    entry_fee_per_contract = fee_cost(entry_notional_per_contract, taker_fee_rate)
+    stop_fee_per_contract = fee_cost(stop_exit_notional_per_contract, taker_fee_rate)
+    tp_fee_per_contract = fee_cost(tp_exit_notional_per_contract, taker_fee_rate)
+
+    gross_loss_per_contract = actual_stop_distance * ct_val
+    gross_profit_per_contract = abs(tp - price) * ct_val
+    net_loss_per_contract = gross_loss_per_contract + entry_fee_per_contract + stop_fee_per_contract
+    net_profit_per_contract = gross_profit_per_contract - entry_fee_per_contract - tp_fee_per_contract
+
+    if net_loss_per_contract <= 0 or net_profit_per_contract <= 0:
+        return None
+
+    rr = net_profit_per_contract / net_loss_per_contract
     if rr < MIN_RR:
         return None
 
     risk_usdt = equity * RISK_PER_TRADE_PCT
-    risk_per_contract = stop_distance * ct_val
-    if risk_per_contract <= 0:
-        return None
-    raw_sz = risk_usdt / risk_per_contract
+    raw_sz = risk_usdt / net_loss_per_contract
 
     max_margin = equity * MAX_MARGIN_PCT
     max_notional = max_margin * actual_leverage
@@ -704,9 +807,17 @@ def build_trade_plan(candidate, equity, actual_leverage):
     if sz < Decimal(str(min_sz)):
         return None
 
-    # 由于是全仓，实际保证金大致为 notional / leverage；这里仅用于日志和二次检查。
     notional = float(sz) * ct_val * price
     margin = notional / actual_leverage if actual_leverage > 0 else float("inf")
+    entry_fee = fee_cost(notional, taker_fee_rate)
+    stop_exit_notional = float(sz) * ct_val * sl
+    tp_exit_notional = float(sz) * ct_val * tp
+    stop_fee = fee_cost(stop_exit_notional, taker_fee_rate)
+    tp_fee = fee_cost(tp_exit_notional, taker_fee_rate)
+    gross_loss = float(sz) * gross_loss_per_contract
+    gross_profit = float(sz) * gross_profit_per_contract
+    net_loss = gross_loss + entry_fee + stop_fee
+    net_profit = gross_profit - entry_fee - tp_fee
 
     return {
         "sz": fmt_decimal(sz),
@@ -714,11 +825,22 @@ def build_trade_plan(candidate, equity, actual_leverage):
         "sl": sl,
         "tp": tp,
         "rr": rr,
+        "gross_rr": gross_profit_per_contract / gross_loss_per_contract if gross_loss_per_contract > 0 else 0,
         "risk_usdt": risk_usdt,
         "notional": notional,
         "margin": margin,
         "leverage": actual_leverage,
-        "stop_distance": stop_distance,
+        "stop_distance": actual_stop_distance,
+        "taker_fee_rate": taker_fee_rate,
+        "entry_fee": entry_fee,
+        "stop_fee": stop_fee,
+        "tp_fee": tp_fee,
+        "round_trip_fee_at_stop": entry_fee + stop_fee,
+        "round_trip_fee_at_tp": entry_fee + tp_fee,
+        "gross_loss": gross_loss,
+        "gross_profit": gross_profit,
+        "net_loss": net_loss,
+        "net_profit": net_profit,
     }
 
 
@@ -738,11 +860,16 @@ def get_max_size(inst_id, leverage):
 
 
 def place_market_order(candidate, plan):
+    """只负责市价开仓。
+
+    V2.5 不再把 TP/SL 挂在开仓请求里。先让主订单完全成交，
+    再读取真实 avgPx，然后按真实成交价计算并独立下 TP/SL。
+    OKX 官方文档也明确支持独立 POST /api/v5/trade/order-algo。
+    """
     inst_id = candidate["instId"]
     direction = candidate["direction"]
     side = "buy" if direction == "LONG" else "sell"
-    cl_ord_id = "MCV22" + str(int(time.time() * 1000))[-20:]
-    algo_cl_id = "ALGOV22" + str(int(time.time() * 1000))[-18:]
+    cl_ord_id = "MCV25" + str(int(time.time() * 1000))[-20:]
 
     body = {
         "instId": inst_id,
@@ -751,19 +878,9 @@ def place_market_order(candidate, plan):
         "side": side,
         "ordType": "market",
         "sz": plan["sz"],
-        "attachAlgoOrds": [{
-            "attachAlgoClOrdId": algo_cl_id,
-            "tpTriggerPx": fmt_decimal(plan["tp"]),
-            "tpOrdPx": "-1",
-            "tpTriggerPxType": "mark",
-            "slTriggerPx": fmt_decimal(plan["sl"]),
-            "slOrdPx": "-1",
-            "slTriggerPxType": "mark",
-        }],
     }
 
-    # net_mode 下 posSide 可省略；省略可以兼容更多账户配置。
-    log(f"准备下单：{inst_id} {direction} {plan['sz']}张，{plan['leverage']}x，TP={plan['tp']} SL={plan['sl']}")
+    log(f"准备开仓：{inst_id} {direction} {plan['sz']}张，{plan['leverage']}x")
     resp = okx_request("POST", "/api/v5/trade/order", body=body, private=True)
     item = resp["data"][0]
     if str(item.get("sCode", "0")) != "0":
@@ -771,8 +888,51 @@ def place_market_order(candidate, plan):
     ord_id = item.get("ordId")
     if not ord_id:
         raise RuntimeError(f"OKX未返回ordId：{resp}")
-    return ord_id, algo_cl_id
+    return ord_id
 
+
+def place_protection_order(candidate, plan, algo_cl_id=None):
+    """按真实成交价独立设置 TP/SL。
+
+    net_mode 下使用反向 side + reduceOnly=true，只允许减少现有仓位。
+    tpOrdPx/slOrdPx=-1 表示触发后按市价执行。
+    """
+    inst_id = candidate["instId"]
+    direction = candidate["direction"]
+    exit_side = "sell" if direction == "LONG" else "buy"
+    algo_cl_id = algo_cl_id or ("ALGOV25" + str(int(time.time() * 1000))[-18:])
+
+    body = {
+        "instId": inst_id,
+        "tdMode": TD_MODE,
+        "side": exit_side,
+        "ordType": "conditional",
+        "sz": plan["sz"],
+        "reduceOnly": True,
+        "algoClOrdId": algo_cl_id,
+        "tpTriggerPx": fmt_decimal(plan["tp"]),
+        "tpOrdPx": "-1",
+        "tpTriggerPxType": "mark",
+        "slTriggerPx": fmt_decimal(plan["sl"]),
+        "slOrdPx": "-1",
+        "slTriggerPxType": "mark",
+    }
+
+    # net_mode 下 posSide 可写 net；保留显式值可减少策略单方向歧义。
+    body["posSide"] = "net"
+
+    log(
+        f"按真实成交价设置TP/SL：{inst_id} {direction} "
+        f"TP={plan['tp']} SL={plan['sl']} size={plan['sz']}"
+    )
+    resp = okx_request("POST", "/api/v5/trade/order-algo", body=body, private=True)
+    item = resp["data"][0]
+    if str(item.get("sCode", "0")) != "0":
+        raise RuntimeError(f"TP/SL策略单被OKX拒绝：{item}")
+    algo_id = item.get("algoId")
+    if not algo_id:
+        raise RuntimeError(f"OKX未返回algoId：{resp}")
+    return algo_id, algo_cl_id
 
 def get_order(inst_id, ord_id):
     data = okx_request(
@@ -837,9 +997,42 @@ def get_algo_detail(algo_cl_id):
         return None
 
 
+def cancel_algo(inst_id, algo_id):
+    try:
+        okx_request(
+            "POST", "/api/v5/trade/cancel-algos",
+            body=[{"instId": inst_id, "algoId": str(algo_id)}], private=True
+        )
+    except Exception as e:
+        log(f"取消TP/SL策略单失败 {inst_id}/{algo_id}: {e}")
+
+
+def verify_protection_by_algo(inst_id, algo_id, algo_cl_id, timeout_sec=8):
+    end = time.time() + timeout_sec
+    last = None
+    while time.time() < end:
+        try:
+            data = okx_request(
+                "GET", "/api/v5/trade/order-algo",
+                params={"algoId": str(algo_id)}, private=True
+            )["data"]
+            if data:
+                row = data[0]
+                last = row
+                state = str(row.get("state") or "")
+                if state in ("live", "effective"):
+                    return True, row
+                if state == "order_failed":
+                    return False, row
+        except Exception as e:
+            last = {"state": "query_error", "error": str(e)}
+        time.sleep(0.5)
+    return False, last
+
+
 def verify_protection(inst_id, ord_id, algo_cl_id, timeout_sec=10):
     """
-    V2.3 protection verification:
+    V2.5 protection verification:
     1) Re-read the filled parent order and inspect attachAlgoOrds.
     2) Query GET /trade/order-algo directly by algoClOrdId.
     3) Fall back to pending algo list.
@@ -992,9 +1185,13 @@ def execute_candidate(candidate, state, equity):
         log("无法设置可用杠杆，放弃交易")
         return False
 
-    plan = build_trade_plan(candidate, equity, actual_lev)
+    taker_fee_rate, maker_fee_rate, fee_source = get_taker_fee(inst_id, candidate.get("instrument", {}))
+    log(f"吃单手续费率 : {taker_fee_rate * 100:.4f}%（来源={fee_source}）")
+    log(f"本策略按双边吃单计算：开仓 + TP/SL平仓")
+
+    plan = build_trade_plan(candidate, equity, actual_lev, taker_fee_rate)
     if not plan:
-        log("仓位/止盈止损计算不满足条件，放弃交易")
+        log("仓位/止盈止损/双边手续费计算不满足条件，放弃交易")
         return False
 
     max_buy, max_sell = get_max_size(inst_id, actual_lev)
@@ -1008,6 +1205,19 @@ def execute_candidate(candidate, state, equity):
         plan["sz"] = fmt_decimal(reduced)
         plan["notional"] = float(reduced) * candidate["ctVal"] * candidate["price"]
         plan["margin"] = plan["notional"] / actual_lev
+        s = float(reduced)
+        ct = candidate["ctVal"]
+        p = plan["price"]
+        slp = plan["sl"]
+        tpp = plan["tp"]
+        f = plan["taker_fee_rate"]
+        plan["entry_fee"] = fee_cost(s * ct * p, f)
+        plan["stop_fee"] = fee_cost(s * ct * slp, f)
+        plan["tp_fee"] = fee_cost(s * ct * tpp, f)
+        plan["gross_loss"] = s * ct * abs(p - slp)
+        plan["gross_profit"] = s * ct * abs(tpp - p)
+        plan["net_loss"] = plan["gross_loss"] + plan["entry_fee"] + plan["stop_fee"]
+        plan["net_profit"] = plan["gross_profit"] - plan["entry_fee"] - plan["tp_fee"]
         log(f"按OKX最大可开仓量缩小仓位：{plan['sz']}张")
 
     log(f"实际杠杆   : {actual_lev}x")
@@ -1017,12 +1227,21 @@ def execute_candidate(candidate, state, equity):
     log(f"理论风险   : {plan['risk_usdt']:.2f} USDT")
     log(f"止损       : {plan['sl']}")
     log(f"止盈       : {plan['tp']}")
-    log(f"RR         : {plan['rr']:.2f}")
+    log(f"毛RR       : {plan['gross_rr']:.2f}")
+    log(f"净RR(双边费): {plan['rr']:.2f}")
+    log(f"开仓手续费 : {plan['entry_fee']:.4f} USDT")
+    log(f"止损平仓费 : {plan['stop_fee']:.4f} USDT")
+    log(f"止盈平仓费 : {plan['tp_fee']:.4f} USDT")
+    log(f"止损净风险 : {plan['net_loss']:.4f} USDT")
+    log(f"止盈净收益 : {plan['net_profit']:.4f} USDT")
 
     ord_id = None
+    algo_id = None
     try:
-        ord_id, algo_cl_id = place_market_order(candidate, plan)
-        log(f"主订单已提交：ordId={ord_id}，TP/SL客户ID={algo_cl_id}")
+        # V2.5：先开仓，不附带预估价格的TP/SL。
+        # 等主订单完全成交后，用 OKX 返回的真实 avgPx 重算止损、止盈和双边手续费。
+        ord_id = place_market_order(candidate, plan)
+        log(f"主订单已提交：ordId={ord_id}")
 
         order = wait_order_filled(inst_id, ord_id, 12)
         if not order:
@@ -1030,8 +1249,9 @@ def execute_candidate(candidate, state, equity):
 
         state_order = order.get("state")
         acc_fill = float(order.get("accFillSz") or 0)
-        avg_px = order.get("avgPx") or ""
-        log(f"订单状态：{state_order}，成交量={acc_fill}，均价={avg_px}")
+        avg_px_raw = order.get("avgPx") or ""
+        avg_px = float(avg_px_raw) if avg_px_raw else 0.0
+        log(f"订单状态：{state_order}，成交量={acc_fill}，真实成交均价={avg_px_raw}")
 
         if state_order != "filled":
             if state_order in ("live", "partially_filled"):
@@ -1043,17 +1263,64 @@ def execute_candidate(candidate, state, equity):
             log("主订单未完全成交，已取消/清理，放弃本次交易")
             return False
 
-        # 主订单 fully filled 后，OKX 才会生成 attached TP/SL；再检查一次。
-        ok, algo = verify_protection(inst_id, ord_id, algo_cl_id, 10)
+        if avg_px <= 0:
+            raise RuntimeError("主订单已成交，但OKX未返回有效avgPx")
+
+        # 使用真实成交价重建计划。数量保持已经成交的数量，避免出现
+        # 计划数量与实际持仓数量不一致；手续费仍按开仓+平仓双边计算。
+        actual_candidate = dict(candidate)
+        actual_candidate["price"] = avg_px
+        actual_plan = build_trade_plan(actual_candidate, equity, actual_lev, taker_fee_rate)
+        if not actual_plan:
+            raise RuntimeError("按真实成交价重算后，TP/SL或双边手续费导致净RR不足")
+
+        actual_sz = fmt_decimal(acc_fill if acc_fill > 0 else float(plan["sz"]))
+        actual_plan["sz"] = actual_sz
+        s_actual = float(actual_sz)
+        ct = actual_candidate["ctVal"]
+        p = actual_plan["price"]
+        slp = actual_plan["sl"]
+        tpp = actual_plan["tp"]
+        f = actual_plan["taker_fee_rate"]
+        actual_plan["notional"] = s_actual * ct * p
+        actual_plan["margin"] = actual_plan["notional"] / actual_lev
+        actual_plan["entry_fee"] = fee_cost(s_actual * ct * p, f)
+        actual_plan["stop_fee"] = fee_cost(s_actual * ct * slp, f)
+        actual_plan["tp_fee"] = fee_cost(s_actual * ct * tpp, f)
+        actual_plan["gross_loss"] = s_actual * ct * abs(p - slp)
+        actual_plan["gross_profit"] = s_actual * ct * abs(tpp - p)
+        actual_plan["net_loss"] = actual_plan["gross_loss"] + actual_plan["entry_fee"] + actual_plan["stop_fee"]
+        actual_plan["net_profit"] = actual_plan["gross_profit"] - actual_plan["entry_fee"] - actual_plan["tp_fee"]
+        actual_plan["rr"] = actual_plan["net_profit"] / actual_plan["net_loss"] if actual_plan["net_loss"] > 0 else 0
+        actual_plan["gross_rr"] = actual_plan["gross_profit"] / actual_plan["gross_loss"] if actual_plan["gross_loss"] > 0 else 0
+
+        log("--------------- 真实成交后重算 ---------------")
+        log(f"真实成交价 : {avg_px_raw}")
+        log(f"真实成交量 : {actual_sz} 张")
+        log(f"真实SL     : {actual_plan['sl']}")
+        log(f"真实TP     : {actual_plan['tp']}")
+        log(f"真实毛RR   : {actual_plan['gross_rr']:.2f}")
+        log(f"真实净RR   : {actual_plan['rr']:.2f}（已计入开仓+平仓手续费）")
+        log(f"真实止损净风险 : {actual_plan['net_loss']:.4f} USDT")
+        log(f"真实止盈净收益 : {actual_plan['net_profit']:.4f} USDT")
+
+        # 独立策略单使用真实成交价计算出的 TP/SL。
+        algo_id, algo_cl_id = place_protection_order(candidate, actual_plan)
+        log(f"TP/SL策略单已提交：algoId={algo_id}，客户ID={algo_cl_id}")
+
+        # 保护单必须确认存在且处于有效状态；否则立即平仓。
+        ok, algo = verify_protection_by_algo(inst_id, algo_id, algo_cl_id, 8)
         if not ok:
-            log("严重警告：主订单已成交，但未确认TP/SL策略单")
+            log("严重警告：真实成交后仍未确认TP/SL策略单有效")
             pos = get_bot_position()
             if pos:
                 close_position_market(pos)
+            if algo_id:
+                cancel_algo(inst_id, algo_id)
             log("已紧急平仓，避免裸仓")
             return False
 
-        log(f"TP/SL 已确认：algoId={algo.get('algoId') or algo.get('attachAlgoId', '')} state={algo.get('state', '')}")
+        log(f"TP/SL 已确认：algoId={algo_id} state={algo.get('state', '')}")
         state["trades"] += 1
         state["last_trade_inst"] = inst_id
         save_state(state)
@@ -1096,9 +1363,9 @@ def print_account_header(state, equity):
 def main():
     require_env()
     if SIMULATED_TRADING != "1":
-        raise RuntimeError("V2.3 目前只允许模拟盘运行。请保持 SIMULATED_TRADING=1。")
+        raise RuntimeError("V2.5 目前只允许模拟盘运行。请保持 SIMULATED_TRADING=1。")
 
-    log("启动 OKX 全市场永续强行情自动交易机器人 V2.3")
+    log("启动 OKX 全市场永续强行情自动交易机器人 V2.5")
     log(f"API地址：{BASE_URL}")
     log("交易模式：模拟盘 / SWAP / USDT / cross / net_mode")
 
