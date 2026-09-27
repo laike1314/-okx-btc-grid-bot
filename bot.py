@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 import requests
 
 # ============================================================
-# OKX 全市场永续强行情自动交易机器人 V2.2
+# OKX 全市场永续强行情自动交易机器人 V2.3
 # - 仅模拟盘：SIMULATED_TRADING=1
 # - USDT 本位永续：SWAP / -USDT-SWAP
 # - 单向持仓 net_mode
@@ -76,11 +76,11 @@ LOSS_COOLDOWN_SECONDS = int(os.getenv("LOSS_COOLDOWN_SECONDS", "1800"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "8"))
 
 # ---------- 文件 ----------
-STATE_FILE = os.getenv("STATE_FILE", "multi_coin_bot_state_v22.json")
+STATE_FILE = os.getenv("STATE_FILE", "multi_coin_bot_state_v23.json")
 REQUEST_TIMEOUT = 12
 
 session = requests.Session()
-session.headers.update({"User-Agent": "OKX-MultiCoin-Bot-V2.2"})
+session.headers.update({"User-Agent": "OKX-MultiCoin-Bot-V2.3"})
 
 _print_lock = threading.Lock()
 _rate_lock = threading.Lock()
@@ -825,18 +825,75 @@ def get_pending_algos(inst_id):
         return []
 
 
-def verify_protection(inst_id, algo_cl_id, timeout_sec=6):
+def get_algo_detail(algo_cl_id):
+    try:
+        data = okx_request(
+            "GET", "/api/v5/trade/order-algo",
+            params={"algoClOrdId": algo_cl_id},
+            private=True,
+        )["data"]
+        return data[0] if data else None
+    except Exception as e:
+        return None
+
+
+def verify_protection(inst_id, ord_id, algo_cl_id, timeout_sec=10):
+    """
+    V2.3 protection verification:
+    1) Re-read the filled parent order and inspect attachAlgoOrds.
+    2) Query GET /trade/order-algo directly by algoClOrdId.
+    3) Fall back to pending algo list.
+
+    OKX documents that attached TP/SL algo orders are generated only after
+    the parent order is fully filled. Therefore a short delay and multiple
+    official query paths are used instead of relying only on the pending list.
+    """
     end = time.time() + timeout_sec
+    last_reason = ""
     while time.time() < end:
-        pending = get_pending_algos(inst_id)
-        for a in pending:
-            if a.get("algoClOrdId") == algo_cl_id or a.get("attachAlgoClOrdId") == algo_cl_id:
-                state = a.get("state", "")
+        # Path 1: parent order details.
+        try:
+            order = get_order(inst_id, ord_id)
+            if order:
+                attached = order.get("attachAlgoOrds") or []
+                if attached:
+                    for a in attached:
+                        aid = a.get("attachAlgoId") or a.get("algoId")
+                        acl = a.get("attachAlgoClOrdId") or a.get("algoClOrdId")
+                        if acl == algo_cl_id or aid:
+                            return True, a
+                # Some API responses expose the client algo id at the parent level.
+                if order.get("attachAlgoClOrdId") == algo_cl_id:
+                    return True, order
+        except Exception as e:
+            last_reason = f"订单详情查询异常: {e}"
+
+        # Path 2: direct algo detail query by client algo id.
+        detail = get_algo_detail(algo_cl_id)
+        if detail:
+            state = str(detail.get("state") or "")
+            # live/effective are protected states. If it already triggered, the
+            # position may already be closing; do not call it a protection failure.
+            if state in ("live", "effective", "triggered", "order_failed"):
+                if state == "order_failed":
+                    last_reason = f"Algo存在但状态={state}, failCode={detail.get('failCode')}"
+                else:
+                    return True, detail
+
+        # Path 3: pending algo list.
+        for a in get_pending_algos(inst_id):
+            acl = a.get("algoClOrdId") or a.get("attachAlgoClOrdId")
+            if acl == algo_cl_id:
+                state = str(a.get("state") or "")
                 if state in ("live", "effective"):
                     return True, a
-        time.sleep(0.8)
-    return False, None
+                last_reason = f"Pending Algo状态={state}"
 
+        time.sleep(0.8)
+
+    if last_reason:
+        log(f"TP/SL确认超时：{last_reason}")
+    return False, None
 
 def close_position_market(position):
     inst_id = position.get("instId")
@@ -965,7 +1022,7 @@ def execute_candidate(candidate, state, equity):
     ord_id = None
     try:
         ord_id, algo_cl_id = place_market_order(candidate, plan)
-        log(f"主订单已提交：ordId={ord_id}")
+        log(f"主订单已提交：ordId={ord_id}，TP/SL客户ID={algo_cl_id}")
 
         order = wait_order_filled(inst_id, ord_id, 12)
         if not order:
@@ -987,7 +1044,7 @@ def execute_candidate(candidate, state, equity):
             return False
 
         # 主订单 fully filled 后，OKX 才会生成 attached TP/SL；再检查一次。
-        ok, algo = verify_protection(inst_id, algo_cl_id, 7)
+        ok, algo = verify_protection(inst_id, ord_id, algo_cl_id, 10)
         if not ok:
             log("严重警告：主订单已成交，但未确认TP/SL策略单")
             pos = get_bot_position()
@@ -996,7 +1053,7 @@ def execute_candidate(candidate, state, equity):
             log("已紧急平仓，避免裸仓")
             return False
 
-        log(f"TP/SL 已确认：algoId={algo.get('algoId')} state={algo.get('state')}")
+        log(f"TP/SL 已确认：algoId={algo.get('algoId') or algo.get('attachAlgoId', '')} state={algo.get('state', '')}")
         state["trades"] += 1
         state["last_trade_inst"] = inst_id
         save_state(state)
@@ -1039,9 +1096,9 @@ def print_account_header(state, equity):
 def main():
     require_env()
     if SIMULATED_TRADING != "1":
-        raise RuntimeError("V2.2 目前只允许模拟盘运行。请保持 SIMULATED_TRADING=1。")
+        raise RuntimeError("V2.3 目前只允许模拟盘运行。请保持 SIMULATED_TRADING=1。")
 
-    log("启动 OKX 全市场永续强行情自动交易机器人 V2.2")
+    log("启动 OKX 全市场永续强行情自动交易机器人 V2.3")
     log(f"API地址：{BASE_URL}")
     log("交易模式：模拟盘 / SWAP / USDT / cross / net_mode")
 
