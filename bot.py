@@ -572,12 +572,17 @@ def check_account_mode():
 
     log(f"账户持仓模式：{pos_mode}")
 
-    if pos_mode != "net":
+    # OKX API:
+    # net_mode = 单向持仓
+    # long_short_mode = 双向持仓
+    if pos_mode != "net_mode":
         raise RuntimeError(
-            "当前账户不是 net 单向持仓模式。"
-            "这版机器人为了避免 long/short 模式下的仓位误判，"
-            "只允许 net 模式。请先把OKX账户切换到单向持仓(net)。"
+            f"当前账户不是单向持仓模式，"
+            f"OKX API返回：{pos_mode}。"
+            f"请在OKX中切换为单向持仓。"
         )
+
+    log("账户持仓模式确认：单向持仓 OK")
 
     return config
 
