@@ -1,39 +1,50 @@
 # -*- coding: utf-8 -*-
-"""
-OKX 全市场永续强行情自动交易机器人 V2.7
-------------------------------------------------
-核心修复：
 
-1. 市价开仓后查询真实成交均价。
-2. TP/SL 使用独立 OCO。
-3. OCO 提交前重新读取最新 Mark Price。
-4. 检查 TP/SL 是否已经被当前 Mark Price 穿越。
-5. TP/SL 已经达到时，不再提交无效 OCO，直接市价平仓。
-6. OCO 创建失败 -> 紧急平仓。
-7. OCO 创建成功但验证失败 -> 紧急平仓。
-8. OCO 验证同时检查：
-   - ordType
-   - state
-   - side
-   - posSide
-   - 数量
-   - TP
-   - SL
-9. 开仓成功后立即保存 active_trade。
-10. 程序重启可以恢复本机器人自己的保护单。
-11. 支持旧版 conditional SL 自动转换为 OCO。
-12. TP/SL 使用 tickSz 精确处理。
-13. 已修复 order 查询必须带 instId 的问题。
-14. 交易结束后尝试统计本次成交 PnL。
-15. 连续亏损限制、每日盈亏限制、每日交易次数限制保留。
-16. 默认 OKX 模拟盘。
+"""
+OKX 全市场永续强行情自动交易机器人 V2.8
+================================================
+
+V2.8 核心升级：
+
+1. 新开仓：
+   - 市价开仓
+   - 获取真实成交均价
+   - 根据 ATR 计算 TP/SL
+   - OCO 保护
+   - 严格验证 OCO
+   - OCO 失败自动紧急平仓
+
+2. 已有仓位：
+   - 自动检查是否存在有效 OCO
+   - 没有 OCO -> 自动接管
+   - 自动读取当前 Mark Price
+   - 自动读取当前 ATR
+   - 根据当前市场价格重新计算 TP/SL
+   - 创建新的 OCO
+   - 验证成功后继续运行
+
+3. 旧 conditional：
+   - 自动发现旧 conditional TP/SL
+   - 取消旧保护
+   - 转换成新的 OCO
+
+4. 防止 TP/SL 已经穿价：
+   - LONG：要求 SL < Mark < TP
+   - SHORT：要求 TP < Mark < SL
+
+5. OCO 创建失败：
+   - 默认紧急市价平仓
+
+6. 默认 OKX 模拟盘。
 
 环境变量：
+
 OKX_API_KEY
 OKX_SECRET_KEY
 OKX_PASSPHRASE
 
 依赖：
+
 pip install requests pandas
 """
 
@@ -44,8 +55,8 @@ import hmac
 import base64
 import hashlib
 import traceback
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 import requests
 import pandas as pd
@@ -57,23 +68,24 @@ import pandas as pd
 
 BASE_URL = "https://www.okx.com"
 
-# 1 = 模拟盘
-# 0 = 实盘
 SIMULATED_TRADING = "1"
 
 INST_TYPE = "SWAP"
+
 SETTLE_CCY = "USDT"
+
 TD_MODE = "cross"
+
+POS_MODE = "net"
+
 
 # ============================================================
 # K线
 # ============================================================
 
 BAR = "5m"
-LOOP_SECONDS = 20
 
-CONFIRM_BAR_15M = "15m"
-CONFIRM_BAR_1H = "1H"
+LOOP_SECONDS = 20
 
 
 # ============================================================
@@ -109,20 +121,16 @@ RSI_SHORT_MAX = 48
 # 风险
 # ============================================================
 
-# 单笔风险 = 权益 0.5%
 RISK_PER_TRADE_PCT = 0.005
 
-# 单笔最大保证金 = 权益 8%
 MAX_MARGIN_PCT = 0.08
 
-# 动态杠杆范围
 MIN_LEVERAGE = 5
+
 MAX_LEVERAGE = 15
 
-# ATR 止损
 ATR_SL_MULTIPLIER = 1.5
 
-# 止盈风险比
 RISK_REWARD = 1.8
 
 
@@ -130,10 +138,8 @@ RISK_REWARD = 1.8
 # 手续费
 # ============================================================
 
-# 吃单手续费估算
 TAKER_FEE_RATE = 0.0005
 
-# 手续费风险缓冲
 FEE_BUFFER_MULTIPLIER = 1.0
 
 
@@ -151,6 +157,7 @@ LOSS_COOLDOWN_SECONDS = 1800
 # ============================================================
 
 MAX_DAILY_LOSS_PCT = 0.03
+
 MAX_DAILY_PROFIT_PCT = 0.05
 
 MAX_DAILY_TRADES = 12
@@ -168,7 +175,7 @@ MIN_ATR_PCT = 0.0015
 
 
 # ============================================================
-# API 请求
+# API
 # ============================================================
 
 REQUEST_TIMEOUT = 12
@@ -182,36 +189,68 @@ PROTECTION_TIMEOUT = 12
 # 安全
 # ============================================================
 
-# OCO 失败以后是否立即平仓
 EMERGENCY_CLOSE_IF_OCO_FAIL = True
 
-# 是否尝试修复旧版 conditional SL
 REPAIR_UNKNOWN_OLD_SL = True
 
-# 如果账户中存在不知道来源的人工仓位
-# 默认不猜 TP/SL
-ALLOW_NEW_TRADE_WHEN_UNKNOWN_POSITION = False
+
+# ============================================================
+# V2.8 新增
+# ============================================================
+
+# 发现没有 TP/SL 的旧仓位时：
+# True = 自动接管
+AUTO_ADOPT_UNPROTECTED_POSITION = True
+
+# 接管旧仓位时：
+# 使用当前 Mark + ATR 重新计算保护
+ADOPT_USE_CURRENT_MARK = True
+
+# 如果 ATR 获取失败，允许使用价格百分比作为备用
+ADOPT_FALLBACK_ATR_PCT = 0.005
 
 
 # ============================================================
 # 状态文件
 # ============================================================
 
-STATE_FILE = "bot_state_v27.json"
+STATE_FILE = "bot_state_v28.json"
+
+LEGACY_STATE_FILE = "bot_state_v27.json"
 
 
 # ============================================================
 # API 密钥
 # ============================================================
 
-API_KEY = os.getenv("OKX_API_KEY", "")
-SECRET_KEY = os.getenv("OKX_SECRET_KEY", "")
-PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
+API_KEY = os.getenv(
+    "OKX_API_KEY",
+    ""
+)
+
+SECRET_KEY = os.getenv(
+    "OKX_SECRET_KEY",
+    ""
+)
+
+PASSPHRASE = os.getenv(
+    "OKX_PASSPHRASE",
+    ""
+)
 
 
-if not API_KEY or not SECRET_KEY or not PASSPHRASE:
+if (
+    not API_KEY
+    or
+    not SECRET_KEY
+    or
+    not PASSPHRASE
+):
+
     raise RuntimeError(
-        "缺少 OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE 环境变量。"
+        "缺少 OKX_API_KEY / "
+        "OKX_SECRET_KEY / "
+        "OKX_PASSPHRASE 环境变量"
     )
 
 
@@ -220,6 +259,7 @@ if not API_KEY or not SECRET_KEY or not PASSPHRASE:
 # ============================================================
 
 def log(msg):
+
     print(
         f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}",
         flush=True
@@ -230,46 +270,92 @@ def log(msg):
 # 状态
 # ============================================================
 
+def default_state():
+
+    return {
+
+        "date":
+            datetime.now().strftime(
+                "%Y-%m-%d"
+            ),
+
+        "start_equity":
+            0.0,
+
+        "trades":
+            0,
+
+        "consecutive_losses":
+            0,
+
+        "cooldown_until":
+            0,
+
+        "last_trade_inst":
+            "",
+
+        "active_trade":
+            None,
+    }
+
+
 def load_state():
 
-    default = {
-        "date": datetime.now().strftime("%Y-%m-%d"),
+    default = default_state()
 
-        "start_equity": 0.0,
+    # --------------------------------------------------------
+    # 优先 V2.8
+    # --------------------------------------------------------
 
-        "trades": 0,
+    file_to_load = None
 
-        "consecutive_losses": 0,
+    if os.path.exists(
+        STATE_FILE
+    ):
 
-        "cooldown_until": 0,
+        file_to_load = STATE_FILE
 
-        "last_trade_inst": "",
+    elif os.path.exists(
+        LEGACY_STATE_FILE
+    ):
 
-        "active_trade": None,
-    }
+        file_to_load = (
+            LEGACY_STATE_FILE
+        )
+
+        log(
+            "发现 V2.7 状态文件，"
+            "准备迁移到 V2.8"
+        )
+
+    if not file_to_load:
+
+        return default
 
     try:
 
-        if not os.path.exists(STATE_FILE):
-            return default
-
         with open(
-            STATE_FILE,
+            file_to_load,
             "r",
             encoding="utf-8"
         ) as f:
 
             state = json.load(f)
 
-        for k, v in default.items():
+        for key, value in default.items():
 
-            state.setdefault(k, v)
+            state.setdefault(
+                key,
+                value
+            )
 
         return state
 
     except Exception as e:
 
-        log(f"读取状态文件失败，使用新状态：{e}")
+        log(
+            f"读取状态文件失败：{e}"
+        )
 
         return default
 
@@ -291,192 +377,24 @@ def save_state(state):
             indent=2
         )
 
-    os.replace(tmp, STATE_FILE)
+    os.replace(
+        tmp,
+        STATE_FILE
+    )
 
 
 state = load_state()
 
 
 # ============================================================
-# OKX 签名
-# ============================================================
-
-def iso_timestamp():
-
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
-    )
-
-
-def sign_okx(
-    timestamp,
-    method,
-    request_path,
-    body=""
-):
-
-    message = (
-        timestamp
-        + method.upper()
-        + request_path
-        + body
-    )
-
-    mac = hmac.new(
-        SECRET_KEY.encode(),
-        message.encode(),
-        hashlib.sha256
-    ).digest()
-
-    return base64.b64encode(mac).decode()
-
-
-# ============================================================
-# OKX API
-# ============================================================
-
-def okx_request(
-    method,
-    path,
-    params=None,
-    body=None,
-    private=False
-):
-
-    method = method.upper()
-
-    params = params or {}
-
-    # GET 参数必须参与签名
-    if method == "GET" and params:
-
-        from urllib.parse import urlencode
-
-        request_path = (
-            path
-            + "?"
-            + urlencode(params)
-        )
-
-    else:
-
-        request_path = path
-
-    body_text = ""
-
-    if body is not None:
-
-        body_text = json.dumps(
-            body,
-            separators=(",", ":"),
-            ensure_ascii=False
-        )
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    # 模拟盘
-    if SIMULATED_TRADING == "1":
-
-        headers["x-simulated-trading"] = "1"
-
-    # 私有 API
-    if private:
-
-        ts = iso_timestamp()
-
-        headers.update({
-
-            "OK-ACCESS-KEY": API_KEY,
-
-            "OK-ACCESS-SIGN": sign_okx(
-                ts,
-                method,
-                request_path,
-                body_text
-            ),
-
-            "OK-ACCESS-TIMESTAMP": ts,
-
-            "OK-ACCESS-PASSPHRASE": PASSPHRASE,
-
-        })
-
-    url = BASE_URL + path
-
-    last_error = None
-
-    for attempt in range(3):
-
-        try:
-
-            if method == "GET":
-
-                r = requests.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT,
-                )
-
-            else:
-
-                r = requests.request(
-                    method,
-                    url,
-                    data=body_text,
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT,
-                )
-
-            if r.status_code >= 500:
-
-                raise RuntimeError(
-                    f"HTTP {r.status_code}: "
-                    f"{r.text[:500]}"
-                )
-
-            data = r.json()
-
-            if str(data.get("code")) != "0":
-
-                raise RuntimeError(
-                    f"OKX API错误 "
-                    f"code={data.get('code')} "
-                    f"msg={data.get('msg')} "
-                    f"data={data.get('data')}"
-                )
-
-            return data
-
-        except Exception as e:
-
-            last_error = e
-
-            if attempt < 2:
-
-                time.sleep(
-                    0.7 * (attempt + 1)
-                )
-
-            else:
-
-                raise
-
-    raise last_error
-
-
-# ============================================================
-# Decimal 工具
+# Decimal
 # ============================================================
 
 def D(x):
 
-    return Decimal(str(x))
+    return Decimal(
+        str(x)
+    )
 
 
 def fmt_decimal(x):
@@ -537,23 +455,202 @@ def ceil_step(
     ) * step
 
 
-def round_price(
-    value,
-    tick,
-    direction=None
+# ============================================================
+# OKX 签名
+# ============================================================
+
+def iso_timestamp():
+
+    return (
+        datetime.now(
+            timezone.utc
+        )
+        .isoformat(
+            timespec="milliseconds"
+        )
+        .replace(
+            "+00:00",
+            "Z"
+        )
+    )
+
+
+def sign_okx(
+    timestamp,
+    method,
+    request_path,
+    body=""
 ):
 
-    if direction == "UP":
+    message = (
+        timestamp
+        +
+        method.upper()
+        +
+        request_path
+        +
+        body
+    )
 
-        return ceil_step(
-            value,
-            tick
+    mac = hmac.new(
+        SECRET_KEY.encode(),
+        message.encode(),
+        hashlib.sha256
+    ).digest()
+
+    return base64.b64encode(
+        mac
+    ).decode()
+
+
+# ============================================================
+# API 请求
+# ============================================================
+
+def okx_request(
+    method,
+    path,
+    params=None,
+    body=None,
+    private=False
+):
+
+    method = method.upper()
+
+    params = params or {}
+
+    request_path = path
+
+    if (
+        method == "GET"
+        and
+        params
+    ):
+
+        from urllib.parse import urlencode
+
+        request_path = (
+            path
+            +
+            "?"
+            +
+            urlencode(params)
         )
 
-    return floor_step(
-        value,
-        tick
-    )
+    body_text = ""
+
+    if body is not None:
+
+        body_text = json.dumps(
+            body,
+            separators=(",", ":"),
+            ensure_ascii=False
+        )
+
+    headers = {
+
+        "Content-Type":
+            "application/json",
+
+        "Accept":
+            "application/json",
+    }
+
+    if SIMULATED_TRADING == "1":
+
+        headers[
+            "x-simulated-trading"
+        ] = "1"
+
+    if private:
+
+        ts = iso_timestamp()
+
+        headers.update({
+
+            "OK-ACCESS-KEY":
+                API_KEY,
+
+            "OK-ACCESS-SIGN":
+                sign_okx(
+                    ts,
+                    method,
+                    request_path,
+                    body_text
+                ),
+
+            "OK-ACCESS-TIMESTAMP":
+                ts,
+
+            "OK-ACCESS-PASSPHRASE":
+                PASSPHRASE,
+        })
+
+    url = BASE_URL + path
+
+    last_error = None
+
+    for attempt in range(3):
+
+        try:
+
+            if method == "GET":
+
+                response = requests.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT
+                )
+
+            else:
+
+                response = requests.request(
+                    method,
+                    url,
+                    data=body_text,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT
+                )
+
+            if response.status_code >= 500:
+
+                raise RuntimeError(
+                    f"HTTP {response.status_code}: "
+                    f"{response.text[:500]}"
+                )
+
+            data = response.json()
+
+            if str(
+                data.get("code")
+            ) != "0":
+
+                raise RuntimeError(
+                    f"OKX API错误 "
+                    f"code={data.get('code')} "
+                    f"msg={data.get('msg')} "
+                    f"data={data.get('data')}"
+                )
+
+            return data
+
+        except Exception as e:
+
+            last_error = e
+
+            if attempt < 2:
+
+                time.sleep(
+                    0.7 *
+                    (attempt + 1)
+                )
+
+            else:
+
+                raise
+
+    raise last_error
 
 
 # ============================================================
@@ -563,31 +660,39 @@ def round_price(
 _instrument_cache = {}
 
 
-def get_instrument(inst_id):
+def get_instrument(
+    inst_id
+):
 
     if inst_id in _instrument_cache:
 
-        return _instrument_cache[inst_id]
+        return _instrument_cache[
+            inst_id
+        ]
 
     data = okx_request(
         "GET",
         "/api/v5/public/instruments",
         params={
-            "instType": INST_TYPE,
-            "instId": inst_id,
-        },
-        private=False,
+            "instType":
+                INST_TYPE,
+
+            "instId":
+                inst_id,
+        }
     )["data"]
 
     if not data:
 
         raise RuntimeError(
-            f"找不到合约信息：{inst_id}"
+            f"找不到合约：{inst_id}"
         )
 
     item = data[0]
 
-    _instrument_cache[inst_id] = item
+    _instrument_cache[
+        inst_id
+    ] = item
 
     return item
 
@@ -598,31 +703,39 @@ def get_all_swap_instruments():
         "GET",
         "/api/v5/public/instruments",
         params={
-            "instType": INST_TYPE
-        },
-        private=False,
+            "instType":
+                INST_TYPE
+        }
     )["data"]
 
     result = []
 
-    for x in data:
+    for item in data:
 
-        if x.get("settleCcy") != SETTLE_CCY:
-
-            continue
-
-        if x.get("state") != "live":
+        if item.get(
+            "settleCcy"
+        ) != SETTLE_CCY:
 
             continue
 
-        if x.get("ctType") not in (
+        if item.get(
+            "state"
+        ) != "live":
+
+            continue
+
+        if item.get(
+            "ctType"
+        ) not in (
             "linear",
             ""
         ):
 
             continue
 
-        result.append(x)
+        result.append(
+            item
+        )
 
     return result
 
@@ -637,9 +750,9 @@ def get_tickers():
         "GET",
         "/api/v5/market/tickers",
         params={
-            "instType": INST_TYPE
-        },
-        private=False,
+            "instType":
+                INST_TYPE
+        }
     )["data"]
 
     return {
@@ -648,15 +761,17 @@ def get_tickers():
     }
 
 
-def get_ticker(inst_id):
+def get_ticker(
+    inst_id
+):
 
     data = okx_request(
         "GET",
         "/api/v5/market/ticker",
         params={
-            "instId": inst_id
-        },
-        private=False,
+            "instId":
+                inst_id
+        }
     )["data"]
 
     if not data:
@@ -668,14 +783,22 @@ def get_ticker(inst_id):
     return data[0]
 
 
-def get_mark_price(inst_id):
+def get_mark_price(
+    inst_id
+):
 
-    ticker = get_ticker(inst_id)
+    ticker = get_ticker(
+        inst_id
+    )
 
     try:
 
         mark = float(
-            ticker.get("markPx") or 0
+            ticker.get(
+                "markPx"
+            )
+            or
+            0
         )
 
     except Exception:
@@ -685,13 +808,18 @@ def get_mark_price(inst_id):
     if mark <= 0:
 
         mark = float(
-            ticker.get("last") or 0
+            ticker.get(
+                "last"
+            )
+            or
+            0
         )
 
     if mark <= 0:
 
         raise RuntimeError(
-            f"{inst_id} 无有效 Mark Price"
+            f"{inst_id} "
+            "没有有效 Mark Price"
         )
 
     return mark
@@ -711,13 +839,21 @@ def get_candles(
         "GET",
         "/api/v5/market/candles",
         params={
-            "instId": inst_id,
-            "bar": bar,
-            "limit": str(
-                min(limit, 300)
-            ),
-        },
-        private=False,
+
+            "instId":
+                inst_id,
+
+            "bar":
+                bar,
+
+            "limit":
+                str(
+                    min(
+                        limit,
+                        300
+                    )
+                ),
+        }
     )["data"]
 
     if not data:
@@ -734,27 +870,58 @@ def get_candles(
 
         rows.append({
 
-            "ts": int(x[0]),
+            "ts":
+                int(x[0]),
 
-            "open": float(x[1]),
+            "open":
+                float(x[1]),
 
-            "high": float(x[2]),
+            "high":
+                float(x[2]),
 
-            "low": float(x[3]),
+            "low":
+                float(x[3]),
 
-            "close": float(x[4]),
+            "close":
+                float(x[4]),
 
-            "vol": float(x[5]),
+            "vol":
+                float(x[5]),
 
-            "volCcy": float(x[6]),
+            "volCcy":
+                float(x[6]),
 
-            "volCcyQuote": float(x[7]),
+            "volCcyQuote":
+                float(x[7]),
 
-            "confirm": str(x[8]),
-
+            "confirm":
+                str(x[8]),
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(
+        rows
+    )
+
+
+def closed_df(df):
+
+    if df.empty:
+
+        return df
+
+    if (
+        str(
+            df.iloc[-1].get(
+                "confirm",
+                "1"
+            )
+        )
+        == "1"
+    ):
+
+        return df
+
+    return df.iloc[:-1].copy()
 
 
 # ============================================================
@@ -895,7 +1062,9 @@ def atr(
             tr3
         ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     return tr.ewm(
         alpha=1 / period,
@@ -903,7 +1072,9 @@ def atr(
     ).mean()
 
 
-def prepare_indicators(df):
+def prepare_indicators(
+    df
+):
 
     if len(df) < 60:
 
@@ -945,30 +1116,37 @@ def prepare_indicators(df):
     return df
 
 
-# ============================================================
-# 只使用已经确认的 K 线
-# ============================================================
+def get_current_atr(
+    inst_id
+):
 
-def closed_df(df):
+    df = get_candles(
+        inst_id,
+        BAR,
+        100
+    )
 
-    if df.empty:
+    df = closed_df(
+        df
+    )
 
-        return df
+    if len(df) < 30:
 
-    if (
-        str(
-            df.iloc[-1]
-            .get(
-                "confirm",
-                "1"
-            )
-        )
-        == "1"
-    ):
+        return None
 
-        return df
+    df = prepare_indicators(
+        df
+    )
 
-    return df.iloc[:-1].copy()
+    value = float(
+        df.iloc[-1]["atr"]
+    )
+
+    if value <= 0:
+
+        return None
+
+    return value
 
 
 # ============================================================
@@ -986,13 +1164,17 @@ def timeframe_trend(
         80
     )
 
-    df = closed_df(df)
+    df = closed_df(
+        df
+    )
 
     if len(df) < 40:
 
         return 0
 
-    df = prepare_indicators(df)
+    df = prepare_indicators(
+        df
+    )
 
     x = df.iloc[-1]
 
@@ -1030,13 +1212,17 @@ def calculate_signal(
         120
     )
 
-    df = closed_df(df)
+    df = closed_df(
+        df
+    )
 
     if len(df) < 60:
 
         return None
 
-    df = prepare_indicators(df)
+    df = prepare_indicators(
+        df
+    )
 
     x = df.iloc[-1]
 
@@ -1062,17 +1248,17 @@ def calculate_signal(
         price
     )
 
-    if atr_pct < MIN_ATR_PCT:
+    if (
+        atr_pct
+        <
+        MIN_ATR_PCT
+    ):
 
         return None
 
     long_score = 0
 
     short_score = 0
-
-    # --------------------------------------------------------
-    # EMA
-    # --------------------------------------------------------
 
     if (
         x["ema_fast"]
@@ -1090,10 +1276,6 @@ def calculate_signal(
 
         short_score += 2
 
-    # --------------------------------------------------------
-    # 价格相对 EMA
-    # --------------------------------------------------------
-
     if (
         price
         >
@@ -1109,10 +1291,6 @@ def calculate_signal(
     ):
 
         short_score += 1
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
 
     if (
         RSI_LONG_MIN
@@ -1134,10 +1312,6 @@ def calculate_signal(
 
         short_score += 1
 
-    # --------------------------------------------------------
-    # MACD
-    # --------------------------------------------------------
-
     if (
         x["macd"]
         >
@@ -1162,18 +1336,14 @@ def calculate_signal(
 
         short_score += 2
 
-    # --------------------------------------------------------
-    # 15m / 1H
-    # --------------------------------------------------------
-
     trend15 = timeframe_trend(
         inst_id,
-        CONFIRM_BAR_15M
+        "15m"
     )
 
     trend1h = timeframe_trend(
         inst_id,
-        CONFIRM_BAR_1H
+        "1H"
     )
 
     if trend15 == 1:
@@ -1191,10 +1361,6 @@ def calculate_signal(
     elif trend1h == -1:
 
         short_score += 1
-
-    # --------------------------------------------------------
-    # 最终方向
-    # --------------------------------------------------------
 
     if (
         long_score
@@ -1228,10 +1394,6 @@ def calculate_signal(
 
         return None
 
-    # --------------------------------------------------------
-    # 动态杠杆
-    # --------------------------------------------------------
-
     if score <= 4:
 
         leverage = 5
@@ -1258,27 +1420,35 @@ def calculate_signal(
 
     return {
 
-        "instId": inst_id,
+        "instId":
+            inst_id,
 
-        "direction": direction,
+        "direction":
+            direction,
 
-        "score": score,
+        "score":
+            score,
 
-        "leverage": leverage,
+        "leverage":
+            leverage,
 
-        "price": price,
+        "price":
+            price,
 
-        "atr": atr_value,
+        "atr":
+            atr_value,
 
-        "atr_pct": atr_pct,
+        "atr_pct":
+            atr_pct,
 
-        "rsi": float(
-            x["rsi"]
-        ),
+        "rsi":
+            float(x["rsi"]),
 
-        "trend15": trend15,
+        "trend15":
+            trend15,
 
-        "trend1h": trend1h,
+        "trend1h":
+            trend1h,
     }
 
 
@@ -1291,13 +1461,13 @@ def get_equity():
     data = okx_request(
         "GET",
         "/api/v5/account/balance",
-        private=True,
+        private=True
     )["data"]
 
     if not data:
 
         raise RuntimeError(
-            "账户余额返回为空"
+            "账户余额为空"
         )
 
     details = data[0].get(
@@ -1305,18 +1475,16 @@ def get_equity():
         []
     )
 
-    for x in details:
+    for item in details:
 
-        if (
-            x.get("ccy")
-            ==
-            SETTLE_CCY
-        ):
+        if item.get(
+            "ccy"
+        ) == SETTLE_CCY:
 
             eq = (
-                x.get("eq")
+                item.get("eq")
                 or
-                x.get("cashBal")
+                item.get("cashBal")
                 or
                 "0"
             )
@@ -1332,7 +1500,7 @@ def get_equity():
         return float(total)
 
     raise RuntimeError(
-        "没有找到 USDT 权益"
+        "找不到 USDT 权益"
     )
 
 
@@ -1346,19 +1514,20 @@ def get_positions():
         "GET",
         "/api/v5/account/positions",
         params={
-            "instType": INST_TYPE
+            "instType":
+                INST_TYPE
         },
-        private=True,
+        private=True
     )["data"]
 
     result = []
 
-    for p in data:
+    for item in data:
 
         try:
 
             pos = float(
-                p.get(
+                item.get(
                     "pos",
                     "0"
                 )
@@ -1370,11 +1539,11 @@ def get_positions():
 
             pos = 0
 
-        if abs(pos) <= 0:
+        if abs(pos) > 0:
 
-            continue
-
-        result.append(p)
+            result.append(
+                item
+            )
 
     return result
 
@@ -1387,19 +1556,20 @@ def get_bot_position():
 
         return None
 
-    # 当前机器人设计：
-    # 账户只允许一个仓位
+    # 本机器人一次只允许一个持仓
     return positions[0]
 
 
-def position_direction(pos):
+def position_direction(
+    pos
+):
 
     pos_side = pos.get(
         "posSide",
         "net"
     )
 
-    pos_qty = float(
+    qty = float(
         pos.get(
             "pos",
             "0"
@@ -1416,31 +1586,35 @@ def position_direction(pos):
 
         return "SHORT"
 
-    if pos_qty > 0:
+    if qty > 0:
 
         return "LONG"
 
     return "SHORT"
 
 
-def get_position_avg_px(pos):
+def get_position_avg_px(
+    pos
+):
 
-    for k in (
+    for key in (
         "avgPx",
         "openAvgPx"
     ):
 
         try:
 
-            px = float(
-                pos.get(k)
+            value = float(
+                pos.get(
+                    key
+                )
                 or
                 0
             )
 
-            if px > 0:
+            if value > 0:
 
-                return px
+                return value
 
         except Exception:
 
@@ -1460,30 +1634,31 @@ def set_leverage(
 
     body = {
 
-        "instId": inst_id,
+        "instId":
+            inst_id,
 
-        "lever": str(
-            leverage
-        ),
+        "lever":
+            str(leverage),
 
-        "mgnMode": TD_MODE,
+        "mgnMode":
+            TD_MODE,
 
-        "posSide": "net",
+        "posSide":
+            "net",
     }
 
     data = okx_request(
         "POST",
         "/api/v5/account/set-leverage",
         body=body,
-        private=True,
+        private=True
     )["data"]
 
     if (
         data
         and
         str(
-            data[0]
-            .get(
+            data[0].get(
                 "sCode",
                 "0"
             )
@@ -1496,17 +1671,14 @@ def set_leverage(
             f"设置杠杆失败：{data[0]}"
         )
 
-    return True
-
 
 # ============================================================
-# TP / SL 计算
+# 新仓位 TP/SL
 # ============================================================
 
-def build_protection_plan(
+def build_new_protection(
     candidate,
-    avg_px=None,
-    sl_override=None
+    avg_px
 ):
 
     inst_id = candidate[
@@ -1521,200 +1693,452 @@ def build_protection_plan(
         info["tickSz"]
     )
 
-    avg_px = float(
-        avg_px
-        or
-        candidate["price"]
-    )
-
-    atr_value = float(
+    atr_value = D(
         candidate["atr"]
     )
 
-    if avg_px <= 0:
+    avg = D(
+        avg_px
+    )
 
-        raise RuntimeError(
-            f"{inst_id} 成交价无效"
+    distance = (
+        atr_value
+        *
+        D(
+            ATR_SL_MULTIPLIER
         )
-
-    if atr_value <= 0:
-
-        raise RuntimeError(
-            f"{inst_id} ATR无效"
-        )
+    )
 
     direction = candidate[
         "direction"
     ]
 
-    # --------------------------------------------------------
-    # 使用旧 SL
-    # --------------------------------------------------------
+    if direction == "LONG":
 
-    if (
-        sl_override is not None
-        and
-        float(sl_override) > 0
-    ):
-
-        sl = float(
-            sl_override
+        sl = floor_step(
+            avg - distance,
+            tick
         )
 
-        risk_distance = abs(
-            avg_px
-            -
-            sl
+        tp = ceil_step(
+            avg
+            +
+            distance
+            *
+            D(RISK_REWARD),
+            tick
         )
 
     else:
 
-        risk_distance = (
-            atr_value
-            *
-            ATR_SL_MULTIPLIER
+        sl = ceil_step(
+            avg + distance,
+            tick
         )
 
-        if direction == "LONG":
+        tp = floor_step(
+            avg
+            -
+            distance
+            *
+            D(RISK_REWARD),
+            tick
+        )
 
-            sl = (
-                avg_px
-                -
-                risk_distance
-            )
+    return {
 
-        else:
+        "instId":
+            inst_id,
 
-            sl = (
-                avg_px
-                +
-                risk_distance
-            )
+        "direction":
+            direction,
 
-    if risk_distance <= 0:
+        "avgPx":
+            avg_px,
+
+        "tp":
+            float(tp),
+
+        "sl":
+            float(sl),
+
+        "tickSz":
+            str(tick),
+
+        "sz":
+            None,
+    }
+
+
+# ============================================================
+# V2.8：
+# 为已有未保护仓位计算 TP/SL
+# ============================================================
+
+def build_adopt_protection(
+    pos
+):
+
+    inst_id = pos[
+        "instId"
+    ]
+
+    direction = position_direction(
+        pos
+    )
+
+    avg_px = get_position_avg_px(
+        pos
+    )
+
+    if avg_px <= 0:
 
         raise RuntimeError(
-            f"{inst_id} TP/SL距离无效"
+            f"{inst_id} "
+            "无法取得持仓均价"
         )
 
     # --------------------------------------------------------
-    # LONG
+    # 当前 Mark
+    # --------------------------------------------------------
+
+    mark = get_mark_price(
+        inst_id
+    )
+
+    # --------------------------------------------------------
+    # 当前 ATR
+    # --------------------------------------------------------
+
+    atr_value = get_current_atr(
+        inst_id
+    )
+
+    if (
+        atr_value is None
+        or
+        atr_value <= 0
+    ):
+
+        atr_value = (
+            mark
+            *
+            ADOPT_FALLBACK_ATR_PCT
+        )
+
+        log(
+            f"{inst_id} "
+            f"ATR获取失败，"
+            f"使用备用 ATR="
+            f"{atr_value}"
+        )
+
+    info = get_instrument(
+        inst_id
+    )
+
+    tick = D(
+        info["tickSz"]
+    )
+
+    distance = (
+        D(str(atr_value))
+        *
+        D(
+            ATR_SL_MULTIPLIER
+        )
+    )
+
+    # ========================================================
+    # 非常重要：
+    #
+    # 已有仓位采用“当前 Mark”作为重新计算基准，
+    # 而不是使用历史开仓价。
+    # ========================================================
+
+    if direction == "LONG":
+
+        sl = floor_step(
+            D(str(mark))
+            -
+            distance,
+            tick
+        )
+
+        tp = ceil_step(
+            D(str(mark))
+            +
+            distance
+            *
+            D(RISK_REWARD),
+            tick
+        )
+
+    else:
+
+        sl = ceil_step(
+            D(str(mark))
+            +
+            distance,
+            tick
+        )
+
+        tp = floor_step(
+            D(str(mark))
+            -
+            distance
+            *
+            D(RISK_REWARD),
+            tick
+        )
+
+    # --------------------------------------------------------
+    # 确保保护价在当前 Mark 外侧
     # --------------------------------------------------------
 
     if direction == "LONG":
 
-        sl = float(
-            round_price(
-                sl,
-                tick,
-                "DOWN"
-            )
-        )
+        if sl >= D(str(mark)):
 
-        tp = float(
-            round_price(
-                avg_px
+            sl = floor_step(
+                D(str(mark))
+                -
+                tick * 2,
+                tick
+            )
+
+        if tp <= D(str(mark)):
+
+            tp = ceil_step(
+                D(str(mark))
                 +
-                risk_distance
-                *
-                RISK_REWARD,
-                tick,
-                "UP"
+                tick * 2,
+                tick
             )
-        )
-
-        if sl >= avg_px:
-
-            sl = float(
-                round_price(
-                    avg_px - tick,
-                    tick,
-                    "DOWN"
-                )
-            )
-
-        if tp <= avg_px:
-
-            tp = float(
-                round_price(
-                    avg_px + tick,
-                    tick,
-                    "UP"
-                )
-            )
-
-    # --------------------------------------------------------
-    # SHORT
-    # --------------------------------------------------------
 
     else:
 
-        sl = float(
-            round_price(
-                sl,
-                tick,
-                "UP"
-            )
-        )
+        if tp >= D(str(mark)):
 
-        tp = float(
-            round_price(
-                avg_px
+            tp = floor_step(
+                D(str(mark))
                 -
-                risk_distance
-                *
-                RISK_REWARD,
-                tick,
-                "DOWN"
-            )
-        )
-
-        if sl <= avg_px:
-
-            sl = float(
-                round_price(
-                    avg_px + tick,
-                    tick,
-                    "UP"
-                )
+                tick * 2,
+                tick
             )
 
-        if tp >= avg_px:
+        if sl <= D(str(mark)):
 
-            tp = float(
-                round_price(
-                    avg_px - tick,
-                    tick,
-                    "DOWN"
-                )
+            sl = ceil_step(
+                D(str(mark))
+                +
+                tick * 2,
+                tick
             )
+
+    log(
+        f"🛡️ 自动接管 {inst_id}："
+        f"方向={direction} "
+        f"持仓均价={avg_px} "
+        f"Mark={mark} "
+        f"ATR={atr_value} "
+        f"TP={tp} "
+        f"SL={sl}"
+    )
 
     return {
 
-        "instId": inst_id,
+        "instId":
+            inst_id,
 
-        "direction": direction,
+        "direction":
+            direction,
 
-        "avgPx": avg_px,
+        "avgPx":
+            avg_px,
 
-        "tp": tp,
+        "markPx":
+            mark,
 
-        "sl": sl,
+        "atr":
+            atr_value,
 
-        "tickSz": str(tick),
+        "tp":
+            float(tp),
 
-        "lotSz": str(
-            info["lotSz"]
-        ),
+        "sl":
+            float(sl),
 
-        "minSz": str(
-            info["minSz"]
-        ),
+        "tickSz":
+            str(tick),
 
-        "ctVal": str(
-            info["ctVal"]
-        ),
+        "sz":
+            abs(
+                float(
+                    pos.get(
+                        "pos",
+                        0
+                    )
+                )
+            ),
     }
+
+
+# ============================================================
+# 检查 TP/SL 是否位于当前价格正确一侧
+# ============================================================
+
+def validate_protection(
+    plan
+):
+
+    direction = plan[
+        "direction"
+    ]
+
+    inst_id = plan[
+        "instId"
+    ]
+
+    tick = D(
+        plan["tickSz"]
+    )
+
+    tp = D(
+        plan["tp"]
+    )
+
+    sl = D(
+        plan["sl"]
+    )
+
+    mark = D(
+        str(
+            get_mark_price(
+                inst_id
+            )
+        )
+    )
+
+    if direction == "LONG":
+
+        if mark >= tp:
+
+            return (
+                "TP_REACHED",
+                float(mark)
+            )
+
+        if mark <= sl:
+
+            return (
+                "SL_REACHED",
+                float(mark)
+            )
+
+        if not (
+            sl < mark
+            and
+            mark < tp
+        ):
+
+            return (
+                "INVALID",
+                float(mark)
+            )
+
+        # 至少隔两个 tick
+        if (
+            tp - mark
+            <
+            tick * 2
+        ):
+
+            tp = ceil_step(
+                mark
+                +
+                tick * 2,
+                tick
+            )
+
+            plan["tp"] = float(tp)
+
+        if (
+            mark - sl
+            <
+            tick * 2
+        ):
+
+            sl = floor_step(
+                mark
+                -
+                tick * 2,
+                tick
+            )
+
+            plan["sl"] = float(sl)
+
+    else:
+
+        if mark <= tp:
+
+            return (
+                "TP_REACHED",
+                float(mark)
+            )
+
+        if mark >= sl:
+
+            return (
+                "SL_REACHED",
+                float(mark)
+            )
+
+        if not (
+            tp < mark
+            and
+            mark < sl
+        ):
+
+            return (
+                "INVALID",
+                float(mark)
+            )
+
+        if (
+            mark - tp
+            <
+            tick * 2
+        ):
+
+            tp = floor_step(
+                mark
+                -
+                tick * 2,
+                tick
+            )
+
+            plan["tp"] = float(tp)
+
+        if (
+            sl - mark
+            <
+            tick * 2
+        ):
+
+            sl = ceil_step(
+                mark
+                +
+                tick * 2,
+                tick
+            )
+
+            plan["sl"] = float(sl)
+
+    return (
+        "OK",
+        float(mark)
+    )
 
 
 # ============================================================
@@ -1758,9 +2182,7 @@ def calculate_size(
         atr_value
         *
         D(
-            str(
-                ATR_SL_MULTIPLIER
-            )
+            ATR_SL_MULTIPLIER
         )
     )
 
@@ -1772,30 +2194,23 @@ def calculate_size(
         D(str(equity))
         *
         D(
-            str(
-                RISK_PER_TRADE_PCT
-            )
+            RISK_PER_TRADE_PCT
         )
     )
 
-    # 开仓 + 止损平仓
-    fee_per_contract = (
+    fee = (
         price
         *
         ct_val
         *
         D(
-            str(
-                TAKER_FEE_RATE
-            )
+            TAKER_FEE_RATE
         )
         *
-        D("2")
+        D(2)
         *
         D(
-            str(
-                FEE_BUFFER_MULTIPLIER
-            )
+            FEE_BUFFER_MULTIPLIER
         )
     )
 
@@ -1804,7 +2219,7 @@ def calculate_size(
         *
         ct_val
         +
-        fee_per_contract
+        fee
     )
 
     if denominator <= 0:
@@ -1821,9 +2236,7 @@ def calculate_size(
         D(str(equity))
         *
         D(
-            str(
-                MAX_MARGIN_PCT
-            )
+            MAX_MARGIN_PCT
         )
     )
 
@@ -1880,8 +2293,8 @@ def place_market_order(
         "sell"
     )
 
-    cl_ord_id = (
-        "MCV27"
+    cl_id = (
+        "MCV28"
         +
         str(
             int(
@@ -1894,45 +2307,48 @@ def place_market_order(
 
     body = {
 
-        "instId": inst_id,
+        "instId":
+            inst_id,
 
-        "tdMode": TD_MODE,
+        "tdMode":
+            TD_MODE,
 
-        "side": side,
+        "side":
+            side,
 
-        "ordType": "market",
+        "ordType":
+            "market",
 
-        "sz": fmt_decimal(sz),
+        "sz":
+            fmt_decimal(sz),
 
-        "posSide": "net",
+        "posSide":
+            "net",
 
-        "clOrdId": cl_ord_id,
+        "clOrdId":
+            cl_id,
     }
 
     resp = okx_request(
         "POST",
         "/api/v5/trade/order",
         body=body,
-        private=True,
+        private=True
     )
 
     item = resp[
         "data"
     ][0]
 
-    if (
-        str(
-            item.get(
-                "sCode",
-                "0"
-            )
+    if str(
+        item.get(
+            "sCode",
+            "0"
         )
-        !=
-        "0"
-    ):
+    ) != "0":
 
         raise RuntimeError(
-            f"开仓被OKX拒绝：{item}"
+            f"开仓失败：{item}"
         )
 
     ord_id = item.get(
@@ -1942,7 +2358,7 @@ def place_market_order(
     if not ord_id:
 
         raise RuntimeError(
-            f"OKX未返回ordId：{resp}"
+            f"没有返回 ordId：{resp}"
         )
 
     return ord_id
@@ -1961,10 +2377,13 @@ def get_order(
         "GET",
         "/api/v5/trade/order",
         params={
-            "instId": inst_id,
-            "ordId": order_id,
+            "instId":
+                inst_id,
+
+            "ordId":
+                order_id,
         },
-        private=True,
+        private=True
     )["data"]
 
     return (
@@ -1981,14 +2400,13 @@ def get_order(
 
 def wait_order_filled(
     inst_id,
-    ord_id,
-    timeout=ORDER_FILL_TIMEOUT
+    ord_id
 ):
 
     end = (
         time.time()
         +
-        timeout
+        ORDER_FILL_TIMEOUT
     )
 
     last = None
@@ -1997,32 +2415,25 @@ def wait_order_filled(
 
         try:
 
-            data = okx_request(
-                "GET",
-                "/api/v5/trade/order",
-                params={
-                    "instId": inst_id,
-                    "ordId": ord_id,
-                },
-                private=True,
-            )["data"]
+            row = get_order(
+                inst_id,
+                ord_id
+            )
 
-            if data:
-
-                row = data[0]
+            if row:
 
                 last = row
 
-                state_now = str(
+                order_state = str(
                     row.get(
                         "state",
                         ""
                     )
                 )
 
-                if state_now == "filled":
+                if order_state == "filled":
 
-                    avg_px = float(
+                    avg = float(
                         row.get(
                             "avgPx"
                         )
@@ -2034,7 +2445,7 @@ def wait_order_filled(
                         0
                     )
 
-                    fill_sz = float(
+                    size = float(
                         row.get(
                             "accFillSz"
                         )
@@ -2043,312 +2454,73 @@ def wait_order_filled(
                             "fillSz"
                         )
                         or
-                        row.get(
-                            "sz"
-                        )
-                        or
                         0
                     )
 
                     if (
-                        avg_px > 0
+                        avg > 0
                         and
-                        fill_sz > 0
+                        size > 0
                     ):
 
                         return row
 
-                if state_now in (
+                if order_state in (
                     "canceled",
                     "mmp_canceled"
                 ):
 
                     raise RuntimeError(
-                        f"开仓订单已取消：{row}"
+                        f"订单已取消：{row}"
                     )
 
         except Exception as e:
 
             log(
-                f"查询成交状态异常：{e}"
+                f"查询成交异常：{e}"
             )
 
-        time.sleep(0.7)
+        time.sleep(
+            0.7
+        )
 
-    # 最后通过持仓确认
     pos = get_bot_position()
 
     if (
         pos
         and
-        pos.get("instId")
+        pos.get(
+            "instId"
+        )
         ==
         inst_id
     ):
 
         return {
 
-            "avgPx": (
-                pos.get(
-                    "avgPx"
-                )
-                or
-                pos.get(
-                    "openAvgPx"
-                )
-            ),
+            "avgPx":
+                get_position_avg_px(
+                    pos
+                ),
 
-            "accFillSz": pos.get(
-                "pos"
-            ),
+            "accFillSz":
+                abs(
+                    float(
+                        pos.get(
+                            "pos"
+                        )
+                        or
+                        0
+                    )
+                ),
 
             "state":
-                "filled_by_position_check",
+                "position_confirmed",
         }
 
     raise RuntimeError(
-        f"订单 {ord_id} "
-        f"超时未确认成交，"
+        f"订单超时：{ord_id} "
         f"last={last}"
-    )
-
-
-# ============================================================
-# TP/SL 当前价格关系
-# ============================================================
-
-def protection_relation(
-    direction,
-    tp,
-    sl,
-    mark,
-    tick
-):
-
-    eps = float(
-        D(tick)
-    )
-
-    if direction == "LONG":
-
-        if mark >= tp - eps:
-
-            return "TP_REACHED"
-
-        if mark <= sl + eps:
-
-            return "SL_REACHED"
-
-        if not (
-            tp > mark + eps
-            and
-            sl < mark - eps
-        ):
-
-            return "INVALID"
-
-    else:
-
-        if mark <= tp + eps:
-
-            return "TP_REACHED"
-
-        if mark >= sl - eps:
-
-            return "SL_REACHED"
-
-        if not (
-            tp < mark - eps
-            and
-            sl > mark + eps
-        ):
-
-            return "INVALID"
-
-    return "OK"
-
-
-# ============================================================
-# OCO 提交前重新校验
-# ============================================================
-
-def validate_and_prepare_protection(
-    candidate,
-    plan
-):
-
-    inst_id = candidate[
-        "instId"
-    ]
-
-    info = get_instrument(
-        inst_id
-    )
-
-    tick = D(
-        info["tickSz"]
-    )
-
-    mark = D(
-        str(
-            get_mark_price(
-                inst_id
-            )
-        )
-    )
-
-    tp = D(
-        str(
-            plan["tp"]
-        )
-    )
-
-    sl = D(
-        str(
-            plan["sl"]
-        )
-    )
-
-    avg = D(
-        str(
-            plan["avgPx"]
-        )
-    )
-
-    direction = candidate[
-        "direction"
-    ]
-
-    # ========================================================
-    # 先判断是否已经触发
-    # ========================================================
-
-    if direction == "LONG":
-
-        if mark >= tp:
-
-            return (
-                "TP_REACHED",
-                float(mark),
-                plan
-            )
-
-        if mark <= sl:
-
-            return (
-                "SL_REACHED",
-                float(mark),
-                plan
-            )
-
-        # TP 至少距离 Mark 两个 tick
-        if tp <= mark + tick:
-
-            tp = ceil_step(
-                mark
-                +
-                tick * 2,
-                tick
-            )
-
-        # SL 至少距离 Mark 两个 tick
-        if sl >= mark - tick:
-
-            sl = floor_step(
-                mark
-                -
-                tick * 2,
-                tick
-            )
-
-    else:
-
-        if mark <= tp:
-
-            return (
-                "TP_REACHED",
-                float(mark),
-                plan
-            )
-
-        if mark >= sl:
-
-            return (
-                "SL_REACHED",
-                float(mark),
-                plan
-            )
-
-        if tp >= mark - tick:
-
-            tp = floor_step(
-                mark
-                -
-                tick * 2,
-                tick
-            )
-
-        if sl <= mark + tick:
-
-            sl = ceil_step(
-                mark
-                +
-                tick * 2,
-                tick
-            )
-
-    # ========================================================
-    # 最终关系检查
-    # ========================================================
-
-    if direction == "LONG":
-
-        if not (
-            tp > mark
-            and
-            sl < mark
-            and
-            sl < avg < tp
-        ):
-
-            raise RuntimeError(
-                "OCO价格关系非法 LONG："
-                f"avg={avg} "
-                f"mark={mark} "
-                f"tp={tp} "
-                f"sl={sl}"
-            )
-
-    else:
-
-        if not (
-            tp < mark
-            and
-            sl > mark
-            and
-            tp < avg < sl
-        ):
-
-            raise RuntimeError(
-                "OCO价格关系非法 SHORT："
-                f"avg={avg} "
-                f"mark={mark} "
-                f"tp={tp} "
-                f"sl={sl}"
-            )
-
-    new_plan = dict(plan)
-
-    new_plan["tp"] = float(tp)
-
-    new_plan["sl"] = float(sl)
-
-    new_plan["markAtValidation"] = float(mark)
-
-    return (
-        "OK",
-        float(mark),
-        new_plan
     )
 
 
@@ -2356,22 +2528,18 @@ def validate_and_prepare_protection(
 # 创建 OCO
 # ============================================================
 
-def place_protection_order(
-    candidate,
-    plan,
-    algo_cl_ord_id=None
+def place_oco(
+    plan
 ):
 
-    inst_id = candidate[
+    inst_id = plan[
         "instId"
     ]
 
-    direction = candidate[
+    direction = plan[
         "direction"
     ]
 
-    # LONG 平仓 = sell
-    # SHORT 平仓 = buy
     exit_side = (
         "sell"
         if direction == "LONG"
@@ -2379,42 +2547,49 @@ def place_protection_order(
         "buy"
     )
 
-    if not algo_cl_ord_id:
+    sz = float(
+        plan["sz"]
+    )
 
-        algo_cl_ord_id = (
-            "OCO27"
-            +
-            str(
-                int(
-                    time.time()
-                    *
-                    1000
-                )
-            )[-20:]
-        )
+    cl_id = (
+        "OCO28"
+        +
+        str(
+            int(
+                time.time()
+                *
+                1000
+            )
+        )[-20:]
+    )
 
     body = {
 
-        "instId": inst_id,
+        "instId":
+            inst_id,
 
-        "tdMode": TD_MODE,
+        "tdMode":
+            TD_MODE,
 
-        "side": exit_side,
+        "side":
+            exit_side,
 
-        "posSide": "net",
+        "posSide":
+            "net",
 
-        "ordType": "oco",
+        "ordType":
+            "oco",
 
-        "sz": fmt_decimal(
-            plan["sz"]
-        ),
+        "sz":
+            fmt_decimal(sz),
 
         "tpTriggerPx":
             fmt_decimal(
                 plan["tp"]
             ),
 
-        "tpOrdPx": "-1",
+        "tpOrdPx":
+            "-1",
 
         "tpTriggerPxType":
             "mark",
@@ -2424,50 +2599,48 @@ def place_protection_order(
                 plan["sl"]
             ),
 
-        "slOrdPx": "-1",
+        "slOrdPx":
+            "-1",
 
         "slTriggerPxType":
             "mark",
 
-        "reduceOnly": True,
+        "reduceOnly":
+            True,
 
         "algoClOrdId":
-            algo_cl_ord_id,
+            cl_id,
     }
 
     log(
-        "提交 OCO："
-        f"side={exit_side} "
+        f"提交 OCO："
+        f"{inst_id} "
+        f"{direction} "
         f"sz={body['sz']} "
         f"TP={body['tpTriggerPx']} "
-        f"SL={body['slTriggerPx']} "
-        f"trigger=mark"
+        f"SL={body['slTriggerPx']}"
     )
 
     resp = okx_request(
         "POST",
         "/api/v5/trade/order-algo",
         body=body,
-        private=True,
+        private=True
     )
 
     item = resp[
         "data"
     ][0]
 
-    if (
-        str(
-            item.get(
-                "sCode",
-                "0"
-            )
+    if str(
+        item.get(
+            "sCode",
+            "0"
         )
-        !=
-        "0"
-    ):
+    ) != "0":
 
         raise RuntimeError(
-            f"OCO TP/SL 被 OKX拒绝：{item}"
+            f"OCO创建失败：{item}"
         )
 
     algo_id = item.get(
@@ -2477,17 +2650,17 @@ def place_protection_order(
     if not algo_id:
 
         raise RuntimeError(
-            f"OKX未返回OCO algoId：{resp}"
+            f"OCO没有返回algoId：{resp}"
         )
 
     return (
         algo_id,
-        algo_cl_ord_id
+        cl_id
     )
 
 
 # ============================================================
-# OCO 详情
+# 策略单
 # ============================================================
 
 def get_algo_detail(
@@ -2499,9 +2672,9 @@ def get_algo_detail(
 
     if algo_id:
 
-        params["algoId"] = str(
-            algo_id
-        )
+        params[
+            "algoId"
+        ] = str(algo_id)
 
     elif algo_cl_ord_id:
 
@@ -2519,7 +2692,7 @@ def get_algo_detail(
         "GET",
         "/api/v5/trade/order-algo",
         params=params,
-        private=True,
+        private=True
     )["data"]
 
     return (
@@ -2530,260 +2703,6 @@ def get_algo_detail(
     )
 
 
-# ============================================================
-# 严格验证 OCO
-# ============================================================
-
-def verify_protection_by_algo(
-    inst_id,
-    algo_id,
-    algo_cl_ord_id,
-    expected_sz,
-    direction,
-    expected_tp,
-    expected_sl,
-    timeout_sec=PROTECTION_TIMEOUT
-):
-
-    end = (
-        time.time()
-        +
-        timeout_sec
-    )
-
-    last = None
-
-    exit_side = (
-        "sell"
-        if direction == "LONG"
-        else
-        "buy"
-    )
-
-    while time.time() < end:
-
-        try:
-
-            row = get_algo_detail(
-                algo_id=algo_id,
-                algo_cl_ord_id=algo_cl_ord_id
-            )
-
-            if row:
-
-                last = row
-
-                state_now = str(
-                    row.get(
-                        "state"
-                    )
-                    or
-                    ""
-                )
-
-                ord_type = str(
-                    row.get(
-                        "ordType"
-                    )
-                    or
-                    ""
-                )
-
-                side = str(
-                    row.get(
-                        "side"
-                    )
-                    or
-                    ""
-                )
-
-                pos_side = str(
-                    row.get(
-                        "posSide"
-                    )
-                    or
-                    ""
-                )
-
-                tp_px = row.get(
-                    "tpTriggerPx"
-                )
-
-                sl_px = row.get(
-                    "slTriggerPx"
-                )
-
-                row_sz = (
-                    row.get("sz")
-                    or
-                    row.get(
-                        "actualSz"
-                    )
-                    or
-                    ""
-                )
-
-                log(
-                    "OCO检查："
-                    f"state={state_now} "
-                    f"ordType={ord_type} "
-                    f"side={side} "
-                    f"posSide={pos_side} "
-                    f"sz={row_sz} "
-                    f"TP={tp_px} "
-                    f"SL={sl_px}"
-                )
-
-                if state_now in (
-                    "order_failed",
-                    "partially_failed",
-                    "canceled"
-                ):
-
-                    return (
-                        False,
-                        row
-                    )
-
-                if ord_type != "oco":
-
-                    time.sleep(0.6)
-
-                    continue
-
-                if side != exit_side:
-
-                    time.sleep(0.6)
-
-                    continue
-
-                if pos_side != "net":
-
-                    time.sleep(0.6)
-
-                    continue
-
-                # ------------------------------------------------
-                # TP / SL 精度验证
-                # ------------------------------------------------
-
-                try:
-
-                    tp_ok = (
-                        abs(
-                            float(tp_px)
-                            -
-                            float(expected_tp)
-                        )
-                        <=
-                        max(
-                            abs(
-                                float(
-                                    expected_tp
-                                )
-                            )
-                            *
-                            1e-7,
-                            1e-12
-                        )
-                    )
-
-                except Exception:
-
-                    tp_ok = False
-
-                try:
-
-                    sl_ok = (
-                        abs(
-                            float(sl_px)
-                            -
-                            float(expected_sl)
-                        )
-                        <=
-                        max(
-                            abs(
-                                float(
-                                    expected_sl
-                                )
-                            )
-                            *
-                            1e-7,
-                            1e-12
-                        )
-                    )
-
-                except Exception:
-
-                    sl_ok = False
-
-                # ------------------------------------------------
-                # 数量验证
-                # ------------------------------------------------
-
-                try:
-
-                    sz_ok = (
-                        abs(
-                            float(row_sz)
-                            -
-                            float(expected_sz)
-                        )
-                        <=
-                        max(
-                            abs(
-                                float(
-                                    expected_sz
-                                )
-                            )
-                            *
-                            0.0001,
-                            1e-12
-                        )
-                    )
-
-                except Exception:
-
-                    sz_ok = True
-
-                if (
-                    state_now
-                    in (
-                        "live",
-                        "effective",
-                        "partially_effective"
-                    )
-                    and
-                    tp_ok
-                    and
-                    sl_ok
-                    and
-                    sz_ok
-                ):
-
-                    return (
-                        True,
-                        row
-                    )
-
-        except Exception as e:
-
-            log(
-                f"OCO策略单查询异常：{e}"
-            )
-
-        time.sleep(0.7)
-
-    return (
-        False,
-        last
-    )
-
-
-# ============================================================
-# 查询策略单
-# ============================================================
-
 def get_pending_algos(
     inst_id,
     ord_type
@@ -2793,23 +2712,28 @@ def get_pending_algos(
         "GET",
         "/api/v5/trade/orders-algo-pending",
         params={
-            "ordType": ord_type,
-            "instType": INST_TYPE,
-            "instId": inst_id,
+
+            "ordType":
+                ord_type,
+
+            "instType":
+                INST_TYPE,
+
+            "instId":
+                inst_id,
         },
-        private=True,
+        private=True
     )["data"]
 
 
 # ============================================================
-# 寻找当前 OCO
+# 找有效 OCO
 # ============================================================
 
 def find_valid_oco(
     inst_id,
     position_sz,
-    direction,
-    algo_id=None
+    direction
 ):
 
     try:
@@ -2819,99 +2743,74 @@ def find_valid_oco(
             "oco"
         )
 
-        exit_side = (
+        expected_side = (
             "sell"
             if direction == "LONG"
             else
             "buy"
         )
 
-        for a in algos:
+        for item in algos:
 
-            if (
-                str(
-                    a.get(
-                        "ordType"
-                    )
-                )
-                !=
-                "oco"
-            ):
-
-                continue
-
-            if (
-                str(
-                    a.get(
-                        "state"
-                    )
-                    or
+            if str(
+                item.get(
+                    "ordType",
                     ""
                 )
-                not in (
-                    "live",
-                    "effective",
-                    "partially_effective"
-                )
-            ):
+            ) != "oco":
 
                 continue
 
-            if (
-                str(
-                    a.get(
-                        "side"
-                    )
-                    or
+            if str(
+                item.get(
+                    "state",
                     ""
                 )
-                !=
-                exit_side
+            ) not in (
+                "live",
+                "effective",
+                "partially_effective"
             ):
 
                 continue
 
-            if (
-                str(
-                    a.get(
-                        "posSide"
-                    )
-                    or
+            if str(
+                item.get(
+                    "side",
+                    ""
+                )
+            ) != expected_side:
+
+                continue
+
+            if str(
+                item.get(
+                    "posSide",
                     "net"
                 )
-                !=
-                "net"
-            ):
+            ) != "net":
 
                 continue
 
             try:
 
-                if (
-                    float(
-                        a.get(
-                            "tpTriggerPx"
-                        )
-                        or
-                        0
+                tp = float(
+                    item.get(
+                        "tpTriggerPx"
                     )
-                    <=
+                    or
                     0
-                ):
+                )
 
-                    continue
-
-                if (
-                    float(
-                        a.get(
-                            "slTriggerPx"
-                        )
-                        or
-                        0
+                sl = float(
+                    item.get(
+                        "slTriggerPx"
                     )
-                    <=
+                    or
                     0
-                ):
+                )
+
+                if tp <= 0 or sl <= 0:
 
                     continue
 
@@ -2919,28 +2818,14 @@ def find_valid_oco(
 
                 continue
 
-            if (
-                algo_id
-                and
-                str(
-                    a.get(
-                        "algoId"
-                    )
-                )
-                ==
-                str(algo_id)
-            ):
-
-                return a
-
             try:
 
-                a_sz = float(
-                    a.get(
+                algo_sz = float(
+                    item.get(
                         "sz"
                     )
                     or
-                    a.get(
+                    item.get(
                         "actualSz"
                     )
                     or
@@ -2950,35 +2835,86 @@ def find_valid_oco(
                 if (
                     position_sz > 0
                     and
+                    algo_sz > 0
+                    and
                     abs(
-                        a_sz
+                        algo_sz
                         -
                         position_sz
                     )
-                    <=
+                    >
                     max(
                         position_sz
                         *
-                        0.0001,
+                        0.001,
                         1e-12
                     )
                 ):
 
-                    return a
+                    continue
 
             except Exception:
 
                 pass
 
-        return None
+            return item
 
     except Exception as e:
 
         log(
-            f"寻找有效 OCO 失败：{e}"
+            f"查询 OCO 异常：{e}"
         )
 
-        return None
+    return None
+
+
+# ============================================================
+# 找旧 conditional
+# ============================================================
+
+def find_old_conditional(
+    inst_id
+):
+
+    try:
+
+        algos = get_pending_algos(
+            inst_id,
+            "conditional"
+        )
+
+        result = []
+
+        for item in algos:
+
+            state_now = str(
+                item.get(
+                    "state",
+                    ""
+                )
+            )
+
+            if state_now not in (
+                "live",
+                "effective",
+                "partially_effective"
+            ):
+
+                continue
+
+            result.append(
+                item
+            )
+
+        return result
+
+    except Exception as e:
+
+        log(
+            f"查询 conditional 异常：{e}"
+        )
+
+        return []
 
 
 # ============================================================
@@ -2995,12 +2931,15 @@ def cancel_algo(
         return False
 
     body = [
+
         {
-            "instId": inst_id,
-            "algoId": str(
-                algo_id
-            ),
+            "instId":
+                inst_id,
+
+            "algoId":
+                str(algo_id)
         }
+
     ]
 
     try:
@@ -3009,7 +2948,7 @@ def cancel_algo(
             "POST",
             "/api/v5/trade/cancel-algos",
             body=body,
-            private=True,
+            private=True
         )
 
         item = resp.get(
@@ -3017,16 +2956,12 @@ def cancel_algo(
             [{}]
         )[0]
 
-        if (
-            str(
-                item.get(
-                    "sCode",
-                    "0"
-                )
+        if str(
+            item.get(
+                "sCode",
+                "0"
             )
-            !=
-            "0"
-        ):
+        ) != "0":
 
             log(
                 f"取消策略单失败：{item}"
@@ -3046,10 +2981,177 @@ def cancel_algo(
 
 
 # ============================================================
+# 验证 OCO
+# ============================================================
+
+def verify_oco(
+    plan,
+    algo_id,
+    cl_id
+):
+
+    end = (
+        time.time()
+        +
+        PROTECTION_TIMEOUT
+    )
+
+    expected_side = (
+        "sell"
+        if plan["direction"]
+        ==
+        "LONG"
+        else
+        "buy"
+    )
+
+    while time.time() < end:
+
+        try:
+
+            row = get_algo_detail(
+                algo_id=algo_id,
+                algo_cl_ord_id=cl_id
+            )
+
+            if row:
+
+                state_now = str(
+                    row.get(
+                        "state",
+                        ""
+                    )
+                )
+
+                ord_type = str(
+                    row.get(
+                        "ordType",
+                        ""
+                    )
+                )
+
+                side = str(
+                    row.get(
+                        "side",
+                        ""
+                    )
+                )
+
+                tp = float(
+                    row.get(
+                        "tpTriggerPx"
+                    )
+                    or
+                    0
+                )
+
+                sl = float(
+                    row.get(
+                        "slTriggerPx"
+                    )
+                    or
+                    0
+                )
+
+                if state_now in (
+                    "order_failed",
+                    "partially_failed",
+                    "canceled"
+                ):
+
+                    return (
+                        False,
+                        row
+                    )
+
+                if (
+                    ord_type == "oco"
+                    and
+                    side == expected_side
+                    and
+                    tp > 0
+                    and
+                    sl > 0
+                    and
+                    state_now in (
+                        "live",
+                        "effective",
+                        "partially_effective"
+                    )
+                ):
+
+                    tp_ok = (
+                        abs(
+                            tp
+                            -
+                            float(
+                                plan["tp"]
+                            )
+                        )
+                        <=
+                        max(
+                            abs(
+                                float(
+                                    plan["tp"]
+                                )
+                            )
+                            *
+                            1e-7,
+                            1e-12
+                        )
+                    )
+
+                    sl_ok = (
+                        abs(
+                            sl
+                            -
+                            float(
+                                plan["sl"]
+                            )
+                        )
+                        <=
+                        max(
+                            abs(
+                                float(
+                                    plan["sl"]
+                                )
+                            )
+                            *
+                            1e-7,
+                            1e-12
+                        )
+                    )
+
+                    if tp_ok and sl_ok:
+
+                        return (
+                            True,
+                            row
+                        )
+
+        except Exception as e:
+
+            log(
+                f"OCO验证异常：{e}"
+            )
+
+        time.sleep(
+            0.7
+        )
+
+    return (
+        False,
+        None
+    )
+
+
+# ============================================================
 # 紧急平仓
 # ============================================================
 
-def emergency_close_position(pos):
+def emergency_close_position(
+    pos
+):
 
     if not pos:
 
@@ -3067,7 +3169,7 @@ def emergency_close_position(pos):
         float(
             pos.get(
                 "pos",
-                "0"
+                0
             )
             or
             0
@@ -3086,7 +3188,7 @@ def emergency_close_position(pos):
     )
 
     log(
-        f"⚠️ 紧急平仓："
+        f"🚨 紧急平仓："
         f"{inst_id} "
         f"{direction} "
         f"qty={qty}"
@@ -3094,24 +3196,29 @@ def emergency_close_position(pos):
 
     body = {
 
-        "instId": inst_id,
+        "instId":
+            inst_id,
 
-        "tdMode": TD_MODE,
+        "tdMode":
+            TD_MODE,
 
-        "side": side,
+        "side":
+            side,
 
-        "ordType": "market",
+        "ordType":
+            "market",
 
-        "sz": fmt_decimal(
-            qty
-        ),
+        "sz":
+            fmt_decimal(qty),
 
-        "posSide": "net",
+        "posSide":
+            "net",
 
-        "reduceOnly": True,
+        "reduceOnly":
+            True,
 
         "clOrdId":
-            "EMC27"
+            "EMC28"
             +
             str(
                 int(
@@ -3126,36 +3233,35 @@ def emergency_close_position(pos):
         "POST",
         "/api/v5/trade/order",
         body=body,
-        private=True,
+        private=True
     )
 
     item = resp[
         "data"
     ][0]
 
-    if (
-        str(
-            item.get(
-                "sCode",
-                "0"
-            )
+    if str(
+        item.get(
+            "sCode",
+            "0"
         )
-        !=
-        "0"
-    ):
+    ) != "0":
 
         raise RuntimeError(
-            f"紧急平仓被拒绝：{item}"
+            f"紧急平仓失败：{item}"
         )
 
     return True
 
 
 # ============================================================
-# 已有持仓保护恢复
+# V2.8 核心：
+# 自动接管没有保护的持仓
 # ============================================================
 
-def repair_existing_position(pos):
+def adopt_existing_position(
+    pos
+):
 
     inst_id = pos[
         "instId"
@@ -3169,121 +3275,53 @@ def repair_existing_position(pos):
         float(
             pos.get(
                 "pos",
-                "0"
+                0
             )
             or
             0
         )
     )
 
-    avg_px = get_position_avg_px(
-        pos
-    )
-
-    if (
-        qty <= 0
-        or
-        avg_px <= 0
-    ):
+    if qty <= 0:
 
         return False
 
-    active = state.get(
-        "active_trade"
+    log(
+        "=" * 60
+    )
+
+    log(
+        f"🛡️ 自动接管已有持仓："
+        f"{inst_id} "
+        f"{direction} "
+        f"qty={qty}"
     )
 
     # ========================================================
-    # A：本机器人自己有 active_trade
+    # 第一层：检查 OCO
     # ========================================================
 
-    if (
-        active
-        and
-        active.get(
-            "instId"
-        )
-        ==
-        inst_id
-        and
-        active.get(
-            "direction"
-        )
-        ==
+    existing_oco = find_valid_oco(
+        inst_id,
+        qty,
         direction
-        and
-        float(
-            active.get(
-                "avgPx",
-                0
-            )
-            or
-            0
-        )
-        > 0
-        and
-        float(
-            active.get(
-                "tp",
-                0
-            )
-            or
-            0
-        )
-        > 0
-        and
-        float(
-            active.get(
-                "sl",
-                0
-            )
-            or
-            0
-        )
-        > 0
-    ):
+    )
 
-        algo_id = active.get(
-            "algoId"
-        )
-
-        algo_cl_ord_id = (
-            active.get(
-                "algoClOrdId"
-            )
-        )
-
-        # ----------------------------------------------------
-        # 先找现有 OCO
-        # ----------------------------------------------------
-
-        valid = find_valid_oco(
-            inst_id,
-            qty,
-            direction,
-            algo_id=algo_id
-        )
-
-        if valid:
-
-            log(
-                f"已有持仓保护正常："
-                f"{inst_id} "
-                f"TP={valid.get('tpTriggerPx')} "
-                f"SL={valid.get('slTriggerPx')}"
-            )
-
-            return True
+    if existing_oco:
 
         log(
-            f"发现 {inst_id} 持仓，"
-            f"但原 OCO 不存在，准备恢复"
+            f"✅ 已存在有效 OCO："
+            f"algoId="
+            f"{existing_oco.get('algoId')} "
+            f"TP="
+            f"{existing_oco.get('tpTriggerPx')} "
+            f"SL="
+            f"{existing_oco.get('slTriggerPx')}"
         )
 
-        # ----------------------------------------------------
-        # 构建原计划
-        # ----------------------------------------------------
-
-        plan = {
+        state[
+            "active_trade"
+        ] = {
 
             "instId":
                 inst_id,
@@ -3291,24 +3329,213 @@ def repair_existing_position(pos):
             "direction":
                 direction,
 
+            "sz":
+                qty,
+
             "avgPx":
-                avg_px,
+                get_position_avg_px(
+                    pos
+                ),
 
             "tp":
                 float(
-                    active["tp"]
+                    existing_oco.get(
+                        "tpTriggerPx"
+                    )
                 ),
 
             "sl":
                 float(
-                    active["sl"]
+                    existing_oco.get(
+                        "slTriggerPx"
+                    )
                 ),
 
-            "sz":
-                qty,
+            "algoId":
+                existing_oco.get(
+                    "algoId"
+                ),
+
+            "algoClOrdId":
+                existing_oco.get(
+                    "algoClOrdId"
+                ),
+
+            "openedAt":
+                int(
+                    time.time()
+                ),
         }
 
-        candidate = {
+        save_state(
+            state
+        )
+
+        return True
+
+    # ========================================================
+    # 第二层：检查旧 conditional
+    # ========================================================
+
+    old_algos = find_old_conditional(
+        inst_id
+    )
+
+    if old_algos:
+
+        log(
+            f"发现 {len(old_algos)} 个旧 conditional"
+        )
+
+        if REPAIR_UNKNOWN_OLD_SL:
+
+            for old in old_algos:
+
+                old_id = old.get(
+                    "algoId"
+                )
+
+                if old_id:
+
+                    log(
+                        f"取消旧 conditional："
+                        f"{old_id}"
+                    )
+
+                    cancel_algo(
+                        inst_id,
+                        old_id
+                    )
+
+    # ========================================================
+    # 第三层：自动计算当前保护
+    # ========================================================
+
+    if not AUTO_ADOPT_UNPROTECTED_POSITION:
+
+        log(
+            "自动接管未保护仓位功能关闭"
+        )
+
+        return False
+
+    try:
+
+        plan = build_adopt_protection(
+            pos
+        )
+
+        # ----------------------------------------------------
+        # 重新读取 Mark
+        # 防止计算和提交之间价格变化
+        # ----------------------------------------------------
+
+        status, mark = (
+            validate_protection(
+                plan
+            )
+        )
+
+        if status in (
+            "TP_REACHED",
+            "SL_REACHED"
+        ):
+
+            log(
+                f"⚠️ 接管时保护价格"
+                f"已经被当前价格穿越："
+                f"{status} "
+                f"mark={mark}"
+            )
+
+            emergency_close_position(
+                pos
+            )
+
+            return True
+
+        if status != "OK":
+
+            raise RuntimeError(
+                f"接管保护价格非法："
+                f"status={status} "
+                f"mark={mark}"
+            )
+
+        # ----------------------------------------------------
+        # 再次读取仓位
+        # ----------------------------------------------------
+
+        latest_pos = get_bot_position()
+
+        if not latest_pos:
+
+            log(
+                "接管过程中仓位已经消失"
+            )
+
+            return True
+
+        if (
+            latest_pos.get(
+                "instId"
+            )
+            !=
+            inst_id
+        ):
+
+            return False
+
+        plan["sz"] = abs(
+            float(
+                latest_pos.get(
+                    "pos",
+                    0
+                )
+            )
+        )
+
+        if plan["sz"] <= 0:
+
+            return True
+
+        # ----------------------------------------------------
+        # 创建 OCO
+        # ----------------------------------------------------
+
+        algo_id, cl_id = place_oco(
+            plan
+        )
+
+        log(
+            f"OCO已创建："
+            f"algoId={algo_id}"
+        )
+
+        # ----------------------------------------------------
+        # 严格验证
+        # ----------------------------------------------------
+
+        ok, row = verify_oco(
+            plan,
+            algo_id,
+            cl_id
+        )
+
+        if not ok:
+
+            raise RuntimeError(
+                f"自动接管 OCO 验证失败："
+                f"{row}"
+            )
+
+        # ----------------------------------------------------
+        # 保存
+        # ----------------------------------------------------
+
+        state[
+            "active_trade"
+        ] = {
 
             "instId":
                 inst_id,
@@ -3316,370 +3543,260 @@ def repair_existing_position(pos):
             "direction":
                 direction,
 
-            "price":
-                avg_px,
+            "sz":
+                plan["sz"],
 
-            "atr":
-                abs(
-                    avg_px
-                    -
-                    float(
-                        active["sl"]
-                    )
-                )
-                /
-                ATR_SL_MULTIPLIER,
+            "avgPx":
+                plan["avgPx"],
+
+            "tp":
+                plan["tp"],
+
+            "sl":
+                plan["sl"],
+
+            "algoId":
+                algo_id,
+
+            "algoClOrdId":
+                cl_id,
+
+            "openedAt":
+                int(
+                    time.time()
+                ),
+
+            "adopted":
+                True,
         }
 
-        try:
+        save_state(
+            state
+        )
 
-            status, mark, plan = (
-                validate_and_prepare_protection(
-                    candidate,
-                    plan
-                )
-            )
+        log(
+            "=" * 60
+        )
 
-            if status in (
-                "TP_REACHED",
-                "SL_REACHED"
-            ):
+        log(
+            f"✅ 已成功接管 {inst_id}"
+        )
 
-                log(
-                    f"{inst_id} "
-                    f"恢复时发现保护价已触发："
-                    f"{status} "
-                    f"mark={mark}"
-                )
+        log(
+            f"方向：{direction}"
+        )
 
-                emergency_close_position(
-                    pos
-                )
+        log(
+            f"持仓：{plan['sz']}"
+        )
 
-                state[
-                    "active_trade"
-                ] = None
+        log(
+            f"原始均价：{plan['avgPx']}"
+        )
 
-                save_state(state)
+        log(
+            f"当前 Mark：{plan['markPx']}"
+        )
 
-                return True
+        log(
+            f"ATR：{plan['atr']}"
+        )
 
-            new_id, clid = (
-                place_protection_order(
-                    candidate,
-                    plan,
-                    algo_cl_ord_id
-                )
-            )
+        log(
+            f"TP：{plan['tp']}"
+        )
 
-            ok, row = (
-                verify_protection_by_algo(
-                    inst_id,
-                    new_id,
-                    clid,
-                    qty,
-                    direction,
-                    plan["tp"],
-                    plan["sl"],
-                    PROTECTION_TIMEOUT
-                )
-            )
+        log(
+            f"SL：{plan['sl']}"
+        )
 
-            if not ok:
+        log(
+            f"OCO：{algo_id}"
+        )
 
-                raise RuntimeError(
-                    f"OCO恢复失败：{row}"
-                )
+        log(
+            "=" * 60
+        )
 
-            active.update({
+        return True
 
-                "algoId":
-                    new_id,
+    except Exception as e:
 
-                "algoClOrdId":
-                    clid,
+        log(
+            f"❌ 自动接管 {inst_id} 失败：{e}"
+        )
 
-                "sz":
-                    qty,
+        traceback.print_exc()
 
-                "avgPx":
-                    avg_px,
+        # ====================================================
+        # 保护失败
+        # ====================================================
 
-                "tp":
-                    plan["tp"],
+        if EMERGENCY_CLOSE_IF_OCO_FAIL:
 
-                "sl":
-                    plan["sl"],
-            })
+            try:
 
-            state[
-                "active_trade"
-            ] = active
+                latest_pos = get_bot_position()
 
-            save_state(state)
-
-            log(
-                f"✅ OCO已恢复："
-                f"TP={plan['tp']} "
-                f"SL={plan['sl']}"
-            )
-
-            return True
-
-        except Exception as e:
-
-            log(
-                f"恢复 OCO 失败：{e}"
-            )
-
-            if EMERGENCY_CLOSE_IF_OCO_FAIL:
-
-                try:
+                if (
+                    latest_pos
+                    and
+                    latest_pos.get(
+                        "instId"
+                    )
+                    ==
+                    inst_id
+                ):
 
                     emergency_close_position(
-                        pos
+                        latest_pos
                     )
 
                     state[
                         "active_trade"
                     ] = None
 
-                    save_state(state)
-
-                except Exception as close_e:
+                    save_state(
+                        state
+                    )
 
                     log(
-                        "❌ 恢复失败且"
-                        f"紧急平仓失败：{close_e}"
+                        "✅ 因无法建立保护，"
+                        "已经紧急平仓"
                     )
 
-            return False
-
-    # ========================================================
-    # B：旧版 conditional SL
-    # ========================================================
-
-    if REPAIR_UNKNOWN_OLD_SL:
-
-        try:
-
-            algos = get_pending_algos(
-                inst_id,
-                "conditional"
-            )
-
-            old_sl = None
-
-            old_algo_id = None
-
-            for a in algos:
-
-                if (
-                    str(
-                        a.get(
-                            "ordType"
-                        )
-                    )
-                    !=
-                    "conditional"
-                ):
-
-                    continue
-
-                sl_px = a.get(
-                    "slTriggerPx"
-                )
-
-                try:
-
-                    sl_val = float(
-                        sl_px or 0
-                    )
-
-                except Exception:
-
-                    continue
-
-                if sl_val > 0:
-
-                    old_sl = sl_val
-
-                    old_algo_id = (
-                        a.get(
-                            "algoId"
-                        )
-                    )
-
-                    break
-
-            if old_sl:
+            except Exception as close_e:
 
                 log(
-                    f"检测到旧版 "
-                    f"conditional SL："
-                    f"{inst_id} "
-                    f"SL={old_sl}"
+                    "🚨 自动接管失败，"
+                    f"且紧急平仓失败：{close_e}"
                 )
 
-                # 取消旧保护
-                if old_algo_id:
-
-                    cancel_algo(
-                        inst_id,
-                        old_algo_id
-                    )
-
-                candidate = {
-
-                    "instId":
-                        inst_id,
-
-                    "direction":
-                        direction,
-
-                    "price":
-                        avg_px,
-
-                    "atr":
-                        max(
-                            abs(
-                                avg_px
-                                -
-                                old_sl
-                            )
-                            /
-                            ATR_SL_MULTIPLIER,
-
-                            avg_px
-                            *
-                            0.001
-                        ),
-                }
-
-                plan = (
-                    build_protection_plan(
-                        candidate,
-                        avg_px=avg_px,
-                        sl_override=old_sl
-                    )
-                )
-
-                plan["sz"] = qty
-
-                status, mark, plan = (
-                    validate_and_prepare_protection(
-                        candidate,
-                        plan
-                    )
-                )
-
-                if status in (
-                    "TP_REACHED",
-                    "SL_REACHED"
-                ):
-
-                    log(
-                        "旧SL转换前"
-                        f"价格已触发：{status}"
-                    )
-
-                    emergency_close_position(
-                        pos
-                    )
-
-                    return True
-
-                algo_id_new, clid = (
-                    place_protection_order(
-                        candidate,
-                        plan
-                    )
-                )
-
-                ok, row = (
-                    verify_protection_by_algo(
-                        inst_id,
-                        algo_id_new,
-                        clid,
-                        qty,
-                        direction,
-                        plan["tp"],
-                        plan["sl"],
-                        PROTECTION_TIMEOUT
-                    )
-                )
-
-                if not ok:
-
-                    raise RuntimeError(
-                        f"旧 SL 转 OCO 失败：{row}"
-                    )
-
-                state[
-                    "active_trade"
-                ] = {
-
-                    "instId":
-                        inst_id,
-
-                    "direction":
-                        direction,
-
-                    "sz":
-                        qty,
-
-                    "avgPx":
-                        avg_px,
-
-                    "tp":
-                        plan["tp"],
-
-                    "sl":
-                        plan["sl"],
-
-                    "algoId":
-                        algo_id_new,
-
-                    "algoClOrdId":
-                        clid,
-
-                    "openedAt":
-                        int(
-                            time.time()
-                        ),
-                }
-
-                save_state(state)
-
-                log(
-                    f"✅ 旧 SL 已转换为 OCO："
-                    f"TP={plan['tp']} "
-                    f"SL={plan['sl']}"
-                )
-
-                return True
-
-        except Exception as e:
-
-            log(
-                f"旧 SL 自动转换 OCO失败：{e}"
-            )
-
-    # ========================================================
-    # 未知仓位
-    # ========================================================
-
-    log(
-        f"⚠️ {inst_id} 存在持仓，"
-        f"但无法确定原始 TP/SL。"
-        f"机器人不会猜价格。"
-    )
-
-    return False
+        return False
 
 
 # ============================================================
-# 每日状态
+# 修复已有持仓
+# ============================================================
+
+def repair_existing_position(
+    pos
+):
+
+    inst_id = pos[
+        "instId"
+    ]
+
+    qty = abs(
+        float(
+            pos.get(
+                "pos",
+                0
+            )
+            or
+            0
+        )
+    )
+
+    direction = position_direction(
+        pos
+    )
+
+    # --------------------------------------------------------
+    # 先检查 OCO
+    # --------------------------------------------------------
+
+    existing = find_valid_oco(
+        inst_id,
+        qty,
+        direction
+    )
+
+    if existing:
+
+        log(
+            f"✅ {inst_id} "
+            f"OCO正常，继续监控："
+            f"TP={existing.get('tpTriggerPx')} "
+            f"SL={existing.get('slTriggerPx')}"
+        )
+
+        # 如果状态里没有，就补记录
+        if not state.get(
+            "active_trade"
+        ):
+
+            state[
+                "active_trade"
+            ] = {
+
+                "instId":
+                    inst_id,
+
+                "direction":
+                    direction,
+
+                "sz":
+                    qty,
+
+                "avgPx":
+                    get_position_avg_px(
+                        pos
+                    ),
+
+                "tp":
+                    float(
+                        existing.get(
+                            "tpTriggerPx"
+                        )
+                    ),
+
+                "sl":
+                    float(
+                        existing.get(
+                            "slTriggerPx"
+                        )
+                    ),
+
+                "algoId":
+                    existing.get(
+                        "algoId"
+                    ),
+
+                "algoClOrdId":
+                    existing.get(
+                        "algoClOrdId"
+                    ),
+
+                "openedAt":
+                    int(
+                        time.time()
+                    ),
+            }
+
+            save_state(
+                state
+            )
+
+        return True
+
+    # --------------------------------------------------------
+    # 没有 OCO
+    # --------------------------------------------------------
+
+    log(
+        f"⚠️ {inst_id} "
+        f"没有发现有效 OCO，"
+        f"进入自动接管流程"
+    )
+
+    return adopt_existing_position(
+        pos
+    )
+
+
+# ============================================================
+# 每日限制
 # ============================================================
 
 def reset_daily_if_needed(
@@ -3694,13 +3811,17 @@ def reset_daily_if_needed(
         "date"
     ) != today:
 
-        state["date"] = today
+        state[
+            "date"
+        ] = today
 
         state[
             "start_equity"
         ] = float(equity)
 
-        state["trades"] = 0
+        state[
+            "trades"
+        ] = 0
 
         state[
             "consecutive_losses"
@@ -3714,11 +3835,8 @@ def reset_daily_if_needed(
             "last_trade_inst"
         ] = ""
 
-        save_state(state)
-
-        log(
-            f"新交易日，"
-            f"起始权益={equity:.4f}"
+        save_state(
+            state
         )
 
     if not state.get(
@@ -3729,7 +3847,9 @@ def reset_daily_if_needed(
             "start_equity"
         ] = float(equity)
 
-        save_state(state)
+        save_state(
+            state
+        )
 
 
 def daily_allowed(
@@ -3747,8 +3867,7 @@ def daily_allowed(
     ):
 
         log(
-            "达到今日最大交易次数，"
-            "暂停开新仓"
+            "达到每日交易次数限制"
         )
 
         return False
@@ -3766,19 +3885,6 @@ def daily_allowed(
         )
     ):
 
-        remain = int(
-            state[
-                "cooldown_until"
-            ]
-            -
-            time.time()
-        )
-
-        log(
-            "连续亏损冷却中，"
-            f"剩余 {max(remain, 0)} 秒"
-        )
-
         return False
 
     start = float(
@@ -3789,34 +3895,34 @@ def daily_allowed(
 
     if start > 0:
 
-        change_pct = (
+        change = (
             equity
             -
             start
         ) / start
 
         if (
-            change_pct
+            change
             <=
             -MAX_DAILY_LOSS_PCT
         ):
 
             log(
-                "达到每日最大亏损限制："
-                f"{change_pct:.2%}"
+                f"达到每日亏损限制："
+                f"{change:.2%}"
             )
 
             return False
 
         if (
-            change_pct
+            change
             >=
             MAX_DAILY_PROFIT_PCT
         ):
 
             log(
-                "达到每日盈利限制："
-                f"{change_pct:.2%}"
+                f"达到每日盈利限制："
+                f"{change:.2%}"
             )
 
             return False
@@ -3825,112 +3931,7 @@ def daily_allowed(
 
 
 # ============================================================
-# 已实现 PnL
-# ============================================================
-
-def get_realized_pnl_for_position(
-    inst_id,
-    opened_at=None
-):
-
-    try:
-
-        data = okx_request(
-            "GET",
-            "/api/v5/trade/fills-history",
-            params={
-                "instType": INST_TYPE,
-                "instId": inst_id,
-                "limit": "100",
-            },
-            private=True,
-        )["data"]
-
-        if not data:
-
-            return None
-
-        cutoff_ms = (
-            int(
-                opened_at or 0
-            )
-            *
-            1000
-        )
-
-        total = 0.0
-
-        found = False
-
-        for x in data:
-
-            try:
-
-                ts = int(
-                    x.get(
-                        "ts"
-                    )
-                    or
-                    0
-                )
-
-            except Exception:
-
-                ts = 0
-
-            if (
-                cutoff_ms
-                and
-                ts < cutoff_ms
-            ):
-
-                continue
-
-            try:
-
-                pnl = float(
-                    x.get(
-                        "pnl"
-                    )
-                    or
-                    0
-                )
-
-                fee = float(
-                    x.get(
-                        "fee"
-                    )
-                    or
-                    0
-                )
-
-                total += (
-                    pnl
-                    +
-                    fee
-                )
-
-                found = True
-
-            except Exception:
-
-                pass
-
-        if found:
-
-            return total
-
-    except Exception as e:
-
-        log(
-            f"读取成交盈亏失败：{e}"
-        )
-
-    return None
-
-
-# ============================================================
-# 检查仓位是否结束
+# 检查交易是否结束
 # ============================================================
 
 def check_position_closed():
@@ -3955,18 +3956,14 @@ def check_position_closed():
 
         positions = get_positions()
 
-    except Exception as e:
-
-        log(
-            f"检查持仓结束状态失败：{e}"
-        )
+    except Exception:
 
         return
 
-    for p in positions:
+    for pos in positions:
 
         if (
-            p.get(
+            pos.get(
                 "instId"
             )
             ==
@@ -3975,68 +3972,19 @@ def check_position_closed():
 
             return
 
-    # --------------------------------------------------------
-    # 仓位已经不存在
-    # --------------------------------------------------------
-
-    pnl = get_realized_pnl_for_position(
-        inst_id,
-        active.get(
-            "openedAt"
-        )
+    # 仓位消失
+    log(
+        f"检测到 {inst_id} "
+        "仓位已经结束"
     )
-
-    if pnl is not None:
-
-        log(
-            f"检测到仓位结束："
-            f"{inst_id}，"
-            f"本次成交净PnL≈"
-            f"{pnl:.4f} USDT "
-            f"（含成交手续费，"
-            f"未单独计 funding）"
-        )
-
-        if pnl < 0:
-
-            state[
-                "consecutive_losses"
-            ] += 1
-
-            if (
-                state[
-                    "consecutive_losses"
-                ]
-                >=
-                MAX_CONSECUTIVE_LOSSES
-            ):
-
-                state[
-                    "cooldown_until"
-                ] = (
-                    time.time()
-                    +
-                    LOSS_COOLDOWN_SECONDS
-                )
-
-                log(
-                    "连续亏损达到 "
-                    f"{MAX_CONSECUTIVE_LOSSES} 次，"
-                    f"冷却 "
-                    f"{LOSS_COOLDOWN_SECONDS // 60} 分钟"
-                )
-
-        elif pnl > 0:
-
-            state[
-                "consecutive_losses"
-            ] = 0
 
     state[
         "active_trade"
     ] = None
 
-    save_state(state)
+    save_state(
+        state
+    )
 
 
 # ============================================================
@@ -4051,7 +3999,7 @@ def scan_candidates():
 
     tickers = get_tickers()
 
-    rows = []
+    result = []
 
     for info in instruments:
 
@@ -4069,7 +4017,7 @@ def scan_candidates():
 
         try:
 
-            vol24 = float(
+            volume = float(
                 ticker.get(
                     "volCcy24h"
                 )
@@ -4077,31 +4025,17 @@ def scan_candidates():
                 0
             )
 
-            last = float(
-                ticker.get(
-                    "last"
-                )
-                or
-                0
-            )
-
-            if last <= 0:
-
-                continue
-
             if (
-                vol24
+                volume
                 <
                 MIN_24H_VOL_USDT
             ):
 
                 continue
 
-            candidate = (
-                calculate_signal(
-                    inst_id,
-                    ticker
-                )
+            candidate = calculate_signal(
+                inst_id,
+                ticker
             )
 
             if not candidate:
@@ -4109,10 +4043,10 @@ def scan_candidates():
                 continue
 
             volume_score = min(
-                vol24
+                volume
                 /
                 50_000_000,
-                3.0
+                3
             )
 
             candidate[
@@ -4131,7 +4065,7 @@ def scan_candidates():
                 100
             )
 
-            rows.append(
+            result.append(
                 candidate
             )
 
@@ -4139,19 +4073,19 @@ def scan_candidates():
 
             continue
 
-    rows.sort(
+    result.sort(
         key=lambda x:
             x["rank_score"],
         reverse=True
     )
 
-    return rows[
+    return result[
         :SCAN_LIMIT
     ]
 
 
 # ============================================================
-# 执行候选
+# 执行新交易
 # ============================================================
 
 def execute_candidate(
@@ -4163,10 +4097,6 @@ def execute_candidate(
         "instId"
     ]
 
-    # ========================================================
-    # 防止刚交易同一标的重复进入
-    # ========================================================
-
     if (
         state.get(
             "last_trade_inst"
@@ -4175,16 +4105,7 @@ def execute_candidate(
         inst_id
     ):
 
-        log(
-            f"{inst_id} "
-            "为最近交易标的，跳过一次"
-        )
-
         return False
-
-    # ========================================================
-    # 设置杠杆
-    # ========================================================
 
     set_leverage(
         inst_id,
@@ -4192,10 +4113,6 @@ def execute_candidate(
             "leverage"
         ]
     )
-
-    # ========================================================
-    # 计算数量
-    # ========================================================
 
     sz = calculate_size(
         candidate,
@@ -4206,9 +4123,7 @@ def execute_candidate(
 
         log(
             f"{inst_id} "
-            "计算出的合约数量"
-            "低于最小下单量，跳过。"
-            f"价格={candidate['price']}"
+            "下单数量低于最小数量"
         )
 
         return False
@@ -4217,33 +4132,15 @@ def execute_candidate(
         inst_id
     )
 
-    min_sz = float(
+    if sz < float(
         info["minSz"]
-    )
-
-    if sz < min_sz:
-
-        log(
-            f"{inst_id} "
-            f"sz={sz} "
-            f"< minSz={min_sz}，跳过"
-        )
+    ):
 
         return False
 
-    log(
-        f"准备开仓："
-        f"{inst_id} "
-        f"{candidate['direction']} "
-        f"score={candidate['score']} "
-        f"lev={candidate['leverage']}x "
-        f"sz={sz} "
-        f"price={candidate['price']:.8f}"
-    )
-
-    # ========================================================
-    # 1. 市价开仓
-    # ========================================================
+    # --------------------------------------------------------
+    # 开仓
+    # --------------------------------------------------------
 
     ord_id = place_market_order(
         candidate,
@@ -4251,13 +4148,8 @@ def execute_candidate(
     )
 
     log(
-        f"开仓订单已提交："
-        f"ordId={ord_id}"
+        f"开仓订单：{ord_id}"
     )
-
-    # ========================================================
-    # 2. 等待真实成交
-    # ========================================================
 
     fill = wait_order_filled(
         inst_id,
@@ -4269,24 +4161,12 @@ def execute_candidate(
             "avgPx"
         )
         or
-        fill.get(
-            "fillPx"
-        )
-        or
         0
     )
 
     actual_sz = float(
         fill.get(
             "accFillSz"
-        )
-        or
-        fill.get(
-            "fillSz"
-        )
-        or
-        fill.get(
-            "pos"
         )
         or
         0
@@ -4300,25 +4180,14 @@ def execute_candidate(
 
         pos = get_bot_position()
 
-        if (
-            not pos
-            or
-            pos.get(
-                "instId"
-            )
-            !=
-            inst_id
-        ):
+        if not pos:
 
             raise RuntimeError(
-                "开仓后无法取得"
-                "真实成交价/数量"
+                "开仓后没有持仓"
             )
 
-        avg_px = (
-            get_position_avg_px(
-                pos
-            )
+        avg_px = get_position_avg_px(
+            pos
         )
 
         actual_sz = abs(
@@ -4331,109 +4200,31 @@ def execute_candidate(
             )
         )
 
-    if (
-        avg_px <= 0
-        or
-        actual_sz <= 0
-    ):
-
-        raise RuntimeError(
-            "开仓后真实成交价/数量无效"
-        )
-
     log(
         f"真实成交："
-        f"{inst_id} "
         f"avgPx={avg_px} "
         f"sz={actual_sz}"
     )
 
-    # ========================================================
-    # 3. 根据真实成交价计算 TP/SL
-    # ========================================================
+    # --------------------------------------------------------
+    # 计算保护
+    # --------------------------------------------------------
 
-    plan = build_protection_plan(
+    plan = build_new_protection(
         candidate,
-        avg_px=avg_px
+        avg_px
     )
 
     plan["sz"] = actual_sz
 
-    log(
-        f"初始保护计划："
-        f"TP={plan['tp']} "
-        f"SL={plan['sl']} "
-        f"RR={RISK_REWARD}"
+    status, mark = validate_protection(
+        plan
     )
 
-    # ========================================================
-    # 4. 立即保存 active_trade
-    #
-    # 即使之后 OCO 创建失败，
-    # 重启以后仍然知道这笔仓位属于机器人。
-    # ========================================================
-
-    state[
-        "active_trade"
-    ] = {
-
-        "instId":
-            inst_id,
-
-        "direction":
-            candidate[
-                "direction"
-            ],
-
-        "sz":
-            actual_sz,
-
-        "avgPx":
-            avg_px,
-
-        "tp":
-            plan["tp"],
-
-        "sl":
-            plan["sl"],
-
-        "algoId":
-            None,
-
-        "algoClOrdId":
-            None,
-
-        "openedAt":
-            int(
-                time.time()
-            ),
-    }
-
-    save_state(state)
-
-    # ========================================================
-    # 5. OCO 提交前重新读取 Mark Price
-    # ========================================================
-
-    status, mark, plan = (
-        validate_and_prepare_protection(
-            candidate,
-            plan
-        )
-    )
-
-    # --------------------------------------------------------
-    # 如果开仓瞬间 TP/SL 已经被穿越
-    # --------------------------------------------------------
-
-    if status in (
-        "TP_REACHED",
-        "SL_REACHED"
-    ):
+    if status != "OK":
 
         log(
-            "⚠️ 开仓后保护价"
-            "已经被 Mark Price 穿越："
+            f"开仓后保护价格异常："
             f"{status} "
             f"mark={mark}"
         )
@@ -4446,130 +4237,102 @@ def execute_candidate(
                 pos
             )
 
-        state[
-            "active_trade"
-        ] = None
-
-        save_state(state)
-
         return False
 
-    # ========================================================
-    # 6. 保存经过 Mark Price 修正后的 TP/SL
-    # ========================================================
-
-    state[
-        "active_trade"
-    ]["tp"] = plan[
-        "tp"
-    ]
-
-    state[
-        "active_trade"
-    ]["sl"] = plan[
-        "sl"
-    ]
-
-    save_state(state)
-
-    # ========================================================
-    # 7. 创建 OCO
-    # ========================================================
-
-    algo_id = None
-
-    algo_cl_id = None
+    # --------------------------------------------------------
+    # OCO
+    # --------------------------------------------------------
 
     try:
 
-        algo_id, algo_cl_id = (
-            place_protection_order(
-                candidate,
-                plan
-            )
+        algo_id, cl_id = place_oco(
+            plan
         )
 
-        state[
-            "active_trade"
-        ]["algoId"] = algo_id
-
-        state[
-            "active_trade"
-        ]["algoClOrdId"] = (
-            algo_cl_id
-        )
-
-        save_state(state)
-
-        log(
-            "OCO策略单已提交："
-            f"algoId={algo_id} "
-            f"客户ID={algo_cl_id}"
-        )
-
-        # ====================================================
-        # 8. 严格验证 OCO
-        # ====================================================
-
-        ok, algo = (
-            verify_protection_by_algo(
-
-                inst_id,
-
-                algo_id,
-
-                algo_cl_id,
-
-                actual_sz,
-
-                candidate[
-                    "direction"
-                ],
-
-                plan["tp"],
-
-                plan["sl"],
-
-                PROTECTION_TIMEOUT
-            )
+        ok, row = verify_oco(
+            plan,
+            algo_id,
+            cl_id
         )
 
         if not ok:
 
             raise RuntimeError(
-                f"OCO TP/SL 未确认：{algo}"
+                f"OCO验证失败：{row}"
             )
 
-        log(
-            "✅ OCO TP/SL 已确认："
-            f"algoId={algo_id} "
-            f"TP={algo.get('tpTriggerPx')} "
-            f"SL={algo.get('slTriggerPx')}"
+        state[
+            "active_trade"
+        ] = {
+
+            "instId":
+                inst_id,
+
+            "direction":
+                candidate[
+                    "direction"
+                ],
+
+            "sz":
+                actual_sz,
+
+            "avgPx":
+                avg_px,
+
+            "tp":
+                plan["tp"],
+
+            "sl":
+                plan["sl"],
+
+            "algoId":
+                algo_id,
+
+            "algoClOrdId":
+                cl_id,
+
+            "openedAt":
+                int(
+                    time.time()
+                ),
+
+            "adopted":
+                False,
+        }
+
+        state[
+            "trades"
+        ] += 1
+
+        state[
+            "last_trade_inst"
+        ] = inst_id
+
+        save_state(
+            state
         )
+
+        log(
+            f"🎯 新交易建立成功："
+            f"{inst_id} "
+            f"{candidate['direction']} "
+            f"TP={plan['tp']} "
+            f"SL={plan['sl']}"
+        )
+
+        return True
 
     except Exception as e:
 
         log(
-            f"❌ OCO创建/验证失败：{e}"
+            f"❌ OCO失败：{e}"
         )
-
-        # ====================================================
-        # 9. OCO 失败 -> 紧急平仓
-        # ====================================================
 
         if EMERGENCY_CLOSE_IF_OCO_FAIL:
 
             pos = get_bot_position()
 
-            if (
-                pos
-                and
-                pos.get(
-                    "instId"
-                )
-                ==
-                inst_id
-            ):
+            if pos:
 
                 try:
 
@@ -4577,52 +4340,14 @@ def execute_candidate(
                         pos
                     )
 
-                    state[
-                        "active_trade"
-                    ] = None
-
-                    save_state(state)
-
-                    log(
-                        "✅ OCO失败后的"
-                        "紧急平仓完成"
-                    )
-
                 except Exception as close_e:
 
                     log(
-                        "❌ OCO失败后的"
-                        f"紧急平仓也失败：{close_e}"
+                        f"🚨 紧急平仓失败："
+                        f"{close_e}"
                     )
 
-                    # 不清 active_trade
-                    # 下一轮继续尝试保护/恢复
-
         raise
-
-    # ========================================================
-    # 10. 交易正式建立
-    # ========================================================
-
-    state[
-        "trades"
-    ] += 1
-
-    state[
-        "last_trade_inst"
-    ] = inst_id
-
-    save_state(state)
-
-    log(
-        f"🎯 交易建立完成："
-        f"{inst_id} "
-        f"{candidate['direction']} "
-        f"TP={plan['tp']} "
-        f"SL={plan['sl']}"
-    )
-
-    return True
 
 
 # ============================================================
@@ -4636,8 +4361,13 @@ def main():
     )
 
     log(
-        "OKX 全市场永续"
-        "强行情自动交易机器人 V2.7 启动"
+        "OKX 全市场永续强行情"
+        "自动交易机器人 V2.8 启动"
+    )
+
+    log(
+        "V2.8："
+        "自动接管未保护持仓"
     )
 
     log(
@@ -4647,8 +4377,8 @@ def main():
     )
 
     log(
-        "TP/SL模式："
-        "OCO + Mark Price预校验 + 严格验证"
+        "TP/SL："
+        "OCO + Mark Price + ATR"
     )
 
     log(
@@ -4656,7 +4386,7 @@ def main():
     )
 
     # ========================================================
-    # 启动账户检查
+    # 启动账户
     # ========================================================
 
     equity = get_equity()
@@ -4671,7 +4401,7 @@ def main():
     )
 
     # ========================================================
-    # 启动时检查已有仓位
+    # 启动立即接管已有仓位
     # ========================================================
 
     try:
@@ -4681,7 +4411,7 @@ def main():
         if pos:
 
             log(
-                "启动发现已有持仓："
+                "🚨 启动发现已有持仓："
                 f"{pos.get('instId')} "
                 f"{position_direction(pos)} "
                 f"qty={pos.get('pos')}"
@@ -4701,13 +4431,17 @@ def main():
                     "active_trade"
                 ] = None
 
-                save_state(state)
+                save_state(
+                    state
+                )
 
     except Exception as e:
 
         log(
-            f"启动持仓保护检查失败：{e}"
+            f"启动持仓检查异常：{e}"
         )
+
+        traceback.print_exc()
 
     # ========================================================
     # 主循环
@@ -4717,41 +4451,33 @@ def main():
 
         try:
 
-            # ------------------------------------------------
-            # 更新权益
-            # ------------------------------------------------
-
             equity = get_equity()
 
             reset_daily_if_needed(
                 equity
             )
 
-            # ------------------------------------------------
-            # 检查之前交易是否已经结束
-            # ------------------------------------------------
-
             check_position_closed()
 
             # ------------------------------------------------
-            # 当前仓位
+            # 任何时候发现持仓
+            # 第一优先级都是保护持仓
             # ------------------------------------------------
 
             pos = get_bot_position()
 
             if pos:
 
-                # 有仓位绝不继续开仓
                 repair_existing_position(
                     pos
                 )
 
                 log(
-                    "当前已有持仓："
+                    f"当前持仓："
                     f"{pos.get('instId')} "
                     f"{position_direction(pos)} "
                     f"qty={pos.get('pos')} "
-                    "，等待 OCO TP/SL 结束"
+                    f"→ 等待 TP/SL"
                 )
 
                 time.sleep(
@@ -4761,7 +4487,7 @@ def main():
                 continue
 
             # ------------------------------------------------
-            # 没仓位
+            # 没有持仓
             # ------------------------------------------------
 
             if state.get(
@@ -4772,7 +4498,9 @@ def main():
                     "active_trade"
                 ] = None
 
-                save_state(state)
+                save_state(
+                    state
+                )
 
             # ------------------------------------------------
             # 每日限制
@@ -4789,12 +4517,10 @@ def main():
                 continue
 
             # ------------------------------------------------
-            # 扫描市场
+            # 扫描
             # ------------------------------------------------
 
-            candidates = (
-                scan_candidates()
-            )
+            candidates = scan_candidates()
 
             if not candidates:
 
@@ -4808,21 +4534,14 @@ def main():
 
                 continue
 
-            # ------------------------------------------------
-            # 输出前五名
-            # ------------------------------------------------
-
             preview = []
 
             for c in candidates[:5]:
 
                 preview.append(
-
                     f"{c['instId']} "
                     f"{c['direction']} "
-                    f"S{c['score']} "
-                    f"rank={c['rank_score']:.2f}"
-
+                    f"S{c['score']}"
                 )
 
             log(
@@ -4833,15 +4552,10 @@ def main():
                 )
             )
 
-            # ------------------------------------------------
-            # 尝试最强候选
-            # ------------------------------------------------
-
             traded = False
 
             for candidate in candidates:
 
-                # 再检查一次仓位
                 if get_bot_position():
 
                     break
@@ -4860,15 +4574,12 @@ def main():
                 except Exception as e:
 
                     log(
-                        f"执行 "
                         f"{candidate['instId']} "
-                        f"失败：{e}"
+                        f"执行失败：{e}"
                     )
 
                     traceback.print_exc()
 
-                    # 如果已经形成仓位
-                    # 不允许继续尝试其它币
                     if get_bot_position():
 
                         break
@@ -4882,7 +4593,7 @@ def main():
         except KeyboardInterrupt:
 
             log(
-                "收到停止指令，机器人退出"
+                "机器人停止"
             )
 
             break
