@@ -1,25 +1,25 @@
 # -*- coding: utf-8 -*-
 
 """
-OKX 永续自动交易模拟盘 V2.9
+============================================================
+OKX 永续自动交易模拟盘 V2.9.1
+============================================================
 
-主要功能：
-1. OKX 模拟盘
-2. 自动扫描 CoinGecko 市值 Top30
-3. OKX USDT 永续合约
-4. EMA + RSI + MACD + ATR
-5. 5m 信号 + 15m趋势 + 1H趋势
-6. 动态杠杆 5x ~ 20x
-7. 自动根据合约实际最大杠杆限制
-8. 自动仓位计算
-9. 自动开多 / 开空
-10. 独立 OCO 止盈止损
-11. 实时 Mark Price
-12. 实时浮盈 / 浮亏 / ROI
-13. 平仓后读取 OKX realizedPnl
-14. 连续亏损保护
-15. 同时只允许一个持仓
-16. UTC+8 日志
+本版本修复：
+1. consecutive_losses 全局变量错误
+2. 连续亏损保护无法正常运行
+3. OCO 验证逻辑
+4. 持仓实时 Mark Price
+5. 实时浮盈/浮亏/ROI
+6. TP/SL 实时显示
+7. Top30 新开仓限制
+8. 已有仓位继续管理
+9. 动态杠杆 5x ~ 20x
+10. 自动适配合约最大杠杆
+11. 平仓后读取 realizedPnl
+12. UTC+8 日志
+13. 清理重复函数
+============================================================
 """
 
 import os
@@ -36,16 +36,16 @@ from urllib.parse import urlencode
 import requests
 
 
-# =========================================================
+# ============================================================
 # 版本
-# =========================================================
+# ============================================================
 
-VERSION = "V2.9"
+VERSION = "V2.9.1"
 
 
-# =========================================================
-# OKX 基础配置
-# =========================================================
+# ============================================================
+# OKX 基础设置
+# ============================================================
 
 BASE_URL = "https://www.okx.com"
 
@@ -58,13 +58,21 @@ POS_MODE = "net"
 # 1 = 模拟盘
 SIMULATED_TRADING = "1"
 
-# 默认扫描所有符合条件的 USDT 永续
+
+# ============================================================
+# 指定交易品种
+# ============================================================
+
+# 留空 = 自动扫描 Top30
+# 如果以后只想测试 BTC，可以改成：
+# TARGET_INST_ID = "BTC-USDT-SWAP"
+
 TARGET_INST_ID = ""
 
 
-# =========================================================
+# ============================================================
 # K线
-# =========================================================
+# ============================================================
 
 SIGNAL_BAR = "5m"
 TREND_BAR_15M = "15m"
@@ -73,20 +81,25 @@ TREND_BAR_1H = "1H"
 LOOP_SECONDS = 20
 
 
-# =========================================================
-# Top30
-# =========================================================
+# ============================================================
+# CoinGecko Top30
+# ============================================================
 
 TOP30_CACHE_SECONDS = 600
-
-MIN_24H_VOLUME_USD = Decimal("3000000")
 
 SCAN_LIMIT = 30
 
 
-# =========================================================
-# 指标参数
-# =========================================================
+# ============================================================
+# 流动性
+# ============================================================
+
+MIN_24H_VOLUME_USD = Decimal("3000000")
+
+
+# ============================================================
+# 指标
+# ============================================================
 
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -100,9 +113,9 @@ MACD_SIGNAL = 9
 ATR_PERIOD = 14
 
 
-# =========================================================
+# ============================================================
 # RSI
-# =========================================================
+# ============================================================
 
 RSI_LONG_MIN = Decimal("52")
 RSI_LONG_MAX = Decimal("72")
@@ -111,11 +124,16 @@ RSI_SHORT_MIN = Decimal("28")
 RSI_SHORT_MAX = Decimal("48")
 
 
-# =========================================================
-# 风控
-# =========================================================
+# ============================================================
+# 信号
+# ============================================================
 
 MIN_SIGNAL_SCORE = 4
+
+
+# ============================================================
+# 仓位风险
+# ============================================================
 
 MAX_MARGIN_PCT = Decimal("0.08")
 
@@ -125,14 +143,19 @@ MIN_LEVERAGE = Decimal("5")
 
 MAX_LEVERAGE = Decimal("20")
 
+
+# ============================================================
+# 连续亏损保护
+# ============================================================
+
 MAX_CONSECUTIVE_LOSSES = 3
 
 LOSS_COOLDOWN_SECONDS = 1800
 
 
-# =========================================================
+# ============================================================
 # TP / SL
-# =========================================================
+# ============================================================
 
 TARGET_SL_ROI_PCT = Decimal("1.5")
 
@@ -151,9 +174,9 @@ MAX_TP_PRICE_PCT = Decimal("0.045")
 MIN_TRIGGER_GAP_PCT = Decimal("0.0010")
 
 
-# =========================================================
+# ============================================================
 # OCO
-# =========================================================
+# ============================================================
 
 OCO_RETRY_COUNT = 3
 
@@ -162,145 +185,235 @@ OCO_VERIFY_WAIT = 1.2
 EMERGENCY_CLOSE_ON_NEW_POSITION_PROTECTION_FAILURE = True
 
 
-# =========================================================
-# Session
-# =========================================================
-
-session = requests.Session()
-
-session.headers.update({
-    "Content-Type": "application/json",
-    "x-simulated-trading": SIMULATED_TRADING
-})
-
-
-# =========================================================
-# API KEY
-# =========================================================
-
-API_KEY = os.getenv("OKX_API_KEY")
-SECRET_KEY = os.getenv("OKX_SECRET_KEY")
-PASSPHRASE = os.getenv("OKX_PASSPHRASE")
-
-if not API_KEY or not SECRET_KEY or not PASSPHRASE:
-    raise RuntimeError(
-        "缺少 OKX API 环境变量："
-        "OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE"
-    )
-
-
-# =========================================================
+# ============================================================
 # UTC+8
-# =========================================================
+# ============================================================
 
-UTC8 = timezone(timedelta(hours=8))
-
-
-def now_ms():
-    return str(int(time.time() * 1000))
+UTC8 = timezone(
+    timedelta(hours=8)
+)
 
 
 def now_str():
-    return datetime.now(UTC8).strftime("%Y-%m-%d %H:%M:%S")
+
+    return datetime.now(
+        UTC8
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 def log(msg):
-    print(f"[{now_str()}] {msg}", flush=True)
+
+    print(
+        f"[{now_str()}] {msg}",
+        flush=True
+    )
 
 
-# =========================================================
-# Decimal 工具
-# =========================================================
+# ============================================================
+# Decimal
+# ============================================================
 
 def D(value, default="0"):
+
     try:
+
         if value is None or value == "":
+
             return Decimal(default)
-        return Decimal(str(value))
+
+        return Decimal(
+            str(value)
+        )
+
     except Exception:
+
         return Decimal(default)
 
 
 def fmt_decimal(value, digits=12):
+
     value = D(value)
 
-    s = format(value, "f")
+    s = format(
+        value,
+        "f"
+    )
 
     if "." in s:
-        a, b = s.split(".", 1)
+
+        a, b = s.split(
+            ".",
+            1
+        )
+
         b = b[:digits]
+
         s = a + "." + b
 
     s = s.rstrip("0").rstrip(".")
 
-    if s in ("", "-0"):
+    if s in (
+        "",
+        "-0"
+    ):
+
         return "0"
 
     return s
 
 
-def round_down(value, step):
+def round_down(
+    value,
+    step
+):
+
     value = D(value)
     step = D(step)
 
     if step <= 0:
+
         return value
 
-    return (value / step).to_integral_value(
+    return (
+        value / step
+    ).to_integral_value(
         rounding=ROUND_DOWN
     ) * step
 
 
-def round_up(value, step):
+def round_up(
+    value,
+    step
+):
+
     value = D(value)
     step = D(step)
 
     if step <= 0:
+
         return value
 
-    return (value / step).to_integral_value(
+    return (
+        value / step
+    ).to_integral_value(
         rounding=ROUND_UP
     ) * step
 
 
-def clamp(value, low, high):
+def clamp(
+    value,
+    low,
+    high
+):
+
     value = D(value)
 
     if value < low:
+
         return low
 
     if value > high:
+
         return high
 
     return value
 
 
-# =========================================================
-# OKX 签名
-# =========================================================
+# ============================================================
+# API KEY
+# ============================================================
 
-def get_timestamp():
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
-        "+00:00",
-        "Z"
+API_KEY = os.getenv(
+    "OKX_API_KEY"
+)
+
+SECRET_KEY = os.getenv(
+    "OKX_SECRET_KEY"
+)
+
+PASSPHRASE = os.getenv(
+    "OKX_PASSPHRASE"
+)
+
+if not API_KEY or not SECRET_KEY or not PASSPHRASE:
+
+    raise RuntimeError(
+        "缺少 OKX API 环境变量："
+        "OKX_API_KEY / "
+        "OKX_SECRET_KEY / "
+        "OKX_PASSPHRASE"
     )
 
 
-def make_signature(timestamp, method, request_path, body=""):
-    message = timestamp + method.upper() + request_path + body
+# ============================================================
+# Session
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update(
+    {
+        "Content-Type": "application/json",
+        "x-simulated-trading":
+            SIMULATED_TRADING
+    }
+)
+
+
+# ============================================================
+# OKX 签名
+# ============================================================
+
+def get_timestamp():
+
+    return (
+        datetime.now(
+            timezone.utc
+        )
+        .isoformat(
+            timespec="milliseconds"
+        )
+        .replace(
+            "+00:00",
+            "Z"
+        )
+    )
+
+
+def make_signature(
+    timestamp,
+    method,
+    request_path,
+    body=""
+):
+
+    message = (
+        timestamp
+        + method.upper()
+        + request_path
+        + body
+    )
 
     mac = hmac.new(
-        SECRET_KEY.encode("utf-8"),
-        message.encode("utf-8"),
+        SECRET_KEY.encode(
+            "utf-8"
+        ),
+        message.encode(
+            "utf-8"
+        ),
         hashlib.sha256
     )
 
-    return base64.b64encode(mac.digest()).decode()
+    return base64.b64encode(
+        mac.digest()
+    ).decode()
 
 
-# =========================================================
+# ============================================================
 # OKX 请求
-# =========================================================
+# ============================================================
 
 def okx_request(
     method,
@@ -320,29 +433,52 @@ def okx_request(
     query = ""
 
     if params:
+
         clean_params = {}
 
-        for k, v in params.items():
-            if v is not None and v != "":
-                clean_params[k] = v
+        for key, value in params.items():
+
+            if (
+                value is not None
+                and value != ""
+            ):
+
+                clean_params[key] = value
 
         if clean_params:
-            query = "?" + urlencode(clean_params)
 
-    request_path = path + query
+            query = (
+                "?"
+                + urlencode(
+                    clean_params
+                )
+            )
+
+    request_path = (
+        path + query
+    )
 
     body_text = ""
 
-    if method in ("POST", "PUT"):
+    if method in (
+        "POST",
+        "PUT"
+    ):
+
         body_text = json.dumps(
             body,
-            separators=(",", ":"),
+            separators=(
+                ",",
+                ":"
+            ),
             ensure_ascii=False
         )
 
     headers = {
-        "Content-Type": "application/json",
-        "x-simulated-trading": SIMULATED_TRADING
+        "Content-Type":
+            "application/json",
+        "x-simulated-trading":
+            SIMULATED_TRADING
     }
 
     if private:
@@ -356,14 +492,26 @@ def okx_request(
             body_text
         )
 
-        headers.update({
-            "OK-ACCESS-KEY": API_KEY,
-            "OK-ACCESS-SIGN": sign,
-            "OK-ACCESS-TIMESTAMP": timestamp,
-            "OK-ACCESS-PASSPHRASE": PASSPHRASE
-        })
+        headers.update(
+            {
+                "OK-ACCESS-KEY":
+                    API_KEY,
 
-    url = BASE_URL + request_path
+                "OK-ACCESS-SIGN":
+                    sign,
+
+                "OK-ACCESS-TIMESTAMP":
+                    timestamp,
+
+                "OK-ACCESS-PASSPHRASE":
+                    PASSPHRASE
+            }
+        )
+
+    url = (
+        BASE_URL
+        + request_path
+    )
 
     try:
 
@@ -405,21 +553,27 @@ def okx_request(
     except Exception as e:
 
         raise RuntimeError(
-            f"OKX 请求失败 {method} {request_path}: {e}"
+            f"OKX 请求失败 "
+            f"{method} {request_path}: {e}"
         )
 
-    if str(data.get("code")) != "0":
+    if str(
+        data.get("code")
+    ) != "0":
 
         raise RuntimeError(
             f"OKX API错误: {data}"
         )
 
-    return data.get("data", [])
+    return data.get(
+        "data",
+        []
+    )
 
 
-# =========================================================
+# ============================================================
 # CoinGecko Top30
-# =========================================================
+# ============================================================
 
 top30_cache = {
     "time": 0,
@@ -434,68 +588,84 @@ def get_top30_market_caps():
 
     now = time.time()
 
-    if now - top30_cache["time"] < TOP30_CACHE_SECONDS:
+    if (
+        now
+        - top30_cache["time"]
+        < TOP30_CACHE_SECONDS
+    ):
 
         return (
             top30_cache["symbols"],
             top30_cache["rank"]
         )
 
-    url = (
-        "https://api.coingecko.com/api/v3/coins/markets"
-    )
-
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": "30",
-        "page": "1",
-        "sparkline": "false"
-    }
-
     try:
 
-        r = requests.get(
-            url,
-            params=params,
+        response = requests.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "order":
+                    "market_cap_desc",
+                "per_page": "30",
+                "page": "1",
+                "sparkline": "false"
+            },
             timeout=15
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
-        rows = r.json()
+        rows = response.json()
 
         symbols = set()
-        rank = {}
 
-        for i, row in enumerate(rows, start=1):
+        ranks = {}
+
+        for index, row in enumerate(
+            rows,
+            start=1
+        ):
 
             symbol = str(
-                row.get("symbol", "")
+                row.get(
+                    "symbol",
+                    ""
+                )
             ).upper().strip()
 
             if not symbol:
+
                 continue
 
-            symbols.add(symbol)
-            rank[symbol] = i
+            symbols.add(
+                symbol
+            )
+
+            ranks[symbol] = index
 
         if not symbols:
+
             raise RuntimeError(
-                "CoinGecko Top30 返回为空"
+                "CoinGecko Top30为空"
             )
 
         top30_cache = {
             "time": now,
             "symbols": symbols,
-            "rank": rank
+            "rank": ranks
         }
 
-        return symbols, rank
+        return (
+            symbols,
+            ranks
+        )
 
     except Exception as e:
 
-        log(f"⚠️ CoinGecko Top30 获取失败: {e}")
+        log(
+            f"⚠️ CoinGecko Top30获取失败: {e}"
+        )
 
         return (
             set(),
@@ -503,50 +673,58 @@ def get_top30_market_caps():
         )
 
 
-# =========================================================
+# ============================================================
 # 合约缓存
-# =========================================================
+# ============================================================
 
 instrument_cache = {}
 
-instrument_cache_lock = threading.Lock()
+instrument_lock = threading.Lock()
 
 
-def get_instrument(inst_id):
+def get_instrument(
+    inst_id
+):
 
-    with instrument_cache_lock:
+    with instrument_lock:
 
         if inst_id in instrument_cache:
 
-            return instrument_cache[inst_id]
+            return instrument_cache[
+                inst_id
+            ]
 
     rows = okx_request(
         "GET",
         "/api/v5/public/instruments",
         params={
-            "instType": INST_TYPE,
-            "instId": inst_id
+            "instType":
+                INST_TYPE,
+            "instId":
+                inst_id
         }
     )
 
     if not rows:
 
         raise RuntimeError(
-            f"找不到合约信息: {inst_id}"
+            f"找不到合约: {inst_id}"
         )
 
     info = rows[0]
 
-    with instrument_cache_lock:
+    with instrument_lock:
 
-        instrument_cache[inst_id] = info
+        instrument_cache[
+            inst_id
+        ] = info
 
     return info
 
 
-# =========================================================
-# 获取全部 USDT 永续
-# =========================================================
+# ============================================================
+# 全部活跃USDT永续
+# ============================================================
 
 def get_all_active_usdt_swaps():
 
@@ -554,7 +732,8 @@ def get_all_active_usdt_swaps():
         "GET",
         "/api/v5/public/instruments",
         params={
-            "instType": INST_TYPE
+            "instType":
+                INST_TYPE
         }
     )
 
@@ -562,95 +741,140 @@ def get_all_active_usdt_swaps():
 
     for row in rows:
 
-        inst_id = row.get("instId", "")
+        inst_id = row.get(
+            "instId",
+            ""
+        )
 
-        if not inst_id.endswith("-USDT-SWAP"):
+        if not inst_id.endswith(
+            "-USDT-SWAP"
+        ):
+
             continue
 
-        if row.get("state") != "live":
+        if row.get(
+            "state"
+        ) != "live":
+
             continue
 
-        if row.get("settleCcy") != "USDT":
+        if row.get(
+            "settleCcy"
+        ) != "USDT":
+
             continue
 
-        result.append(row)
+        result.append(
+            row
+        )
 
-        with instrument_cache_lock:
+        with instrument_lock:
 
-            instrument_cache[inst_id] = row
+            instrument_cache[
+                inst_id
+            ] = row
 
     return result
 
 
-# =========================================================
-# 获取 Top30 OKX 合约
-# =========================================================
+# ============================================================
+# Top30 OKX交易品种
+# ============================================================
 
 def get_top30_okx_instruments():
 
-    symbols, ranks = get_top30_market_caps()
+    symbols, ranks = (
+        get_top30_market_caps()
+    )
 
     if not symbols:
 
         return []
 
-    all_swaps = get_all_active_usdt_swaps()
+    all_swaps = (
+        get_all_active_usdt_swaps()
+    )
 
     result = []
 
     for row in all_swaps:
 
-        inst_id = row.get("instId", "")
+        inst_id = row.get(
+            "instId",
+            ""
+        )
 
-        parts = inst_id.split("-")
+        parts = inst_id.split(
+            "-"
+        )
 
         if len(parts) < 3:
+
             continue
 
-        base = parts[0].upper()
+        base = (
+            parts[0]
+            .upper()
+        )
 
         if base not in symbols:
+
             continue
 
-        row = dict(row)
-
-        row["_top30_rank"] = ranks.get(
-            base,
-            999
+        item = dict(
+            row
         )
 
-        row["_baseCcy"] = base
+        item["_baseCcy"] = base
 
-        result.append(row)
+        item["_top30_rank"] = (
+            ranks.get(
+                base,
+                999
+            )
+        )
+
+        result.append(
+            item
+        )
 
     result.sort(
-        key=lambda x: x.get(
-            "_top30_rank",
-            999
-        )
+        key=lambda x:
+            x.get(
+                "_top30_rank",
+                999
+            )
     )
 
     if TARGET_INST_ID:
 
         result = [
-            x for x in result
-            if x.get("instId") == TARGET_INST_ID
+            x
+            for x in result
+            if x.get(
+                "instId"
+            ) == TARGET_INST_ID
         ]
 
-    return result[:SCAN_LIMIT]
+    return result[
+        :SCAN_LIMIT
+    ]
 
 
-# =========================================================
+# ============================================================
 # Ticker
-# =========================================================
+# ============================================================
 
-def get_ticker(inst_id):
+def get_ticker(
+    inst_id
+):
 
     rows = okx_request(
         "GET",
         "/api/v5/market/ticker",
         params={
-            "instId": inst_id
+            "instId":
+                inst_id
         }
     )
 
@@ -663,17 +887,27 @@ def get_ticker(inst_id):
     row = rows[0]
 
     mark = D(
-        row.get("markPx") or row.get("last")
+        row.get(
+            "markPx"
+        )
+        or row.get(
+            "last"
+        )
     )
 
     last = D(
-        row.get("last")
+        row.get(
+            "last"
+        )
     )
 
     return {
-        "markPx": mark,
-        "last": last,
-        "raw": row
+        "markPx":
+            mark,
+        "last":
+            last,
+        "raw":
+            row
     }
 
 
@@ -683,7 +917,8 @@ def get_all_tickers():
         "GET",
         "/api/v5/market/tickers",
         params={
-            "instType": INST_TYPE
+            "instType":
+                INST_TYPE
         }
     )
 
@@ -691,18 +926,22 @@ def get_all_tickers():
 
     for row in rows:
 
-        inst_id = row.get("instId")
+        inst_id = row.get(
+            "instId"
+        )
 
         if inst_id:
 
-            result[inst_id] = row
+            result[
+                inst_id
+            ] = row
 
     return result
 
 
-# =========================================================
+# ============================================================
 # K线
-# =========================================================
+# ============================================================
 
 def get_candles(
     inst_id,
@@ -714,9 +953,12 @@ def get_candles(
         "GET",
         "/api/v5/market/candles",
         params={
-            "instId": inst_id,
-            "bar": bar,
-            "limit": str(limit)
+            "instId":
+                inst_id,
+            "bar":
+                bar,
+            "limit":
+                str(limit)
         }
     )
 
@@ -725,49 +967,76 @@ def get_candles(
     for row in rows:
 
         if len(row) < 9:
+
             continue
 
         try:
 
-            candles.append({
-                "ts": int(row[0]),
-                "open": D(row[1]),
-                "high": D(row[2]),
-                "low": D(row[3]),
-                "close": D(row[4]),
-                "vol": D(row[5]),
-                "confirm": str(row[8])
-            })
+            candles.append(
+                {
+                    "ts":
+                        int(row[0]),
+
+                    "open":
+                        D(row[1]),
+
+                    "high":
+                        D(row[2]),
+
+                    "low":
+                        D(row[3]),
+
+                    "close":
+                        D(row[4]),
+
+                    "vol":
+                        D(row[5]),
+
+                    "confirm":
+                        str(row[8])
+                }
+            )
 
         except Exception:
+
             continue
 
     candles.sort(
-        key=lambda x: x["ts"]
+        key=lambda x:
+            x["ts"]
     )
 
-    # 只保留已完成K线
-    candles = [
-        x for x in candles
+    return [
+        x
+        for x in candles
         if x["confirm"] == "1"
     ]
 
-    return candles
 
-
-# =========================================================
+# ============================================================
 # EMA
-# =========================================================
+# ============================================================
 
-def ema(values, period):
+def ema(
+    values,
+    period
+):
 
-    values = [D(x) for x in values]
+    values = [
+        D(x)
+        for x in values
+    ]
 
     if len(values) < period:
+
         return None
 
-    alpha = Decimal("2") / (
-        Decimal(period) + Decimal("1")
+    alpha = (
+        Decimal("2")
+        / (
+            Decimal(period)
+            + Decimal("1")
+        )
     )
 
     result = values[0]
@@ -776,59 +1045,104 @@ def ema(values, period):
 
         result = (
             price * alpha
-            + result * (Decimal("1") - alpha)
+            + result
+            * (
+                Decimal("1")
+                - alpha
+            )
         )
 
     return result
 
 
-# =========================================================
+# ============================================================
 # RSI
-# =========================================================
+# ============================================================
 
-def calculate_rsi(values, period=14):
+def calculate_rsi(
+    values,
+    period=14
+):
 
-    values = [D(x) for x in values]
+    values = [
+        D(x)
+        for x in values
+    ]
 
-    if len(values) < period + 1:
+    if len(values) < (
+        period + 1
+    ):
+
         return None
 
     gains = []
+
     losses = []
 
-    for i in range(1, len(values)):
+    for i in range(
+        1,
+        len(values)
+    ):
 
-        change = values[i] - values[i - 1]
+        change = (
+            values[i]
+            - values[i - 1]
+        )
 
         if change > 0:
 
-            gains.append(change)
-            losses.append(Decimal("0"))
+            gains.append(
+                change
+            )
+
+            losses.append(
+                Decimal("0")
+            )
 
         else:
 
-            gains.append(Decimal("0"))
-            losses.append(abs(change))
+            gains.append(
+                Decimal("0")
+            )
 
-    avg_gain = sum(
-        gains[:period],
-        Decimal("0")
-    ) / Decimal(period)
+            losses.append(
+                abs(change)
+            )
 
-    avg_loss = sum(
-        losses[:period],
-        Decimal("0")
-    ) / Decimal(period)
+    avg_gain = (
+        sum(
+            gains[:period],
+            Decimal("0")
+        )
+        / Decimal(period)
+    )
 
-    for i in range(period, len(gains)):
+    avg_loss = (
+        sum(
+            losses[:period],
+            Decimal("0")
+        )
+        / Decimal(period)
+    )
+
+    for i in range(
+        period,
+        len(gains)
+    ):
 
         avg_gain = (
-            avg_gain * Decimal(period - 1)
+            avg_gain
+            * Decimal(
+                period - 1
+            )
             + gains[i]
         ) / Decimal(period)
 
         avg_loss = (
-            avg_loss * Decimal(period - 1)
+            avg_loss
+            * Decimal(
+                period - 1
+            )
             + losses[i]
         ) / Decimal(period)
 
@@ -836,37 +1150,46 @@ def calculate_rsi(values, period=14):
 
         return Decimal("100")
 
-    rs = avg_gain / avg_loss
+    rs = (
+        avg_gain
+        / avg_loss
+    )
 
-    return Decimal("100") - (
-        Decimal("100") / (
-            Decimal("1") + rs
+    return (
+        Decimal("100")
+        - (
+            Decimal("100")
+            / (
+                Decimal("1")
+                + rs
+            )
         )
     )
 
 
-# =========================================================
+# ============================================================
 # MACD
-# =========================================================
+# ============================================================
 
-def calculate_macd(values):
+def calculate_macd(
+    values
+):
 
-    values = [D(x) for x in values]
+    values = [
+        D(x)
+        for x in values
+    ]
 
-    if len(values) < MACD_SLOW + MACD_SIGNAL:
+    if len(values) < (
+        MACD_SLOW
+        + MACD_SIGNAL
+    ):
 
-        return None, None
+        return (
+            None,
+            None
+        )
 
-    fast = ema(values, MACD_FAST)
-    slow = ema(values, MACD_SLOW)
-
-    if fast is None or slow is None:
-
-        return None, None
-
-    macd_line = fast - slow
-
-    # 用历史 MACD 序列计算 signal
     macd_values = []
 
     for i in range(
@@ -876,78 +1199,122 @@ def calculate_macd(values):
 
         subset = values[:i]
 
-        ef = ema(
+        fast = ema(
             subset,
             MACD_FAST
         )
 
-        es = ema(
+        slow = ema(
             subset,
             MACD_SLOW
         )
 
-        if ef is not None and es is not None:
+        if (
+            fast is not None
+            and slow is not None
+        ):
 
             macd_values.append(
-                ef - es
+                fast - slow
             )
 
-    if len(macd_values) < MACD_SIGNAL:
+    if len(macd_values) < (
+        MACD_SIGNAL
+    ):
 
-        return macd_line, None
+        return (
+            None,
+            None
+        )
 
     signal = ema(
         macd_values,
         MACD_SIGNAL
     )
 
-    return macd_line, signal
+    return (
+        macd_values[-1],
+        signal
+    )
 
 
-# =========================================================
+# ============================================================
 # ATR
-# =========================================================
+# ============================================================
 
-def calculate_atr(candles, period=14):
+def calculate_atr(
+    candles,
+    period=14
+):
 
-    if len(candles) < period + 1:
+    if len(candles) < (
+        period + 1
+    ):
 
         return None
 
     trs = []
 
-    for i in range(1, len(candles)):
+    for i in range(
+        1,
+        len(candles)
+    ):
 
         current = candles[i]
-        previous = candles[i - 1]
 
-        high = current["high"]
-        low = current["low"]
-        prev_close = previous["close"]
+        previous = candles[
+            i - 1
+        ]
+
+        high = current[
+            "high"
+        ]
+
+        low = current[
+            "low"
+        ]
+
+        previous_close = (
+            previous["close"]
+        )
 
         tr = max(
             high - low,
-            abs(high - prev_close),
-            abs(low - prev_close)
+            abs(
+                high
+                - previous_close
+            ),
+            abs(
+                low
+                - previous_close
+            )
         )
 
-        trs.append(tr)
+        trs.append(
+            tr
+        )
 
     if len(trs) < period:
 
         return None
 
-    return sum(
-        trs[-period:],
-        Decimal("0")
-    ) / Decimal(period)
+    return (
+        sum(
+            trs[-period:],
+            Decimal("0")
+        )
+        / Decimal(period)
+    )
 
 
-# =========================================================
+# ============================================================
 # 趋势
-# =========================================================
+# ============================================================
 
-def get_trend(inst_id, bar):
+def get_trend(
+    inst_id,
+    bar
+):
 
     candles = get_candles(
         inst_id,
@@ -974,7 +1341,10 @@ def get_trend(inst_id, bar):
         EMA_SLOW
     )
 
-    if fast is None or slow is None:
+    if (
+        fast is None
+        or slow is None
+    ):
 
         return "NONE"
 
@@ -989,11 +1359,13 @@ def get_trend(inst_id, bar):
     return "NONE"
 
 
-# =========================================================
+# ============================================================
 # 信号
-# =========================================================
+# ============================================================
 
-def calculate_signal(inst_id):
+def calculate_signal(
+    inst_id
+):
 
     candles = get_candles(
         inst_id,
@@ -1027,8 +1399,10 @@ def calculate_signal(inst_id):
         RSI_PERIOD
     )
 
-    macd_line, macd_signal = calculate_macd(
-        closes
+    macd_line, macd_signal = (
+        calculate_macd(
+            closes
+        )
     )
 
     atr = calculate_atr(
@@ -1038,14 +1412,14 @@ def calculate_signal(inst_id):
 
     if any(
         x is None
-        for x in [
+        for x in (
             fast,
             slow,
             rsi,
             macd_line,
             macd_signal,
             atr
-        ]
+        )
     ):
 
         return None
@@ -1054,9 +1428,13 @@ def calculate_signal(inst_id):
 
         return None
 
-    atr_pct = atr / price
+    atr_pct = (
+        atr / price
+    )
 
-    if atr_pct < Decimal("0.0015"):
+    if atr_pct < Decimal(
+        "0.0015"
+    ):
 
         return None
 
@@ -1082,7 +1460,7 @@ def calculate_signal(inst_id):
 
         short_score += 2
 
-    # 价格位置
+    # 价格
     if price > fast:
 
         long_score += 1
@@ -1142,8 +1520,11 @@ def calculate_signal(inst_id):
         short_score += 1
 
     if (
-        long_score < MIN_SIGNAL_SCORE
-        and short_score < MIN_SIGNAL_SCORE
+        long_score
+        < MIN_SIGNAL_SCORE
+        and
+        short_score
+        < MIN_SIGNAL_SCORE
     ):
 
         return None
@@ -1151,11 +1532,13 @@ def calculate_signal(inst_id):
     if long_score > short_score:
 
         side = "LONG"
+
         score = long_score
 
     elif short_score > long_score:
 
         side = "SHORT"
+
         score = short_score
 
     else:
@@ -1163,21 +1546,38 @@ def calculate_signal(inst_id):
         return None
 
     return {
-        "instId": inst_id,
-        "side": side,
-        "score": score,
-        "price": price,
-        "atr": atr,
-        "atr_pct": atr_pct,
-        "rsi": rsi,
-        "trend15m": trend_15m,
-        "trend1h": trend_1h
+        "instId":
+            inst_id,
+
+        "side":
+            side,
+
+        "score":
+            score,
+
+        "price":
+            price,
+
+        "atr":
+            atr,
+
+        "atr_pct":
+            atr_pct,
+
+        "rsi":
+            rsi,
+
+        "trend15m":
+            trend_15m,
+
+        "trend1h":
+            trend_1h
     }
 
 
-# =========================================================
-# 账户余额
-# =========================================================
+# ============================================================
+# 账户权益
+# ============================================================
 
 def get_equity():
 
@@ -1198,22 +1598,37 @@ def get_equity():
 
     for item in details:
 
-        if item.get("ccy") != "USDT":
+        if item.get(
+            "ccy"
+        ) != "USDT":
+
             continue
 
-        eq = D(item.get("eq"))
+        eq = D(
+            item.get(
+                "eq"
+            )
+        )
 
         if eq > 0:
 
             return eq
 
-        cash = D(item.get("cashBal"))
+        cash = D(
+            item.get(
+                "cashBal"
+            )
+        )
 
         if cash > 0:
 
             return cash
 
-        avail = D(item.get("availBal"))
+        avail = D(
+            item.get(
+                "availBal"
+            )
+        )
 
         if avail > 0:
 
@@ -1222,19 +1637,24 @@ def get_equity():
     return Decimal("0")
 
 
-# =========================================================
-# 仓位
-# =========================================================
+# ============================================================
+# 持仓
+# ============================================================
 
-def get_positions(inst_id=None):
+def get_positions(
+    inst_id=None
+):
 
     params = {
-        "instType": INST_TYPE
+        "instType":
+            INST_TYPE
     }
 
     if inst_id:
 
-        params["instId"] = inst_id
+        params[
+            "instId"
+        ] = inst_id
 
     rows = okx_request(
         "GET",
@@ -1247,31 +1667,47 @@ def get_positions(inst_id=None):
 
     for row in rows:
 
-        pos = D(row.get("pos"))
+        pos = D(
+            row.get(
+                "pos"
+            )
+        )
 
         if pos == 0:
 
             continue
 
-        result.append(row)
+        result.append(
+            row
+        )
 
     return result
 
 
-def get_position(inst_id):
+def get_position(
+    inst_id
+):
 
-    positions = get_positions(inst_id)
+    rows = get_positions(
+        inst_id
+    )
 
-    if positions:
+    if rows:
 
-        return positions[0]
+        return rows[0]
 
     return None
 
 
-def position_side(pos):
+def position_side(
+    pos
+):
 
-    amount = D(pos.get("pos"))
+    amount = D(
+        pos.get(
+            "pos"
+        )
+    )
 
     if amount > 0:
 
@@ -1284,32 +1720,68 @@ def position_side(pos):
     return "NONE"
 
 
-# =========================================================
-# 实时持仓显示
-# =========================================================
+# ============================================================
+# 实时持仓
+# ============================================================
 
-def print_live_position(pos):
+def print_live_position(
+    pos
+):
 
-    inst_id = pos.get("instId")
+    inst_id = pos.get(
+        "instId"
+    )
 
-    ticker = get_ticker(inst_id)
+    ticker = get_ticker(
+        inst_id
+    )
 
-    mark = ticker["markPx"]
+    mark = ticker[
+        "markPx"
+    ]
 
-    avg = D(pos.get("avgPx"))
+    avg = D(
+        pos.get(
+            "avgPx"
+        )
+    )
 
-    qty = abs(D(pos.get("pos")))
+    qty = abs(
+        D(
+            pos.get(
+                "pos"
+            )
+        )
+    )
 
-    lever = D(pos.get("lever"))
+    lever = D(
+        pos.get(
+            "lever"
+        )
+    )
 
-    upl = D(pos.get("upl"))
+    upl = D(
+        pos.get(
+            "upl"
+        )
+    )
 
-    upl_ratio = D(pos.get("uplRatio"))
+    upl_ratio = D(
+        pos.get(
+            "uplRatio"
+        )
+    )
 
-    side = position_side(pos)
+    side = position_side(
+        pos
+    )
+
+    info = get_instrument(
+        inst_id
+    )
 
     ct_val = D(
-        get_instrument(inst_id).get(
+        info.get(
             "ctVal"
         )
     )
@@ -1318,23 +1790,26 @@ def print_live_position(pos):
 
         if side == "LONG":
 
-            price_change_pct = (
+            price_change = (
                 mark - avg
-            ) / avg * Decimal("100")
+            ) / avg * 100
 
         else:
 
-            price_change_pct = (
+            price_change = (
                 avg - mark
-            ) / avg * Decimal("100")
+            ) / avg * 100
 
     else:
 
-        price_change_pct = Decimal("0")
+        price_change = Decimal("0")
 
     local_pnl = Decimal("0")
 
-    if ct_val > 0 and avg > 0:
+    if (
+        ct_val > 0
+        and avg > 0
+    ):
 
         if side == "LONG":
 
@@ -1342,7 +1817,7 @@ def print_live_position(pos):
                 mark - avg
             ) * qty * ct_val
 
-        else:
+        elif side == "SHORT":
 
             local_pnl = (
                 avg - mark
@@ -1351,25 +1826,36 @@ def print_live_position(pos):
     tp = Decimal("0")
     sl = Decimal("0")
 
-    close_algos = pos.get(
+    algos = pos.get(
         "closeOrderAlgo"
     )
 
-    if isinstance(close_algos, list):
+    if isinstance(
+        algos,
+        list
+    ):
 
-        for algo in close_algos:
+        for algo in algos:
 
-            tp = D(
-                algo.get("tpTriggerPx")
+            algo_tp = D(
+                algo.get(
+                    "tpTriggerPx"
+                )
             )
 
-            sl = D(
-                algo.get("slTriggerPx")
+            algo_sl = D(
+                algo.get(
+                    "slTriggerPx"
+                )
             )
 
-            if tp > 0 or sl > 0:
+            if algo_tp > 0:
 
-                break
+                tp = algo_tp
+
+            if algo_sl > 0:
+
+                sl = algo_sl
 
     tp_distance = Decimal("0")
     sl_distance = Decimal("0")
@@ -1378,82 +1864,108 @@ def print_live_position(pos):
 
         if tp > 0:
 
-            tp_distance = abs(
-                tp - mark
-            ) / mark * Decimal("100")
+            tp_distance = (
+                abs(
+                    tp - mark
+                )
+                / mark
+                * 100
+            )
 
         if sl > 0:
 
-            sl_distance = abs(
-                mark - sl
-            ) / mark * Decimal("100")
+            sl_distance = (
+                abs(
+                    mark - sl
+                )
+                / mark
+                * 100
+            )
 
     liq_px = D(
-        pos.get("liqPx")
+        pos.get(
+            "liqPx"
+        )
     )
 
     log(
-        f"📊 持仓 {inst_id} | "
+        f"📊 {inst_id} | "
         f"{side} | "
-        f"开仓 {fmt_decimal(avg)} | "
-        f"Mark {fmt_decimal(mark)} | "
-        f"杠杆 {fmt_decimal(lever)}x | "
-        f"数量 {fmt_decimal(qty)}"
+        f"开仓={fmt_decimal(avg)} | "
+        f"Mark={fmt_decimal(mark)} | "
+        f"杠杆={fmt_decimal(lever)}x | "
+        f"数量={fmt_decimal(qty)}"
     )
 
     log(
-        f"💰 浮盈亏 {fmt_decimal(upl, 8)} USDT | "
-        f"ROI {fmt_decimal(upl_ratio * 100, 4)}% | "
-        f"价格变化 {fmt_decimal(price_change_pct, 4)}%"
+        f"💰 浮盈亏={fmt_decimal(upl, 8)} USDT | "
+        f"ROI={fmt_decimal(upl_ratio * 100, 4)}% | "
+        f"价格变化={fmt_decimal(price_change, 4)}%"
     )
 
     log(
-        f"📌 本地计算PnL约 "
+        f"📐 本地PnL约="
         f"{fmt_decimal(local_pnl, 8)} USDT"
     )
 
     if tp > 0:
 
         log(
-            f"🎯 TP {fmt_decimal(tp)} | "
-            f"距离当前 {fmt_decimal(tp_distance, 4)}%"
+            f"🎯 TP={fmt_decimal(tp)} | "
+            f"距离={fmt_decimal(tp_distance, 4)}%"
         )
 
     else:
 
-        log("⚠️ 当前没有检测到 TP")
+        log(
+            "⚠️ 当前没有检测到TP"
+        )
 
     if sl > 0:
 
         log(
-            f"🛑 SL {fmt_decimal(sl)} | "
-            f"距离当前 {fmt_decimal(sl_distance, 4)}%"
+            f"🛑 SL={fmt_decimal(sl)} | "
+            f"距离={fmt_decimal(sl_distance, 4)}%"
         )
 
     else:
 
-        log("⚠️ 当前没有检测到 SL")
+        log(
+            "⚠️ 当前没有检测到SL"
+        )
 
     if liq_px > 0:
 
         log(
-            f"☠️ 预估强平价 {fmt_decimal(liq_px)}"
+            f"☠️ 强平价="
+            f"{fmt_decimal(liq_px)}"
         )
 
     return {
-        "mark": mark,
-        "upl": upl,
-        "roi": upl_ratio,
-        "tp": tp,
-        "sl": sl
+        "mark":
+            mark,
+
+        "upl":
+            upl,
+
+        "roi":
+            upl_ratio,
+
+        "tp":
+            tp,
+
+        "sl":
+            sl
     }
 
 
-# =========================================================
+# ============================================================
 # 动态杠杆
-# =========================================================
+# ============================================================
 
-def leverage_from_score(score):
+def leverage_from_score(
+    score
+):
 
     if score <= 4:
 
@@ -1474,27 +1986,36 @@ def leverage_from_score(score):
     return Decimal("20")
 
 
-def get_max_allowed_leverage(inst_id):
+def get_max_allowed_leverage(
+    inst_id
+):
 
-    info = get_instrument(inst_id)
+    info = get_instrument(
+        inst_id
+    )
 
     max_lev = D(
-        info.get("lever")
+        info.get(
+            "lever"
+        )
     )
 
     if max_lev <= 0:
 
-        # 如果 instrument 没给，
-        # 默认按照用户策略最大20倍
         return MAX_LEVERAGE
 
     return max_lev
 
 
-def get_actual_leverage(inst_id, desired):
+def get_actual_leverage(
+    inst_id,
+    desired
+):
 
-    max_allowed = get_max_allowed_leverage(
-        inst_id
+    max_allowed = (
+        get_max_allowed_leverage(
+            inst_id
+        )
     )
 
     actual = min(
@@ -1508,32 +2029,39 @@ def get_actual_leverage(inst_id, desired):
         raise RuntimeError(
             f"{inst_id} 最大杠杆 "
             f"{fmt_decimal(max_allowed)}x "
-            f"低于机器人最低杠杆 "
-            f"{fmt_decimal(MIN_LEVERAGE)}x"
+            f"低于机器人最低杠杆"
         )
 
     return actual
 
 
-def set_leverage(inst_id, leverage):
+def set_leverage(
+    inst_id,
+    leverage
+):
 
-    result = okx_request(
+    return okx_request(
         "POST",
         "/api/v5/account/set-leverage",
         body={
-            "instId": inst_id,
-            "lever": fmt_decimal(leverage),
-            "mgnMode": TD_MODE
+            "instId":
+                inst_id,
+
+            "lever":
+                fmt_decimal(
+                    leverage
+                ),
+
+            "mgnMode":
+                TD_MODE
         },
         private=True
     )
 
-    return result
 
-
-# =========================================================
-# 保护价格
-# =========================================================
+# ============================================================
+# TP/SL 计算
+# ============================================================
 
 def calculate_protection(
     pos,
@@ -1541,29 +2069,40 @@ def calculate_protection(
     adopted=False
 ):
 
-    inst_id = pos.get("instId")
+    inst_id = pos.get(
+        "instId"
+    )
 
-    side = position_side(pos)
+    side = position_side(
+        pos
+    )
 
-    avg_px = D(pos.get("avgPx"))
+    avg_px = D(
+        pos.get(
+            "avgPx"
+        )
+    )
 
-    lever = D(pos.get("lever"))
+    leverage = D(
+        pos.get(
+            "lever"
+        )
+    )
 
-    if lever <= 0:
+    if leverage <= 0:
 
-        lever = MIN_LEVERAGE
+        leverage = MIN_LEVERAGE
 
-    ticker = get_ticker(inst_id)
-
-    mark = ticker["markPx"]
+    mark = get_ticker(
+        inst_id
+    )["markPx"]
 
     if mark <= 0:
 
         raise RuntimeError(
-            "Mark Price 无效"
+            "Mark Price无效"
         )
 
-    # 如果没有ATR，重新计算
     if atr is None:
 
         candles = get_candles(
@@ -1580,10 +2119,12 @@ def calculate_protection(
     if atr is None:
 
         raise RuntimeError(
-            "无法计算 ATR"
+            "ATR计算失败"
         )
 
-    atr_pct = atr / mark
+    atr_pct = (
+        atr / mark
+    )
 
     atr_pct = clamp(
         atr_pct,
@@ -1591,17 +2132,16 @@ def calculate_protection(
         Decimal("0.08")
     )
 
-    # ROI -> 价格波动
     target_sl_pct = (
         TARGET_SL_ROI_PCT
-        / lever
-        / Decimal("100")
+        / leverage
+        / 100
     )
 
     target_tp_pct = (
         TARGET_TP_ROI_PCT
-        / lever
-        / Decimal("100")
+        / leverage
+        / 100
     )
 
     atr_sl_pct = (
@@ -1630,75 +2170,104 @@ def calculate_protection(
         MAX_TP_PRICE_PCT
     )
 
-    # 新持仓用平均开仓价
-    # 已有持仓如果重新补保护，
-    # 采用当前 Mark 重新计算时，
-    # 必须确保不会把触发价放到当前价格错误的一侧
     base = avg_px
 
     if base <= 0:
 
         base = mark
 
-    # 如果已有仓位已经明显盈利，
-    # 重新挂保护时允许以当前价作为计算基础
+    # 已有仓位重新保护时：
+    # 如果已经盈利，则以当前Mark重新计算
     if adopted:
 
-        if side == "LONG" and mark > avg_px:
+        if (
+            side == "LONG"
+            and mark > avg_px
+        ):
 
             base = mark
 
-        elif side == "SHORT" and mark < avg_px:
+        elif (
+            side == "SHORT"
+            and mark < avg_px
+        ):
 
             base = mark
 
     if side == "LONG":
 
-        tp = base * (
-            Decimal("1") + tp_pct
+        tp = (
+            base
+            * (
+                Decimal("1")
+                + tp_pct
+            )
         )
 
-        sl = base * (
-            Decimal("1") - sl_pct
+        sl = (
+            base
+            * (
+                Decimal("1")
+                - sl_pct
+            )
         )
 
-        # 确保 TP / SL 相对于当前 Mark 在正确位置
         if tp <= mark:
 
-            tp = mark * (
-                Decimal("1")
-                + MIN_TRIGGER_GAP_PCT
+            tp = (
+                mark
+                * (
+                    Decimal("1")
+                    + MIN_TRIGGER_GAP_PCT
+                )
             )
 
         if sl >= mark:
 
-            sl = mark * (
-                Decimal("1")
-                - MIN_TRIGGER_GAP_PCT
+            sl = (
+                mark
+                * (
+                    Decimal("1")
+                    - MIN_TRIGGER_GAP_PCT
+                )
             )
 
     elif side == "SHORT":
 
-        tp = base * (
-            Decimal("1") - tp_pct
+        tp = (
+            base
+            * (
+                Decimal("1")
+                - tp_pct
+            )
         )
 
-        sl = base * (
-            Decimal("1") + sl_pct
+        sl = (
+            base
+            * (
+                Decimal("1")
+                + sl_pct
+            )
         )
 
         if tp >= mark:
 
-            tp = mark * (
-                Decimal("1")
-                - MIN_TRIGGER_GAP_PCT
+            tp = (
+                mark
+                * (
+                    Decimal("1")
+                    - MIN_TRIGGER_GAP_PCT
+                )
             )
 
         if sl <= mark:
 
-            sl = mark * (
-                Decimal("1")
-                + MIN_TRIGGER_GAP_PCT
+            sl = (
+                mark
+                * (
+                    Decimal("1")
+                    + MIN_TRIGGER_GAP_PCT
+                )
             )
 
     else:
@@ -1707,56 +2276,81 @@ def calculate_protection(
             "无法识别仓位方向"
         )
 
-    info = get_instrument(inst_id)
-
-    tick_sz = D(
-        info.get("tickSz")
+    info = get_instrument(
+        inst_id
     )
 
-    if tick_sz > 0:
+    tick = D(
+        info.get(
+            "tickSz"
+        )
+    )
+
+    if tick > 0:
 
         if side == "LONG":
 
             tp = round_up(
                 tp,
-                tick_sz
+                tick
             )
 
             sl = round_down(
                 sl,
-                tick_sz
+                tick
             )
 
         else:
 
             tp = round_down(
                 tp,
-                tick_sz
+                tick
             )
 
             sl = round_up(
                 sl,
-                tick_sz
+                tick
             )
 
     return {
-        "instId": inst_id,
-        "side": side,
-        "base": base,
-        "mark": mark,
-        "atr": atr,
-        "atr_pct": atr_pct,
-        "sl_pct": sl_pct,
-        "tp_pct": tp_pct,
-        "tp": tp,
-        "sl": sl,
-        "lever": lever
+        "instId":
+            inst_id,
+
+        "side":
+            side,
+
+        "base":
+            base,
+
+        "mark":
+            mark,
+
+        "atr":
+            atr,
+
+        "atr_pct":
+            atr_pct,
+
+        "sl_pct":
+            sl_pct,
+
+        "tp_pct":
+            tp_pct,
+
+        "tp":
+            tp,
+
+        "sl":
+            sl,
+
+        "leverage":
+            leverage
     }
 
 
-# =========================================================
-# 仓位数量
-# =========================================================
+# ============================================================
+# 数量计算
+# ============================================================
 
 def calculate_size(
     equity,
@@ -1771,40 +2365,44 @@ def calculate_size(
     )
 
     ct_val = D(
-        info.get("ctVal")
+        info.get(
+            "ctVal"
+        )
     )
 
     lot_sz = D(
-        info.get("lotSz")
+        info.get(
+            "lotSz"
+        )
     )
 
     min_sz = D(
-        info.get("minSz")
+        info.get(
+            "minSz"
+        )
     )
 
     if ct_val <= 0:
 
         raise RuntimeError(
-            f"{inst_id} ctVal 无效"
+            "ctVal无效"
         )
 
     if lot_sz <= 0:
 
         raise RuntimeError(
-            f"{inst_id} lotSz 无效"
+            "lotSz无效"
         )
 
     if min_sz <= 0:
 
         min_sz = lot_sz
 
-    # 单笔最大保证金
     max_margin = (
         equity
         * MAX_MARGIN_PCT
     )
 
-    # 风险预算
     risk_budget = (
         equity
         * RISK_PER_TRADE_PCT
@@ -1821,7 +2419,6 @@ def calculate_size(
             "价格风险无效"
         )
 
-    # 按风险计算数量
     qty_by_risk = (
         risk_budget
         / (
@@ -1830,7 +2427,6 @@ def calculate_size(
         )
     )
 
-    # 按保证金计算最大数量
     qty_by_margin = (
         max_margin
         * leverage
@@ -1852,7 +2448,6 @@ def calculate_size(
 
     if qty < min_sz:
 
-        # 尝试最小下单量
         qty = min_sz
 
         required_margin = (
@@ -1865,17 +2460,17 @@ def calculate_size(
         if required_margin > max_margin:
 
             raise RuntimeError(
-                f"{inst_id} 最小下单量 "
+                f"{inst_id} 最小数量 "
                 f"{fmt_decimal(min_sz)} "
-                f"超过当前保证金限制"
+                f"超过保证金限制"
             )
 
     return qty
 
 
-# =========================================================
+# ============================================================
 # 市价开仓
-# =========================================================
+# ============================================================
 
 def place_market_order(
     inst_id,
@@ -1890,12 +2485,23 @@ def place_market_order(
     )
 
     body = {
-        "instId": inst_id,
-        "tdMode": TD_MODE,
-        "side": order_side,
-        "posSide": "net",
-        "ordType": "market",
-        "sz": fmt_decimal(qty)
+        "instId":
+            inst_id,
+
+        "tdMode":
+            TD_MODE,
+
+        "side":
+            order_side,
+
+        "posSide":
+            "net",
+
+        "ordType":
+            "market",
+
+        "sz":
+            fmt_decimal(qty)
     }
 
     rows = okx_request(
@@ -1908,15 +2514,15 @@ def place_market_order(
     if not rows:
 
         raise RuntimeError(
-            "下单接口没有返回数据"
+            "开仓接口没有返回"
         )
 
     return rows[0]
 
 
-# =========================================================
+# ============================================================
 # 查询订单
-# =========================================================
+# ============================================================
 
 def get_order(
     inst_id,
@@ -1927,8 +2533,11 @@ def get_order(
         "GET",
         "/api/v5/trade/order",
         params={
-            "instId": inst_id,
-            "ordId": ord_id
+            "instId":
+                inst_id,
+
+            "ordId":
+                ord_id
         },
         private=True
     )
@@ -1943,12 +2552,15 @@ def get_order(
 def wait_order_filled(
     inst_id,
     ord_id,
-    timeout=15
+    timeout=20
 ):
 
     start = time.time()
 
-    while time.time() - start < timeout:
+    while (
+        time.time() - start
+        < timeout
+    ):
 
         order = get_order(
             inst_id,
@@ -1957,10 +2569,15 @@ def wait_order_filled(
 
         if not order:
 
-            time.sleep(0.5)
+            time.sleep(
+                0.5
+            )
+
             continue
 
-        state = order.get("state")
+        state = order.get(
+            "state"
+        )
 
         if state == "filled":
 
@@ -1975,38 +2592,41 @@ def wait_order_filled(
                 f"订单未成交，状态={state}"
             )
 
-        time.sleep(0.5)
+        time.sleep(
+            0.5
+        )
 
     raise RuntimeError(
         "等待订单成交超时"
     )
 
 
-# =========================================================
-# OCO 查询
-# =========================================================
+# ============================================================
+# 查询挂单保护
+# ============================================================
 
 def get_pending_algos(
     inst_id,
     ord_type="oco"
 ):
 
-    rows = okx_request(
+    return okx_request(
         "GET",
         "/api/v5/trade/orders-algo-pending",
         params={
-            "ordType": ord_type,
-            "instId": inst_id
+            "ordType":
+                ord_type,
+
+            "instId":
+                inst_id
         },
         private=True
     )
 
-    return rows
 
-
-# =========================================================
-# 取消 Algo
-# =========================================================
+# ============================================================
+# 取消Algo
+# ============================================================
 
 def cancel_algo(
     inst_id,
@@ -2017,31 +2637,33 @@ def cancel_algo(
 
         return
 
-    body = [
-        {
-            "algoId": str(algo_id),
-            "instId": inst_id
-        }
-    ]
-
     try:
 
         okx_request(
             "POST",
             "/api/v5/trade/cancel-algos",
-            body=body,
+            body=[
+                {
+                    "instId":
+                        inst_id,
+
+                    "algoId":
+                        str(algo_id)
+                }
+            ],
             private=True
         )
 
     except Exception as e:
 
         log(
-            f"⚠️ 取消保护单失败 "
-            f"{inst_id} {algo_id}: {e}"
+            f"⚠️ 取消保护单失败: {e}"
         )
 
 
-def cancel_existing_algos(inst_id):
+def cancel_existing_algos(
+    inst_id
+):
 
     for ord_type in (
         "oco",
@@ -2064,8 +2686,9 @@ def cancel_existing_algos(inst_id):
                 if algo_id:
 
                     log(
-                        f"♻️ 取消旧保护单 "
-                        f"{ord_type} {algo_id}"
+                        f"♻️ 取消旧"
+                        f"{ord_type}保护单 "
+                        f"{algo_id}"
                     )
 
                     cancel_algo(
@@ -2076,22 +2699,27 @@ def cancel_existing_algos(inst_id):
         except Exception as e:
 
             log(
-                f"⚠️ 查询 {ord_type} 保护单失败: {e}"
+                f"⚠️ 查询{ord_type}"
+                f"保护单失败: {e}"
             )
 
 
-# =========================================================
-# 下 OCO
-# =========================================================
+# ============================================================
+# 提交OCO
+# ============================================================
 
 def place_oco(
     pos,
     plan
 ):
 
-    inst_id = pos.get("instId")
+    inst_id = pos.get(
+        "instId"
+    )
 
-    side = position_side(pos)
+    side = position_side(
+        pos
+    )
 
     if side == "LONG":
 
@@ -2104,44 +2732,57 @@ def place_oco(
     else:
 
         raise RuntimeError(
-            "OCO无法识别仓位方向"
+            "OCO方向错误"
         )
 
-    # 注意：
-    # 永续净持仓全平 OCO：
-    # closeFraction = 1
-    # reduceOnly = true
-    # 不再强制同时传 sz
     body = {
-        "instId": inst_id,
-        "tdMode": TD_MODE,
-        "side": close_side,
-        "posSide": "net",
-        "ordType": "oco",
-        "closeFraction": "1",
-        "reduceOnly": True,
+        "instId":
+            inst_id,
 
-        "tpTriggerPx": fmt_decimal(
-            plan["tp"]
-        ),
+        "tdMode":
+            TD_MODE,
 
-        "tpOrdPx": "-1",
+        "side":
+            close_side,
 
-        "tpTriggerPxType": "mark",
+        "posSide":
+            "net",
 
-        "slTriggerPx": fmt_decimal(
-            plan["sl"]
-        ),
+        "ordType":
+            "oco",
 
-        "slOrdPx": "-1",
+        "closeFraction":
+            "1",
 
-        "slTriggerPxType": "mark"
+        "reduceOnly":
+            True,
+
+        "tpTriggerPx":
+            fmt_decimal(
+                plan["tp"]
+            ),
+
+        "tpOrdPx":
+            "-1",
+
+        "tpTriggerPxType":
+            "mark",
+
+        "slTriggerPx":
+            fmt_decimal(
+                plan["sl"]
+            ),
+
+        "slOrdPx":
+            "-1",
+
+        "slTriggerPxType":
+            "mark"
     }
 
     log(
-        f"📌 准备挂 OCO | "
+        f"📌 提交OCO | "
         f"{inst_id} | "
-        f"{side} | "
         f"TP={fmt_decimal(plan['tp'])} | "
         f"SL={fmt_decimal(plan['sl'])}"
     )
@@ -2156,7 +2797,7 @@ def place_oco(
     if not rows:
 
         raise RuntimeError(
-            "OCO接口没有返回数据"
+            "OCO没有返回"
         )
 
     algo_id = rows[0].get(
@@ -2166,27 +2807,39 @@ def place_oco(
     if not algo_id:
 
         raise RuntimeError(
-            f"OCO没有返回 algoId: {rows}"
+            f"OCO没有algoId: {rows}"
         )
 
     log(
-        f"✅ OCO 已提交 | "
+        f"✅ OCO提交成功 "
         f"algoId={algo_id}"
     )
 
     return rows[0]
 
 
-# =========================================================
-# 验证 OCO
-# =========================================================
+# ============================================================
+# 验证OCO
+# ============================================================
 
 def verify_oco(
-    pos,
-    plan
+    pos
 ):
 
-    inst_id = pos.get("instId")
+    inst_id = pos.get(
+        "instId"
+    )
+
+    side = position_side(
+        pos
+    )
+
+    if side not in (
+        "LONG",
+        "SHORT"
+    ):
+
+        return False
 
     rows = get_pending_algos(
         inst_id,
@@ -2201,11 +2854,12 @@ def verify_oco(
         inst_id
     )["markPx"]
 
-    side = position_side(pos)
-
     for row in rows:
 
-        state = row.get("state", "")
+        state = row.get(
+            "state",
+            ""
+        )
 
         if state not in (
             "",
@@ -2217,44 +2871,47 @@ def verify_oco(
             continue
 
         tp = D(
-            row.get("tpTriggerPx")
+            row.get(
+                "tpTriggerPx"
+            )
         )
 
         sl = D(
-            row.get("slTriggerPx")
+            row.get(
+                "slTriggerPx"
+            )
         )
 
-        if tp <= 0 or sl <= 0:
+        if (
+            tp <= 0
+            or sl <= 0
+        ):
 
             continue
 
         if side == "LONG":
 
-            if not (
+            valid = (
                 tp > mark
                 and sl < mark
-            ):
-
-                continue
-
-        elif side == "SHORT":
-
-            if not (
-                tp < mark
-                and sl > mark
-            ):
-
-                continue
+            )
 
         else:
+
+            valid = (
+                tp < mark
+                and sl > mark
+            )
+
+        if not valid:
 
             continue
 
         log(
             f"🟢 OCO验证成功 | "
+            f"Mark={fmt_decimal(mark)} | "
             f"TP={fmt_decimal(tp)} | "
-            f"SL={fmt_decimal(sl)} | "
-            f"Mark={fmt_decimal(mark)}"
+            f"SL={fmt_decimal(sl)}"
         )
 
         return True
@@ -2262,11 +2919,13 @@ def verify_oco(
     return False
 
 
-# =========================================================
+# ============================================================
 # 紧急平仓
-# =========================================================
+# ============================================================
 
-def emergency_close(inst_id):
+def emergency_close(
+    inst_id
+):
 
     log(
         f"🚨 启动紧急平仓: {inst_id}"
@@ -2278,14 +2937,17 @@ def emergency_close(inst_id):
             "POST",
             "/api/v5/trade/close-position",
             body={
-                "instId": inst_id,
-                "mgnMode": TD_MODE
+                "instId":
+                    inst_id,
+
+                "mgnMode":
+                    TD_MODE
             },
             private=True
         )
 
         log(
-            f"🚨 紧急平仓请求已发送: {inst_id}"
+            "🚨 紧急平仓请求已发送"
         )
 
     except Exception as e:
@@ -2295,9 +2957,9 @@ def emergency_close(inst_id):
         )
 
 
-# =========================================================
-# 确保保护单
-# =========================================================
+# ============================================================
+# 确保TP/SL
+# ============================================================
 
 def ensure_protection(
     pos,
@@ -2306,7 +2968,9 @@ def ensure_protection(
     atr=None
 ):
 
-    inst_id = pos.get("instId")
+    inst_id = pos.get(
+        "instId"
+    )
 
     for attempt in range(
         1,
@@ -2322,34 +2986,31 @@ def ensure_protection(
             if not current_pos:
 
                 log(
-                    f"⚠️ {inst_id} 已无持仓，"
-                    f"停止挂保护"
+                    f"⚠️ {inst_id}已经没有持仓"
                 )
 
-                return False
+                return True
 
-            # 每次都重新获取 Mark
-            ticker = get_ticker(
+            # 每次都读取最新Mark
+            mark = get_ticker(
                 inst_id
-            )
-
-            mark = ticker["markPx"]
+            )["markPx"]
 
             log(
-                f"🔄 TP/SL第 {attempt}/{OCO_RETRY_COUNT} 次检查 | "
+                f"🔄 TP/SL检查 "
+                f"{attempt}/{OCO_RETRY_COUNT} | "
                 f"Mark={fmt_decimal(mark)}"
             )
 
-            # 先检查当前是否已有有效 OCO
+            # 先检查是否已有有效保护
             try:
 
                 if verify_oco(
-                    current_pos,
-                    {}
+                    current_pos
                 ):
 
                     log(
-                        f"🟢 {inst_id} 已存在有效 OCO"
+                        "🟢 当前OCO已经有效"
                     )
 
                     return True
@@ -2357,25 +3018,26 @@ def ensure_protection(
             except Exception as e:
 
                 log(
-                    f"⚠️ 检查现有OCO失败: {e}"
+                    f"⚠️ OCO检查异常: {e}"
                 )
 
-            # 清理旧保护单
+            # 没有有效OCO
             cancel_existing_algos(
                 inst_id
             )
 
-            time.sleep(0.3)
+            time.sleep(
+                0.3
+            )
 
-            # 重新计算 ATR
-            candles = get_candles(
+            fresh_candles = get_candles(
                 inst_id,
                 SIGNAL_BAR,
                 100
             )
 
             fresh_atr = calculate_atr(
-                candles,
+                fresh_candles,
                 ATR_PERIOD
             )
 
@@ -2387,17 +3049,20 @@ def ensure_protection(
 
             plan = calculate_protection(
                 current_pos,
-                atr=fresh_atr,
+                atr=(
+                    atr
+                    if atr is not None
+                    else fresh_atr
+                ),
                 adopted=adopted
             )
 
             log(
-                f"🎯 TP/SL计划 | "
-                f"Mark={fmt_decimal(plan['mark'])} | "
+                f"🎯 保护计划 | "
                 f"TP={fmt_decimal(plan['tp'])} | "
                 f"SL={fmt_decimal(plan['sl'])} | "
-                f"SL距离={fmt_decimal(plan['sl_pct'] * 100, 4)}% | "
-                f"TP距离={fmt_decimal(plan['tp_pct'] * 100, 4)}%"
+                f"TP距离={fmt_decimal(plan['tp_pct'] * 100, 4)}% | "
+                f"SL距离={fmt_decimal(plan['sl_pct'] * 100, 4)}%"
             )
 
             place_oco(
@@ -2409,48 +3074,51 @@ def ensure_protection(
                 OCO_VERIFY_WAIT
             )
 
-            verify_pos = get_position(
+            verify_position = get_position(
                 inst_id
             )
 
-            if not verify_pos:
+            if not verify_position:
 
                 log(
-                    "⚠️ 下保护单后仓位已经消失"
+                    "ℹ️ OCO提交后仓位已经不存在"
                 )
 
                 return True
 
             if verify_oco(
-                verify_pos,
-                plan
+                verify_position
             ):
 
                 log(
-                    f"🟢 TP/SL保护正式生效: {inst_id}"
+                    f"🟢 TP/SL正式生效: "
+                    f"{inst_id}"
                 )
 
                 return True
 
             log(
-                f"⚠️ 第 {attempt} 次 OCO 验证失败"
+                f"⚠️ 第{attempt}次OCO验证失败"
             )
 
         except Exception as e:
 
             log(
-                f"❌ 第 {attempt} 次 TP/SL处理失败: {e}"
+                f"❌ 第{attempt}次TP/SL失败: {e}"
             )
 
-        time.sleep(1)
+        time.sleep(
+            1
+        )
 
     log(
-        f"❌ {inst_id} 连续 {OCO_RETRY_COUNT} 次保护失败"
+        f"❌ {inst_id} TP/SL连续失败"
     )
 
     if (
         new_position
-        and EMERGENCY_CLOSE_ON_NEW_POSITION_PROTECTION_FAILURE
+        and
+        EMERGENCY_CLOSE_ON_NEW_POSITION_PROTECTION_FAILURE
     ):
 
         emergency_close(
@@ -2460,27 +3128,34 @@ def ensure_protection(
     return False
 
 
-# =========================================================
-# 历史平仓结果
-# =========================================================
+# ============================================================
+# 历史平仓
+# ============================================================
 
-def get_position_history(inst_id):
+def get_position_history(
+    inst_id
+):
 
-    rows = okx_request(
+    return okx_request(
         "GET",
         "/api/v5/account/positions-history",
         params={
-            "instType": "SWAP",
-            "instId": inst_id,
-            "limit": "20"
+            "instType":
+                "SWAP",
+
+            "instId":
+                inst_id,
+
+            "limit":
+                "20"
         },
         private=True
     )
 
-    return rows
 
-
-def get_latest_closed_result(inst_id):
+def get_latest_closed_result(
+    inst_id
+):
 
     rows = get_position_history(
         inst_id
@@ -2490,29 +3165,32 @@ def get_latest_closed_result(inst_id):
 
         return None
 
-    # 按 uTime 从新到旧
     rows.sort(
-        key=lambda x: D(
-            x.get("uTime")
-        ),
+        key=lambda x:
+            D(
+                x.get(
+                    "uTime"
+                )
+            ),
         reverse=True
     )
 
     for row in rows:
 
-        close_total_pos = D(
-            row.get("closeTotalPos")
-        )
+        if D(
+            row.get(
+                "closeTotalPos"
+            )
+        ) > 0:
 
-        if close_total_pos <= 0:
-            continue
-
-        return row
+            return row
 
     return rows[0]
 
 
-def print_closed_position_result(inst_id):
+def print_closed_position_result(
+    inst_id
+):
 
     try:
 
@@ -2523,7 +3201,8 @@ def print_closed_position_result(inst_id):
         if not row:
 
             log(
-                f"⚠️ 没找到 {inst_id} 的历史平仓记录"
+                f"⚠️ 没找到 "
+                f"{inst_id}历史平仓"
             )
 
             return None
@@ -2534,107 +3213,131 @@ def print_closed_position_result(inst_id):
         )
 
         open_px = D(
-            row.get("openAvgPx")
+            row.get(
+                "openAvgPx"
+            )
         )
 
         close_px = D(
-            row.get("closeAvgPx")
+            row.get(
+                "closeAvgPx"
+            )
         )
 
         pnl = D(
-            row.get("pnl")
+            row.get(
+                "pnl"
+            )
         )
 
         fee = D(
-            row.get("fee")
+            row.get(
+                "fee"
+            )
         )
 
         funding = D(
-            row.get("fundingFee")
+            row.get(
+                "fundingFee"
+            )
         )
 
         realized = D(
-            row.get("realizedPnl")
+            row.get(
+                "realizedPnl"
+            )
         )
 
         pnl_ratio = D(
-            row.get("pnlRatio")
+            row.get(
+                "pnlRatio"
+            )
         )
 
         log(
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            "━━━━━━━━━━━━━━━━━━━━━━"
         )
 
         log(
-            f"🏁 {inst_id} 已平仓"
+            f"🏁 {inst_id} 平仓结果"
         )
 
         log(
             f"方向: {direction}"
         )
 
-        if open_px > 0:
-
-            log(
-                f"开仓均价: {fmt_decimal(open_px)}"
-            )
-
-        if close_px > 0:
-
-            log(
-                f"平仓均价: {fmt_decimal(close_px)}"
-            )
-
         log(
-            f"价格盈亏: {fmt_decimal(pnl, 8)} USDT"
+            f"开仓均价: "
+            f"{fmt_decimal(open_px)}"
         )
 
         log(
-            f"手续费: {fmt_decimal(fee, 8)} USDT"
+            f"平仓均价: "
+            f"{fmt_decimal(close_px)}"
         )
 
         log(
-            f"资金费: {fmt_decimal(funding, 8)} USDT"
+            f"价格盈亏: "
+            f"{fmt_decimal(pnl, 8)} USDT"
         )
 
         log(
-            f"最终 realizedPnl: "
+            f"手续费: "
+            f"{fmt_decimal(fee, 8)} USDT"
+        )
+
+        log(
+            f"资金费: "
+            f"{fmt_decimal(funding, 8)} USDT"
+        )
+
+        log(
+            f"最终realizedPnl: "
             f"{fmt_decimal(realized, 8)} USDT"
         )
 
         log(
-            f"OKX记录 ROI: "
+            f"OKX记录ROI: "
             f"{fmt_decimal(pnl_ratio * 100, 4)}%"
         )
 
         if realized > 0:
 
             log(
-                "🟢 本次交易：盈利"
+                "🟢 本次交易盈利"
             )
 
         elif realized < 0:
 
             log(
-                "🔴 本次交易：亏损"
+                "🔴 本次交易亏损"
             )
 
         else:
 
             log(
-                "⚪ 本次交易：基本持平"
+                "⚪ 本次交易基本持平"
             )
 
         log(
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            "━━━━━━━━━━━━━━━━━━━━━━"
         )
 
         return {
-            "realizedPnl": realized,
-            "pnl": pnl,
-            "fee": fee,
-            "fundingFee": funding,
-            "pnlRatio": pnl_ratio
+            "realizedPnl":
+                realized,
+
+            "pnl":
+                pnl,
+
+            "fee":
+                fee,
+
+            "fundingFee":
+                funding,
+
+            "pnlRatio":
+                pnl_ratio
         }
 
     except Exception as e:
@@ -2646,16 +3349,22 @@ def print_closed_position_result(inst_id):
         return None
 
 
-# =========================================================
+# ============================================================
 # 连续亏损状态
-# =========================================================
+# ============================================================
 
 consecutive_losses = 0
 
-last_loss_time = 0
+last_loss_time = 0.0
 
 
-def update_trade_result(result):
+# ============================================================
+# 更新交易结果
+# ============================================================
+
+def update_trade_result(
+    result
+):
 
     global consecutive_losses
     global last_loss_time
@@ -2665,7 +3374,9 @@ def update_trade_result(result):
         return
 
     realized = D(
-        result.get("realizedPnl")
+        result.get(
+            "realizedPnl"
+        )
     )
 
     if realized < 0:
@@ -2675,24 +3386,36 @@ def update_trade_result(result):
         last_loss_time = time.time()
 
         log(
-            f"🔴 连续亏损次数: "
-            f"{consecutive_losses}/{MAX_CONSECUTIVE_LOSSES}"
+            f"🔴 连续亏损 "
+            f"{consecutive_losses}/"
+            f"{MAX_CONSECUTIVE_LOSSES}"
         )
 
     elif realized > 0:
 
         consecutive_losses = 0
 
-        last_loss_time = 0
+        last_loss_time = 0.0
 
         log(
-            "🟢 本次盈利，连续亏损计数归零"
+            "🟢 本次盈利，"
+            "连续亏损计数归零"
         )
 
 
+# ============================================================
+# 连续亏损冷却
+# ============================================================
+
 def in_loss_cooldown():
 
-    if consecutive_losses < MAX_CONSECUTIVE_LOSSES:
+    global consecutive_losses
+    global last_loss_time
+
+    if (
+        consecutive_losses
+        < MAX_CONSECUTIVE_LOSSES
+    ):
 
         return False
 
@@ -2701,16 +3424,19 @@ def in_loss_cooldown():
         - last_loss_time
     )
 
-    if elapsed < LOSS_COOLDOWN_SECONDS:
+    if (
+        elapsed
+        < LOSS_COOLDOWN_SECONDS
+    ):
 
-        remain = (
+        remaining = (
             LOSS_COOLDOWN_SECONDS
             - elapsed
         )
 
         log(
-            f"🛑 连续亏损保护中，"
-            f"剩余约 {int(remain)} 秒"
+            f"🛑 连续亏损保护中 | "
+            f"剩余约{int(remaining)}秒"
         )
 
         return True
@@ -2718,18 +3444,18 @@ def in_loss_cooldown():
     # 冷却结束
     consecutive_losses = 0
 
-    last_loss_time = 0
+    last_loss_time = 0.0
 
     log(
-        "🟢 连续亏损冷却结束，恢复扫描"
+        "🟢 连续亏损冷却结束"
     )
 
     return False
 
 
-# =========================================================
+# ============================================================
 # 持仓快照
-# =========================================================
+# ============================================================
 
 previous_positions = {}
 
@@ -2744,11 +3470,15 @@ def detect_closed_positions(
 
     for pos in current_positions:
 
-        inst_id = pos.get("instId")
+        inst_id = pos.get(
+            "instId"
+        )
 
         if inst_id:
 
-            current_map[inst_id] = pos
+            current_map[
+                inst_id
+            ] = pos
 
     closed_ids = []
 
@@ -2765,11 +3495,14 @@ def detect_closed_positions(
     for inst_id in closed_ids:
 
         log(
-            f"📕 检测到仓位消失: {inst_id}"
+            f"📕 检测到仓位结束: "
+            f"{inst_id}"
         )
 
-        result = print_closed_position_result(
-            inst_id
+        result = (
+            print_closed_position_result(
+                inst_id
+            )
         )
 
         update_trade_result(
@@ -2781,12 +3514,14 @@ def detect_closed_positions(
             None
         )
 
-    previous_positions = current_map
+    previous_positions = (
+        current_map
+    )
 
 
-# =========================================================
+# ============================================================
 # 管理已有仓位
-# =========================================================
+# ============================================================
 
 def manage_existing_positions():
 
@@ -2806,10 +3541,6 @@ def manage_existing_positions():
             "instId"
         )
 
-        log(
-            f"🔎 管理现有持仓: {inst_id}"
-        )
-
         try:
 
             print_live_position(
@@ -2822,8 +3553,6 @@ def manage_existing_positions():
                 f"⚠️ 实时持仓显示失败: {e}"
             )
 
-        # 已经有仓位，不管它是否仍在Top30，
-        # 都必须继续管理TP/SL
         try:
 
             ensure_protection(
@@ -2835,114 +3564,120 @@ def manage_existing_positions():
         except Exception as e:
 
             log(
-                f"⚠️ 持仓保护处理异常: {e}"
+                f"⚠️ TP/SL管理异常: {e}"
             )
 
     return True
 
 
-# =========================================================
-# 是否允许开新仓
-# =========================================================
+# ============================================================
+# 判断是否可以新开仓
+# ============================================================
 
 def can_open_new_trade():
 
     positions = get_positions()
 
-    return len(positions) == 0
+    return (
+        len(positions)
+        == 0
+    )
 
 
-# =========================================================
+# ============================================================
 # 执行交易
-# =========================================================
+# ============================================================
 
 def execute_candidate(
     candidate
 ):
 
-    inst_id = candidate["instId"]
+    inst_id = candidate[
+        "instId"
+    ]
 
-    side = candidate["side"]
+    side = candidate[
+        "side"
+    ]
 
-    score = candidate["score"]
+    score = candidate[
+        "score"
+    ]
 
-    price = candidate["price"]
-
-    atr = candidate["atr"]
+    atr = candidate[
+        "atr"
+    ]
 
     log(
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        "━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     log(
         f"🚀 准备开仓 | "
         f"{inst_id} | "
         f"{side} | "
-        f"信号分数 {score}"
+        f"Score={score}"
     )
 
-    # 再次确认没有持仓
     if not can_open_new_trade():
 
         log(
-            "⛔ 已存在其他持仓，取消新交易"
+            "⛔ 已经存在持仓"
         )
 
         return False
 
     # 动态杠杆
-    desired_leverage = leverage_from_score(
-        score
+    desired = (
+        leverage_from_score(
+            score
+        )
     )
 
-    leverage = get_actual_leverage(
-        inst_id,
-        desired_leverage
+    leverage = (
+        get_actual_leverage(
+            inst_id,
+            desired
+        )
     )
 
-    if leverage != desired_leverage:
+    if leverage != desired:
 
         log(
-            f"ℹ️ {inst_id} 最大允许杠杆 "
-            f"限制为 {fmt_decimal(leverage)}x，"
-            f"原计划 {fmt_decimal(desired_leverage)}x"
+            f"ℹ️ 合约最大杠杆限制 | "
+            f"计划={fmt_decimal(desired)}x | "
+            f"实际={fmt_decimal(leverage)}x"
         )
 
-    log(
-        f"⚙️ 最终杠杆: {fmt_decimal(leverage)}x"
-    )
+    else:
 
-    # 设置杠杆
+        log(
+            f"⚙️ 动态杠杆="
+            f"{fmt_decimal(leverage)}x"
+        )
+
     set_leverage(
         inst_id,
         leverage
     )
 
     log(
-        f"✅ 杠杆设置成功: "
-        f"{fmt_decimal(leverage)}x"
+        "✅ 杠杆设置成功"
     )
 
-    # 获取最新价格
-    ticker = get_ticker(
+    # 最新Mark
+    price = get_ticker(
         inst_id
+    )["markPx"]
+
+    atr_pct = (
+        atr / price
     )
-
-    current_price = ticker["markPx"]
-
-    if current_price <= 0:
-
-        raise RuntimeError(
-            "当前Mark Price无效"
-        )
-
-    # 先计算一个初始保护比例
-    atr_pct = atr / current_price
 
     target_sl_pct = (
         TARGET_SL_ROI_PCT
         / leverage
-        / Decimal("100")
+        / 100
     )
 
     atr_sl_pct = (
@@ -2961,7 +3696,6 @@ def execute_candidate(
         MAX_SL_PRICE_PCT
     )
 
-    # 仓位
     equity = get_equity()
 
     if equity <= 0:
@@ -2971,25 +3705,25 @@ def execute_candidate(
         )
 
     qty = calculate_size(
-        equity=equity,
-        price=current_price,
-        leverage=leverage,
-        sl_pct=sl_pct,
-        inst_id=inst_id
+        equity,
+        price,
+        leverage,
+        sl_pct,
+        inst_id
     )
 
     log(
-        f"💰 账户权益: "
+        f"💰 权益="
         f"{fmt_decimal(equity, 4)} USDT"
     )
 
     log(
-        f"📦 下单数量: "
+        f"📦 下单数量="
         f"{fmt_decimal(qty)}"
     )
 
     log(
-        f"📉 风险止损距离约: "
+        f"🛑 初始SL距离="
         f"{fmt_decimal(sl_pct * 100, 4)}%"
     )
 
@@ -3007,35 +3741,41 @@ def execute_candidate(
     if not ord_id:
 
         raise RuntimeError(
-            f"开仓订单没有ordId: {order}"
+            f"没有ordId: {order}"
         )
 
     log(
-        f"📨 开仓订单已提交: {ord_id}"
+        f"📨 开仓订单="
+        f"{ord_id}"
     )
 
-    # 等待成交
-    filled_order = wait_order_filled(
+    filled = wait_order_filled(
         inst_id,
         ord_id
     )
 
     fill_px = D(
-        filled_order.get("avgPx")
+        filled.get(
+            "avgPx"
+        )
     )
 
     fill_sz = D(
-        filled_order.get("accFillSz")
-        or filled_order.get("fillSz")
+        filled.get(
+            "accFillSz"
+        )
+        or filled.get(
+            "fillSz"
+        )
     )
 
     log(
         f"✅ 开仓成交 | "
-        f"价格 {fmt_decimal(fill_px)} | "
-        f"数量 {fmt_decimal(fill_sz)}"
+        f"价格={fmt_decimal(fill_px)} | "
+        f"数量={fmt_decimal(fill_sz)}"
     )
 
-    # 获取真实持仓
+    # 等待真实持仓
     position = None
 
     for _ in range(10):
@@ -3048,12 +3788,14 @@ def execute_candidate(
 
             break
 
-        time.sleep(0.5)
+        time.sleep(
+            0.5
+        )
 
     if not position:
 
         raise RuntimeError(
-            "订单成交，但未读取到持仓"
+            "成交后没有读取到持仓"
         )
 
     # 实时显示
@@ -3061,50 +3803,57 @@ def execute_candidate(
         position
     )
 
-    # 立即挂TP/SL
-    protected = ensure_protection(
-        position,
-        adopted=False,
-        new_position=True,
-        atr=atr
+    # 立即保护
+    protected = (
+        ensure_protection(
+            position,
+            adopted=False,
+            new_position=True,
+            atr=atr
+        )
     )
 
     if not protected:
 
         log(
-            "🚨 新仓保护失败，已经执行紧急处理"
+            "🚨 新仓TP/SL保护失败"
         )
 
         return False
 
     log(
-        f"🟢 {inst_id} 开仓完成且TP/SL已确认"
+        f"🟢 {inst_id} "
+        f"开仓+TP/SL全部完成"
     )
 
     log(
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        "━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     return True
 
 
-# =========================================================
-# 扫描候选
-# =========================================================
+# ============================================================
+# 扫描
+# ============================================================
 
 def scan_candidates():
 
-    instruments = get_top30_okx_instruments()
+    instruments = (
+        get_top30_okx_instruments()
+    )
 
     if not instruments:
 
         log(
-            "⚠️ 当前没有可扫描的Top30合约"
+            "⚠️ 当前没有Top30可扫描品种"
         )
 
         return []
 
-    tickers = get_all_tickers()
+    tickers = (
+        get_all_tickers()
+    )
 
     candidates = []
 
@@ -3122,11 +3871,10 @@ def scan_candidates():
 
             continue
 
-        # OKX SWAP 的 volCcy24h 字段
-        # 不同合约的具体计量方式以接口定义为准，
-        # 这里只做流动性过滤，不把它硬解释成美元成交额
         volume = D(
-            ticker.get("volCcy24h")
+            ticker.get(
+                "volCcy24h"
+            )
         )
 
         if volume <= 0:
@@ -3135,17 +3883,23 @@ def scan_candidates():
 
         try:
 
-            signal = calculate_signal(
-                inst_id
+            signal = (
+                calculate_signal(
+                    inst_id
+                )
             )
 
             if not signal:
 
                 continue
 
-            signal["volume"] = volume
+            signal[
+                "volume"
+            ] = volume
 
-            signal["rank"] = info.get(
+            signal[
+                "rank"
+            ] = info.get(
                 "_top30_rank",
                 999
             )
@@ -3157,7 +3911,8 @@ def scan_candidates():
         except Exception as e:
 
             log(
-                f"⚠️ {inst_id} 信号计算失败: {e}"
+                f"⚠️ {inst_id} "
+                f"信号计算失败: {e}"
             )
 
     candidates.sort(
@@ -3171,43 +3926,46 @@ def scan_candidates():
     return candidates
 
 
-# =========================================================
+# ============================================================
 # 打印候选
-# =========================================================
+# ============================================================
 
-def print_candidates(candidates):
+def print_candidates(
+    candidates
+):
 
     if not candidates:
 
         log(
-            "🔎 当前没有符合条件的交易信号"
+            "🔎 没有符合条件的交易信号"
         )
 
         return
 
     log(
-        f"🔎 找到 {len(candidates)} 个候选"
+        f"🔎 找到 "
+        f"{len(candidates)} 个候选"
     )
 
-    for i, c in enumerate(
+    for index, item in enumerate(
         candidates[:10],
         start=1
     ):
 
         log(
-            f"{i}. "
-            f"{c['instId']} | "
-            f"{c['side']} | "
-            f"分数={c['score']} | "
-            f"RSI={fmt_decimal(c['rsi'], 2)} | "
-            f"15m={c['trend15m']} | "
-            f"1H={c['trend1h']}"
+            f"{index}. "
+            f"{item['instId']} | "
+            f"{item['side']} | "
+            f"Score={item['score']} | "
+            f"RSI={fmt_decimal(item['rsi'], 2)} | "
+            f"15m={item['trend15m']} | "
+            f"1H={item['trend1h']}"
         )
 
 
-# =========================================================
-# 主循环
-# =========================================================
+# ============================================================
+# 主程序
+# ============================================================
 
 def main():
 
@@ -3218,33 +3976,37 @@ def main():
     )
 
     log(
-        f"🚀 OKX BTC/多币种永续自动交易模拟盘 {VERSION}"
+        f"🚀 OKX永续自动交易模拟盘 {VERSION}"
     )
 
     log(
-        f"📌 模式: OKX 模拟盘"
+        "📌 模式：模拟盘"
     )
 
     log(
-        f"📌 杠杆范围: "
+        "📌 新开仓：CoinGecko市值Top30"
+    )
+
+    log(
+        "📌 已有仓位：持续管理，不受Top30限制"
+    )
+
+    log(
+        f"📌 杠杆："
         f"{fmt_decimal(MIN_LEVERAGE)}x ~ "
         f"{fmt_decimal(MAX_LEVERAGE)}x"
     )
 
     log(
-        "📌 自动读取合约最大杠杆"
+        "📌 策略：EMA + RSI + MACD + ATR"
     )
 
     log(
-        "📌 策略: EMA + RSI + MACD + ATR"
+        "📌 周期：5m + 15m + 1H"
     )
 
     log(
-        "📌 周期: 5m + 15m + 1H"
-    )
-
-    log(
-        "📌 TP/SL: OCO + Mark Price"
+        "📌 TP/SL：OCO + Mark Price"
     )
 
     log(
@@ -3252,20 +4014,29 @@ def main():
     )
 
     log(
-        "📌 日志时间: UTC+8"
+        "📌 连续亏损保护："
+        f"{MAX_CONSECUTIVE_LOSSES}次"
+    )
+
+    log(
+        "📌 日志时间：UTC+8"
     )
 
     log(
         "=========================================="
     )
 
-    # 启动时先读取已有持仓
+    # ========================================================
+    # 启动时检查持仓
+    # ========================================================
+
     try:
 
         positions = get_positions()
 
         previous_positions = {
-            p.get("instId"): p
+            p.get("instId"):
+                p
             for p in positions
             if p.get("instId")
         }
@@ -3274,7 +4045,7 @@ def main():
 
             log(
                 f"⚠️ 启动时检测到 "
-                f"{len(positions)} 个已有持仓"
+                f"{len(positions)} 个持仓"
             )
 
             for pos in positions:
@@ -3301,15 +4072,21 @@ def main():
             f"⚠️ 启动持仓检查失败: {e}"
         )
 
+    # ========================================================
+    # 主循环
+    # ========================================================
+
     while True:
 
         try:
 
-            # =================================================
-            # 第一优先级：管理现有持仓
-            # =================================================
+            # ------------------------------------------------
+            # 第一优先级：已有持仓
+            # ------------------------------------------------
 
-            has_position = manage_existing_positions()
+            has_position = (
+                manage_existing_positions()
+            )
 
             if has_position:
 
@@ -3319,9 +4096,9 @@ def main():
 
                 continue
 
-            # =================================================
+            # ------------------------------------------------
             # 连续亏损保护
-            # =================================================
+            # ------------------------------------------------
 
             if in_loss_cooldown():
 
@@ -3331,21 +4108,21 @@ def main():
 
                 continue
 
-            # =================================================
+            # ------------------------------------------------
             # 账户
-            # =================================================
+            # ------------------------------------------------
 
             equity = get_equity()
 
             log(
-                f"💰 当前账户权益: "
+                f"💰 当前权益="
                 f"{fmt_decimal(equity, 4)} USDT"
             )
 
             if equity <= 0:
 
                 log(
-                    "⚠️ 账户权益无效，暂不交易"
+                    "⚠️ 账户权益无效"
                 )
 
                 time.sleep(
@@ -3354,11 +4131,13 @@ def main():
 
                 continue
 
-            # =================================================
+            # ------------------------------------------------
             # 扫描
-            # =================================================
+            # ------------------------------------------------
 
-            candidates = scan_candidates()
+            candidates = (
+                scan_candidates()
+            )
 
             print_candidates(
                 candidates
@@ -3372,22 +4151,24 @@ def main():
 
                 continue
 
-            # =================================================
-            # 只选择最强候选
-            # =================================================
+            # ------------------------------------------------
+            # 选择最强信号
+            # ------------------------------------------------
 
-            candidate = candidates[0]
+            candidate = (
+                candidates[0]
+            )
 
             log(
-                f"🎯 最终候选: "
+                f"🎯 最终候选 | "
                 f"{candidate['instId']} | "
                 f"{candidate['side']} | "
                 f"Score={candidate['score']}"
             )
 
-            # =================================================
+            # ------------------------------------------------
             # 执行
-            # =================================================
+            # ------------------------------------------------
 
             execute_candidate(
                 candidate
@@ -3400,7 +4181,7 @@ def main():
         except KeyboardInterrupt:
 
             log(
-                "🛑 收到停止指令，机器人退出"
+                "🛑 机器人停止"
             )
 
             break
@@ -3416,9 +4197,9 @@ def main():
             )
 
 
-# =========================================================
+# ============================================================
 # 启动
-# =========================================================
+# ============================================================
 
 if __name__ == "__main__":
 
