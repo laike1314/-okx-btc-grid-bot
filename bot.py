@@ -486,6 +486,54 @@ def get_all_active_usdt_swaps():
         "/api/v5/public/instruments",
         params={
             "instType": INST_TYPE,
+        },
+    )
+
+    result = []
+
+    for x in data.get("data", []):
+
+        inst_id = str(
+            x.get("instId", "")
+        ).upper()
+
+        # 只要 USDT 永续
+        if not inst_id.endswith("-USDT-SWAP"):
+            continue
+
+        # 必须是正在交易
+        if x.get("state") != "live":
+            continue
+
+        # SWAP 的结算币必须是 USDT
+        if x.get("settleCcy") != SETTLE_CCY:
+            continue
+
+        # 从 instId 提取基础币种
+        # BTC-USDT-SWAP -> BTC
+        parts = inst_id.split("-")
+
+        if len(parts) < 3:
+            continue
+
+        x["_baseCcy"] = parts[0]
+
+        result.append(x)
+
+        instrument_cache[inst_id] = x
+
+    log(
+        f"📡 OKX当前USDT永续合约："
+        f"{len(result)}个"
+    )
+
+    return result
+
+    data = okx_request(
+        "GET",
+        "/api/v5/public/instruments",
+        params={
+            "instType": INST_TYPE,
             "uly": "",
         },
     )
@@ -518,7 +566,7 @@ def get_all_active_usdt_swaps():
 # Top30 对应 OKX 合约
 # ============================================================
 
-def get_top30_okx_instruments():
+def get_top30_okx_instruments():      top_symbols, rank_map = get_top30_market_caps()      if not top_symbols:         log("⛔ 当前无法取得有效市值Top30")         return []      instruments = get_all_active_usdt_swaps()      result = []      for item in instruments:          inst_id = str(             item.get("instId", "")         ).upper()          # 只处理 USDT 永续         if not inst_id.endswith("-USDT-SWAP"):             continue          # ----------------------------------------------------         # OKX SWAP 不依赖 baseCcy         # 直接从 BTC-USDT-SWAP 中提取 BTC         # ----------------------------------------------------         parts = inst_id.split("-")          if len(parts) < 3:             continue          base = parts[0]          if base not in top_symbols:             continue          item["_baseCcy"] = base          item["_marketCapRank"] = rank_map.get(             base,             9999,         )          result.append(item)      # 按全球市值排名排序     result.sort(         key=lambda x: x.get(             "_marketCapRank",             9999,         )     )      log(         f"🔎 OKX可交易市值Top30合约："         f"{len(result)}个"     )      if result:          names = []          for x in result:              names.append(                 f"{x['_baseCcy']}"                 f"(#{x['_marketCapRank']})"             )          log(             "📋 当前可交易Top30："             + ", ".join(names)         )      return result      top_symbols, rank_map = get_top30_market_caps()      if not top_symbols:         log("⛔ 当前无法取得有效市值Top30")         return []      instruments = get_all_active_usdt_swaps()      result = []      for item in instruments:          inst_id = str(             item.get("instId", "")         ).upper()          # 只处理 USDT 永续         if not inst_id.endswith("-USDT-SWAP"):             continue          # ----------------------------------------------------         # OKX SWAP 不依赖 baseCcy         # 直接从 BTC-USDT-SWAP 中提取 BTC         # ----------------------------------------------------         parts = inst_id.split("-")          if len(parts) < 3:             continue          base = parts[0]          if base not in top_symbols:             continue          item["_baseCcy"] = base          item["_marketCapRank"] = rank_map.get(             base,             9999,         )          result.append(item)      # 按全球市值排名排序     result.sort(         key=lambda x: x.get(             "_marketCapRank",             9999,         )     )      log(         f"🔎 OKX可交易市值Top30合约："         f"{len(result)}个"     )      if result:          names = []          for x in result:              names.append(                 f"{x['_baseCcy']}"                 f"(#{x['_marketCapRank']})"             )          log(             "📋 当前可交易Top30："             + ", ".join(names)         )      return result      top_symbols, rank_map = get_top30_market_caps()      if not top_symbols:         log("⛔ 当前无法取得有效市值Top30")         return []      instruments = get_all_active_usdt_swaps()      result = []      for item in instruments:          inst_id = str(             item.get("instId", "")         ).upper()          # 只处理 USDT 永续         if not inst_id.endswith("-USDT-SWAP"):             continue          # ----------------------------------------------------         # OKX SWAP 不依赖 baseCcy         # 直接从 BTC-USDT-SWAP 中提取 BTC         # ----------------------------------------------------         parts = inst_id.split("-")          if len(parts) < 3:             continue          base = parts[0]          if base not in top_symbols:             continue          item["_baseCcy"] = base          item["_marketCapRank"] = rank_map.get(             base,             9999,         )          result.append(item)      # 按全球市值排名排序     result.sort(         key=lambda x: x.get(             "_marketCapRank",             9999,         )     )      log(         f"🔎 OKX可交易市值Top30合约："         f"{len(result)}个"     )      if result:          names = []          for x in result:              names.append(                 f"{x['_baseCcy']}"                 f"(#{x['_marketCapRank']})"             )          log(             "📋 当前可交易Top30："             + ", ".join(names)         )      return result      top_symbols, rank_map = get_top30_market_caps()      if not top_symbols:         log("⛔ 当前无法取得有效市值Top30")         return []      instruments = get_all_active_usdt_swaps()      result = []      for item in instruments:          inst_id = str(             item.get("instId", "")         ).upper()          # 只处理 USDT 永续         if not inst_id.endswith("-USDT-SWAP"):             continue          # ----------------------------------------------------         # OKX SWAP 不依赖 baseCcy         # 直接从 BTC-USDT-SWAP 中提取 BTC         # ----------------------------------------------------         parts = inst_id.split("-")          if len(parts) < 3:             continue          base = parts[0]          if base not in top_symbols:             continue          item["_baseCcy"] = base          item["_marketCapRank"] = rank_map.get(             base,             9999,         )          result.append(item)      # 按全球市值排名排序     result.sort(         key=lambda x: x.get(             "_marketCapRank",             9999,         )     )      log(         f"🔎 OKX可交易市值Top30合约："         f"{len(result)}个"     )      if result:          names = []          for x in result:              names.append(                 f"{x['_baseCcy']}"                 f"(#{x['_marketCapRank']})"             )          log(             "📋 当前可交易Top30："             + ", ".join(names)         )      return result      top_symbols, rank_map = get_top30_market_caps()      if not top_symbols:         log("⛔ 当前无法取得有效市值Top30")         return []      instruments = get_all_active_usdt_swaps()      result = []      for item in instruments:          inst_id = str(             item.get("instId", "")         ).upper()          # 只处理 USDT 永续         if not inst_id.endswith("-USDT-SWAP"):             continue          # ----------------------------------------------------         # OKX SWAP 不依赖 baseCcy         # 直接从 BTC-USDT-SWAP 中提取 BTC         # ----------------------------------------------------         parts = inst_id.split("-")          if len(parts) < 3:             continue          base = parts[0]          if base not in top_symbols:             continue          item["_baseCcy"] = base          item["_marketCapRank"] = rank_map.get(             base,             9999,         )          result.append(item)      # 按全球市值排名排序     result.sort(         key=lambda x: x.get(             "_marketCapRank",             9999,         )     )      log(         f"🔎 OKX可交易市值Top30合约："         f"{len(result)}个"     )      if result:          names = []          for x in result:              names.append(                 f"{x['_baseCcy']}"                 f"(#{x['_marketCapRank']})"             )          log(             "📋 当前可交易Top30："             + ", ".join(names)         )      return result      top_symbols, rank_map = get_top30_market_caps()      if not top_symbols:         log("⛔ 当前无法取得有效市值Top30")         return []      instruments = get_all_active_usdt_swaps()      result = []      for item in instruments:          inst_id = str(             item.get("instId", "")         ).upper()          # 只处理 USDT 永续         if not inst_id.endswith("-USDT-SWAP"):             continue          # ----------------------------------------------------         # OKX SWAP 不依赖 baseCcy         # 直接从 BTC-USDT-SWAP 中提取 BTC         # ----------------------------------------------------         parts = inst_id.split("-")          if len(parts) < 3:             continue          base = parts[0]          if base not in top_symbols:             continue          item["_baseCcy"] = base          item["_marketCapRank"] = rank_map.get(             base,             9999,         )          result.append(item)      # 按全球市值排名排序     result.sort(         key=lambda x: x.get(             "_marketCapRank",             9999,         )     )      log(         f"🔎 OKX可交易市值Top30合约："         f"{len(result)}个"     )      if result:          names = []          for x in result:              names.append(                 f"{x['_baseCcy']}"                 f"(#{x['_marketCapRank']})"             )          log(             "📋 当前可交易Top30："             + ", ".join(names)         )      return result      top_symbols, rank_map = get_top30_market_caps()      if not top_symbols:         log("⛔ 当前无法取得有效市值Top30")         return []      instruments = get_all_active_usdt_swaps()      result = []      for item in instruments:          inst_id = str(             item.get("instId", "")         ).upper()          # 只处理 USDT 永续         if not inst_id.endswith("-USDT-SWAP"):             continue          # ----------------------------------------------------         # OKX SWAP 不依赖 baseCcy         # 直接从 BTC-USDT-SWAP 中提取 BTC         # ----------------------------------------------------         parts = inst_id.split("-")          if len(parts) < 3:             continue          base = parts[0]          if base not in top_symbols:             continue          item["_baseCcy"] = base          item["_marketCapRank"] = rank_map.get(             base,             9999,         )          result.append(item)      # 按全球市值排名排序     result.sort(         key=lambda x: x.get(             "_marketCapRank",             9999,         )     )      log(         f"🔎 OKX可交易市值Top30合约："         f"{len(result)}个"     )      if result:          names = []          for x in result:              names.append(                 f"{x['_baseCcy']}"                 f"(#{x['_marketCapRank']})"             )          log(             "📋 当前可交易Top30："             + ", ".join(names)         )      return result
 
     top_symbols, rank_map = get_top30_market_caps()
 
