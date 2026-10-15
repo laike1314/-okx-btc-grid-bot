@@ -61,10 +61,10 @@ RSI_SHORT_MAX = Decimal("48")
 MIN_SIGNAL_SCORE = 4
 
 # ========== 紧急收紧仓位限制 ==========
-MAX_MARGIN_PCT = Decimal("0.01")        # 单笔最大保证金 = 权益的 1%
-RISK_PER_TRADE_PCT = Decimal("0.001")   # 单笔最大风险 = 权益的 0.1%
-MIN_LEVERAGE = Decimal("5")
-MAX_LEVERAGE = Decimal("10")            # 同时降低最大杠杆
+MAX_MARGIN_PCT = Decimal("1%")        # 单笔最大保证金 = 权益的 1%
+RISK_PER_TRADE_PCT = Decimal("0.1%")   # 单笔最大风险 = 权益的 0.1%
+MIN_LEVERAGE = Decimal("5×")
+MAX_LEVERAGE = Decimal("10×")            # 同时降低最大杠杆
 
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_COOLDOWN_SECONDS = 1800
