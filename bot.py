@@ -5,6 +5,12 @@
 OKX 永续自动交易模拟盘 V2.9.2
 ============================================================
 
+V3.1.0 更新：
+- 混合策略：有趋势做方向回调，无趋势做震荡高抛低吸
+- 小止盈快速平仓（赚一点就走）
+- 每个币种自动使用其最大允许杠杆
+- 仓位仍按权益百分比严格控制
+
 V3.0.0 更新：
 - 全新权威方向判定逻辑（大周期定方向 + 小周期回调入场）
 - 1H EMA21/55 决定只做多或只做空
@@ -63,7 +69,7 @@ import requests
 # 版本
 # ============================================================
 
-VERSION = "V3.0.0"
+VERSION = "V3.1.0"
 
 
 # ============================================================
@@ -100,7 +106,6 @@ TARGET_INST_ID = ""
 SIGNAL_BAR = "5m"
 TREND_BAR_15M = "15m"
 TREND_BAR_1H = "1H"
-TREND_BAR_4H = "4H"
 
 LOOP_SECONDS = 20
 
@@ -165,7 +170,7 @@ RISK_PER_TRADE_PCT = Decimal("0.001")  # 单笔风险 0.1% 权益
 
 MIN_LEVERAGE = Decimal("5")
 
-MAX_LEVERAGE = Decimal("20")
+MAX_LEVERAGE = Decimal("125")  # 上限放宽，实际由币种最大杠杆决定
 
 
 # ============================================================
@@ -181,19 +186,19 @@ LOSS_COOLDOWN_SECONDS = 1800
 # TP / SL
 # ============================================================
 
-TARGET_SL_ROI_PCT = Decimal("1.5")
+TARGET_SL_ROI_PCT = Decimal("0.8")   # 小止损
 
-TARGET_TP_ROI_PCT = Decimal("3.5")
+TARGET_TP_ROI_PCT = Decimal("1.2")   # 小止盈，赚一点就走
 
-RISK_REWARD = Decimal("1.8")
+RISK_REWARD = Decimal("1.5")
 
 ATR_SL_FRACTION = Decimal("0.60")
 
-MIN_SL_PRICE_PCT = Decimal("0.0025")
+MIN_SL_PRICE_PCT = Decimal("0.0020")
 
-MAX_SL_PRICE_PCT = Decimal("0.025")
+MAX_SL_PRICE_PCT = Decimal("0.012")
 
-MAX_TP_PRICE_PCT = Decimal("0.045")
+MAX_TP_PRICE_PCT = Decimal("0.015")  # 最大止盈约1.5%
 
 MIN_TRIGGER_GAP_PCT = Decimal("0.0010")
 
@@ -1278,9 +1283,10 @@ def calculate_atr(
 # ============================================================
 
 
+
 def get_higher_trend(inst_id, bar="1H"):
     """
-    大周期趋势判断（使用 EMA21 + EMA55）
+    大周期趋势判断（EMA21 + EMA55）
     返回: "LONG" / "SHORT" / "RANGE"
     """
     candles = get_candles(inst_id, bar, 120)
@@ -1298,41 +1304,43 @@ def get_higher_trend(inst_id, bar="1H"):
     if price <= 0:
         return "RANGE"
 
-    # 计算两条均线的距离百分比
     distance_pct = abs(ema21 - ema55) / price
 
     # 距离过近视为震荡
-    if distance_pct < Decimal("0.004"):  # 0.4%
+    if distance_pct < Decimal("0.004"):
         return "RANGE"
 
     if ema21 > ema55:
         return "LONG"
     elif ema21 < ema55:
         return "SHORT"
-    else:
-        return "RANGE"
+    return "RANGE"
 
 
 def get_trend(inst_id, bar):
-    """兼容旧调用，内部转接到新逻辑"""
+    """兼容旧调用"""
     return get_higher_trend(inst_id, bar)
+
+
+def get_recent_range(inst_id, bar="5m", lookback=40):
+    """获取近期高低点，用于震荡模式"""
+    candles = get_candles(inst_id, bar, lookback + 5)
+    if len(candles) < lookback:
+        return None, None
+
+    highs = [x["high"] for x in candles[-lookback:]]
+    lows = [x["low"] for x in candles[-lookback:]]
+    return max(highs), min(lows)
 
 
 def calculate_signal(inst_id):
     """
-    权威版信号逻辑 V3：
-    1. 1小时定方向（最高优先级）
-    2. 震荡市直接放弃
-    3. 5分钟等待回调入场（不追涨杀跌）
+    混合策略 V3.1：
+    - 有明确趋势 → 顺势回调入场 + 小止盈
+    - 震荡 → 区间高抛低吸 + 小止盈
     """
-
-    # ---------- 1. 大周期方向 ----------
     higher_trend = get_higher_trend(inst_id, "1H")
 
-    if higher_trend == "RANGE":
-        return None  # 震荡，不做
-
-    # ---------- 2. 获取5分钟数据 ----------
     candles = get_candles(inst_id, SIGNAL_BAR, 140)
     if len(candles) < 60:
         return None
@@ -1348,62 +1356,69 @@ def calculate_signal(inst_id):
 
     if any(x is None for x in (ema9, ema21, rsi, macd_line, macd_signal, atr)):
         return None
-
     if price <= 0:
         return None
 
     atr_pct = atr / price
-    if atr_pct < Decimal("0.0015"):
-        return None  # 波动太小
+    if atr_pct < Decimal("0.0012"):
+        return None
 
-    # ---------- 3. 15分钟辅助确认 ----------
     trend_15m = get_higher_trend(inst_id, "15m")
 
-    # ---------- 4. 做多条件（回调入场） ----------
-    long_ok = False
-    if higher_trend == "LONG":
-        # 价格回踩到 EMA21 附近（允许稍微跌破）
-        near_ema21 = price <= ema21 * Decimal("1.003") and price >= ema21 * Decimal("0.992")
+    side = None
+    score = 0
+    mode = "NONE"
 
-        # RSI 从低位回升
-        rsi_ok = Decimal("38") <= rsi <= Decimal("58")
+    # ========== 趋势模式 ==========
+    if higher_trend in ("LONG", "SHORT"):
+        mode = "TREND"
 
-        # MACD 支持
-        macd_ok = macd_line > macd_signal or macd_line > 0
+        if higher_trend == "LONG":
+            near_ema21 = price <= ema21 * Decimal("1.004") and price >= ema21 * Decimal("0.990")
+            rsi_ok = Decimal("35") <= rsi <= Decimal("60")
+            macd_ok = macd_line > macd_signal or macd_line > 0
+            price_ok = price > ema9
+            trend15_ok = trend_15m in ("LONG", "RANGE")
 
-        # 价格重新站上 EMA9
-        price_above_ema9 = price > ema9
+            if near_ema21 and rsi_ok and macd_ok and price_ok and trend15_ok:
+                side = "LONG"
+                score = 6
 
-        # 15分钟尽量同向
-        trend15_ok = trend_15m in ("LONG", "RANGE")
+        elif higher_trend == "SHORT":
+            near_ema21 = price >= ema21 * Decimal("0.996") and price <= ema21 * Decimal("1.010")
+            rsi_ok = Decimal("40") <= rsi <= Decimal("65")
+            macd_ok = macd_line < macd_signal or macd_line < 0
+            price_ok = price < ema9
+            trend15_ok = trend_15m in ("SHORT", "RANGE")
 
-        if near_ema21 and rsi_ok and macd_ok and price_above_ema9 and trend15_ok:
-            long_ok = True
+            if near_ema21 and rsi_ok and macd_ok and price_ok and trend15_ok:
+                side = "SHORT"
+                score = 6
 
-    # ---------- 5. 做空条件（回调入场） ----------
-    short_ok = False
-    if higher_trend == "SHORT":
-        near_ema21 = price >= ema21 * Decimal("0.997") and price <= ema21 * Decimal("1.008")
-
-        rsi_ok = Decimal("42") <= rsi <= Decimal("62")
-
-        macd_ok = macd_line < macd_signal or macd_line < 0
-
-        price_below_ema9 = price < ema9
-
-        trend15_ok = trend_15m in ("SHORT", "RANGE")
-
-        if near_ema21 and rsi_ok and macd_ok and price_below_ema9 and trend15_ok:
-            short_ok = True
-
-    # ---------- 6. 最终决策 ----------
-    if long_ok and not short_ok:
-        side = "LONG"
-        score = 6
-    elif short_ok and not long_ok:
-        side = "SHORT"
-        score = 6
+    # ========== 震荡模式（高抛低吸） ==========
     else:
+        mode = "RANGE"
+        high, low = get_recent_range(inst_id, SIGNAL_BAR, 40)
+        if high is None or low is None or high <= low:
+            return None
+
+        range_size = high - low
+        if range_size / price < Decimal("0.006"):  # 区间太窄不交易
+            return None
+
+        # 接近下沿做多
+        dist_to_low = (price - low) / range_size
+        # 接近上沿做空
+        dist_to_high = (high - price) / range_size
+
+        if dist_to_low <= Decimal("0.25") and rsi < Decimal("45"):
+            side = "LONG"
+            score = 5
+        elif dist_to_high <= Decimal("0.25") and rsi > Decimal("55"):
+            side = "SHORT"
+            score = 5
+
+    if side is None:
         return None
 
     return {
@@ -1415,7 +1430,8 @@ def calculate_signal(inst_id):
         "atr_pct": atr_pct,
         "rsi": rsi,
         "trend15m": trend_15m,
-        "trend1h": higher_trend
+        "trend1h": higher_trend,
+        "mode": mode
     }
 
 
@@ -1806,24 +1822,10 @@ def print_live_position(
 def leverage_from_score(
     score
 ):
-
-    if score <= 4:
-
-        return Decimal("5")
-
-    if score == 5:
-
-        return Decimal("8")
-
-    if score == 6:
-
-        return Decimal("10")
-
-    if score == 7:
-
-        return Decimal("15")
-
-    return Decimal("20")
+    """始终优先使用较高杠杆，最终由币种最大杠杆限制"""
+    # 用户要求使用最大杠杆，这里返回一个很高的目标值
+    # 实际会被 get_actual_leverage 截断到该币种允许的最大值
+    return MAX_LEVERAGE
 
 
 def get_max_allowed_leverage(
