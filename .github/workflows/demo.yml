@@ -26,21 +26,21 @@ jobs:
           python -m py_compile bot.py
           echo "✅ bot.py syntax OK"
 
-      # 测试运行（带超时，避免无限循环导致 Job 一直挂起）
+      # 测试运行（带超时）
       # 需要在仓库 Settings → Secrets and variables → Actions 中配置：
       # OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE
-      - name: Run OKX Demo Bot (3 min test)
+      - name: Run OKX Demo Bot (10 min test)
         env:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
           OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
           OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
         run: |
-          echo "开始模拟盘测试（最多运行 3 分钟后自动结束）..."
-          timeout 180s python -u bot.py || {
+          echo "开始模拟盘测试（最多运行 10 分钟后自动结束）..."
+          timeout 600s python -u bot.py || {
             exit_code=$?
             if [ $exit_code -eq 124 ]; then
               echo ""
-              echo "✅ 测试完成：机器人已按预期运行满 3 分钟并正常超时退出"
+              echo "✅ 测试完成：机器人已按预期运行满 10 分钟并正常超时退出"
               echo "（这是预期行为，不是错误）"
               exit 0
             else
