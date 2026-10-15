@@ -2,9 +2,6 @@ name: OKX Demo Bot Test
 
 on:
   workflow_dispatch:
-  # 也可以在 push 时做语法检查（不实际跑交易）
-  # push:
-  #   branches: [main]
 
 jobs:
   test:
@@ -29,11 +26,14 @@ jobs:
           python -m py_compile bot.py
           echo "✅ bot.py syntax OK"
 
-      # 如需实际跑模拟盘，请确保 Secrets 已配置，并取消下面注释
-      # - name: Run OKX Demo Test
-      #   env:
-      #     OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
-      #     OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
-      #     OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
-      #   run: |
-      #     timeout 60s python -u bot.py || true
+      # 运行模拟盘（需要先在仓库 Settings → Secrets and variables → Actions 中配置以下三个 Secrets）
+      # OKX_API_KEY
+      # OKX_SECRET_KEY
+      # OKX_PASSPHRASE
+      - name: Run OKX Demo Bot
+        env:
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+        run: |
+          python -u bot.py
