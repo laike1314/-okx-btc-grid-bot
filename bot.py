@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-临时紧急修复版
+临时紧急修复版（已修复语法错误）
 
 问题：仓位仍然过大（用了约20%保证金）
 修复：
-1. MAX_MARGIN_PCT 强制改为 0.01（1%）
-2. 计算完数量后增加硬性检查，超过限制直接拒绝下单
+1. MAX_MARGIN_PCT = 0.01（1%）
+2. RISK_PER_TRADE_PCT = 0.001（0.1%）
+3. MAX_LEVERAGE = 10
 
-完整策略逻辑请继续使用之前的完整文件。
-此版本只做仓位安全限制加强。
+注意：完整策略逻辑已丢失，当前只能做基础测试。
+请尽快恢复完整 bot.py。
 """
 
 import os
@@ -61,10 +62,10 @@ RSI_SHORT_MAX = Decimal("48")
 MIN_SIGNAL_SCORE = 4
 
 # ========== 紧急收紧仓位限制 ==========
-MAX_MARGIN_PCT = Decimal("1%")        # 单笔最大保证金 = 权益的 1%
-RISK_PER_TRADE_PCT = Decimal("0.1%")   # 单笔最大风险 = 权益的 0.1%
-MIN_LEVERAGE = Decimal("5×")
-MAX_LEVERAGE = Decimal("10×")            # 同时降低最大杠杆
+MAX_MARGIN_PCT = Decimal("0.01")        # 单笔最大保证金 = 权益的 1%
+RISK_PER_TRADE_PCT = Decimal("0.001")   # 单笔最大风险 = 权益的 0.1%
+MIN_LEVERAGE = Decimal("5")
+MAX_LEVERAGE = Decimal("10")            # 最大杠杆 10x
 
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_COOLDOWN_SECONDS = 1800
@@ -205,6 +206,6 @@ def okx_request(method, path, params=None, body=None, private=False, timeout=15,
                 break
     raise RuntimeError(f"OKX 请求失败（已重试{max_retries}次） {method} {request_path}: {last_error}")
 
-print(f"[{now_str()}] OKX Bot {VERSION} 紧急仓位限制已加强")
-print("MAX_MARGIN_PCT = 1% | RISK_PER_TRADE_PCT = 0.1% | MAX_LEVERAGE = 10x")
-print("请先手动平掉当前过大的仓位，再重新运行测试")
+print(f"[{now_str()}] OKX Bot {VERSION} 语法错误已修复")
+print("MAX_MARGIN_PCT = 0.01 (1%) | RISK_PER_TRADE_PCT = 0.001 (0.1%) | MAX_LEVERAGE = 10")
+print("注意：当前是精简版，完整策略逻辑需要恢复完整 bot.py")
