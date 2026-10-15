@@ -5,6 +5,10 @@
 OKX 永续自动交易模拟盘 V2.9.2
 ============================================================
 
+V3.1.1 更新：
+- 进一步收紧止盈止损，真正做到赚一点就平仓
+- 止盈约0.6%，止损约0.45%
+
 V3.1.0 更新：
 - 混合策略：有趋势做方向回调，无趋势做震荡高抛低吸
 - 小止盈快速平仓（赚一点就走）
@@ -69,7 +73,7 @@ import requests
 # 版本
 # ============================================================
 
-VERSION = "V3.1.0"
+VERSION = "V3.1.1"
 
 
 # ============================================================
@@ -186,19 +190,19 @@ LOSS_COOLDOWN_SECONDS = 1800
 # TP / SL
 # ============================================================
 
-TARGET_SL_ROI_PCT = Decimal("0.8")   # 小止损
+TARGET_SL_ROI_PCT = Decimal("0.45")  # 更小止损，适配量化
 
-TARGET_TP_ROI_PCT = Decimal("1.2")   # 小止盈，赚一点就走
+TARGET_TP_ROI_PCT = Decimal("0.60")  # 更小止盈，赚一点就走
 
 RISK_REWARD = Decimal("1.5")
 
 ATR_SL_FRACTION = Decimal("0.60")
 
-MIN_SL_PRICE_PCT = Decimal("0.0020")
+MIN_SL_PRICE_PCT = Decimal("0.0015")
 
-MAX_SL_PRICE_PCT = Decimal("0.012")
+MAX_SL_PRICE_PCT = Decimal("0.006")
 
-MAX_TP_PRICE_PCT = Decimal("0.015")  # 最大止盈约1.5%
+MAX_TP_PRICE_PCT = Decimal("0.008")  # 最大止盈约0.8%
 
 MIN_TRIGGER_GAP_PCT = Decimal("0.0010")
 
