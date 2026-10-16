@@ -2,8 +2,20 @@
 
 """
 ============================================================
-OKX 永续自动交易模拟盘 V3.4.0
+OKX 永续自动交易模拟盘 V3.5.0
 ============================================================
+
+V3.5.0 更新（针对 V3.4.0 6小时 -594U / 2胜8负 / PF 0.12）：
+- NET-TP 门槛按名义价值：max(MIN_NET_PROFIT_USDT, 名义*MIN_NET_PROFIT_PCT)，
+  需连续 NET_TP_CONFIRM_CHECKS 次满足，且 last/mark 偏差 <= PRICE_CONSISTENCY_BPS
+- NET-TP 平仓：先检查盘口点差，用 IOC 限价单吃对手价（最多3次），剩余再市价 close-position
+- 平仓后读取真实 realizedPnl，日志 [NET-TP-REAL] 估算 vs 实际；连续大幅负偏差自动提高门槛，
+  再恶化则自动关闭 NET-TP
+- 只交易白名单 BTC/ETH/SOL；趋势模式需 1H ADX>=25 且 15m 与 1H 同向；震荡模式不再满足分数门槛
+- MIN_SIGNAL_SCORE 6->7；单品种止损后冷却 4 小时；日亏损达权益 2% 当日停止开仓
+- 单笔风险 0.1%->0.05% 权益；SL 改为 ATR*1.5；浮盈达 BREAKEVEN_TRIGGER_ROI_PCT 后止损移到保本(含手续费)
+- 51023(仓位不存在)不再重试刷屏：下算法单前检查持仓，出现时静默跳过
+
 
 V3.4.0 更新（核心：扣费后净盈利即平仓）：
 - 新增净利润监控线程：有持仓时每 NET_PNL_POLL_SEC(2s) 检查一次
@@ -90,7 +102,7 @@ import requests
 # 版本
 # ============================================================
 
-VERSION = "V3.4.0"
+VERSION = "V3.5.0"
 
 
 # ============================================================
@@ -178,7 +190,7 @@ RSI_SHORT_MAX = Decimal("48")
 # 信号
 # ============================================================
 
-MIN_SIGNAL_SCORE = 6  # V3.3.0: 4 -> 6
+MIN_SIGNAL_SCORE = 7  # V3.5.0: 6 -> 7（趋势6分 + ADX确认1分）
 
 
 # ============================================================
@@ -187,7 +199,7 @@ MIN_SIGNAL_SCORE = 6  # V3.3.0: 4 -> 6
 
 MAX_MARGIN_PCT = Decimal("0.015")  # 单笔最大保证金占比 1.5%
 
-RISK_PER_TRADE_PCT = Decimal("0.001")  # 单笔风险 0.1% 权益
+RISK_PER_TRADE_PCT = Decimal("0.0005")  # V3.5.0: 0.1% -> 0.05% 权益
 
 MIN_LEVERAGE = Decimal("5")
 
@@ -222,15 +234,33 @@ DEFAULT_MAKER_FEE = Decimal("0.0002")
 FEE_REFRESH_SEC = 3600
 ENABLE_EXCHANGE_SL = True
 
+# V3.5.0
+MIN_NET_PROFIT_PCT = Decimal("0.002")      # 名义价值的 0.2%
+NET_TP_CONFIRM_CHECKS = 3                  # 连续满足次数
+PRICE_CONSISTENCY_BPS = Decimal("5")       # last 与 mark 最大偏差
+MAX_CLOSE_SPREAD_BPS = Decimal("5")        # 盘口点差上限，超出则本轮不平
+NET_TP_IOC_TRIES = 3
+NET_TP_DIVERGENCE_USDT = Decimal("2")      # 实际比估算差超过此值视为大幅负偏差
+NET_TP_RAISE_AFTER = 2                     # 连续N次负偏差 -> 门槛 x1.5
+NET_TP_DISABLE_AFTER = 4                   # 连续N次负偏差 -> 关闭 NET-TP
+ENABLE_NET_TP = True
+SYMBOL_WHITELIST = {"BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"}
+ADX_PERIOD = 14
+MIN_ADX = Decimal("25")
+SYMBOL_STOP_COOLDOWN_SEC = 4 * 3600
+DAILY_LOSS_CAP_PCT = Decimal("0.02")
+BREAKEVEN_TRIGGER_ROI_PCT = Decimal("1.0")  # 浮盈 ROI 达 1% 移保本
+BREAKEVEN_BUFFER_PCT = Decimal("0.0012")    # 保本价额外覆盖双边手续费+滑点
+
 RISK_REWARD = Decimal("1.5")
 
-ATR_SL_FRACTION = Decimal("0.60")
+ATR_SL_FRACTION = Decimal("1.5")  # V3.5.0: 0.6 -> 1.5
 
 MIN_SL_PRICE_PCT = Decimal("0.0015")
 
-MAX_SL_PRICE_PCT = Decimal("0.006")
+MAX_SL_PRICE_PCT = Decimal("0.015")  # V3.5.0: 0.6% -> 1.5%
 
-MAX_TP_PRICE_PCT = Decimal("0.008")  # 最大止盈约0.8%
+MAX_TP_PRICE_PCT = Decimal("0.03")  # V3.5.0: 0.8% -> 3%（保证 R:R）
 
 MIN_TRIGGER_GAP_PCT = Decimal("0.0010")
 
@@ -298,34 +328,16 @@ def D(value, default="0"):
 
 
 def fmt_decimal(value, digits=12):
-
     value = D(value)
-
-    s = format(
-        value,
-        "f"
-    )
-
+    s = format(value, "f")
     if "." in s:
-
-        a, b = s.split(
-            ".",
-            1
-        )
-
+        a, b = s.split(".", 1)
         b = b[:digits]
-
         s = a + "." + b
-
-    s = s.rstrip("0").rstrip(".")
-
-    if s in (
-        "",
-        "-0"
-    ):
-
+        # V3.5.0 修复：只去小数部分末尾0（原逻辑会把 "100" 变成 "1"、"67000" 变成 "67"）
+        s = s.rstrip("0").rstrip(".")
+    if s in ("", "-0", "-"):
         return "0"
-
     return s
 
 
@@ -480,6 +492,10 @@ def make_signature(
 # OKX 请求（带简单重试）
 # ============================================================
 
+class PositionGoneError(RuntimeError):
+    """OKX 51023: 仓位已不存在"""
+
+
 def okx_request(
     method,
     path,
@@ -554,12 +570,16 @@ def okx_request(
             if str(data.get("code")) != "0":
                 # 业务错误通常不重试（除非是限流）
                 err_code = str(data.get("code", ""))
+                if err_code in ("51023",) or "51023" in json.dumps(data):
+                    raise PositionGoneError(f"51023 仓位不存在: {path}")
                 if err_code in ("50011", "50013", "50026"):  # 常见限流/临时错误
                     raise RuntimeError(f"OKX 临时错误: {data}")
                 raise RuntimeError(f"OKX API错误: {data}")
 
             return data.get("data", [])
 
+        except PositionGoneError:
+            raise
         except Exception as e:
             last_error = e
             if attempt < max_retries:
@@ -1316,6 +1336,38 @@ def calculate_atr(
 
 
 
+def calculate_adx(candles, period=14):
+    """Wilder ADX，返回 Decimal 或 None"""
+    if len(candles) < period * 2 + 1:
+        return None
+    trs, pdms, ndms = [], [], []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        ph, pl = candles[i - 1]["high"], candles[i - 1]["low"]
+        up, dn = h - ph, pl - l
+        pdms.append(up if up > dn and up > 0 else Decimal("0"))
+        ndms.append(dn if dn > up and dn > 0 else Decimal("0"))
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    p = Decimal(period)
+    atr = sum(trs[:period]); pdm = sum(pdms[:period]); ndm = sum(ndms[:period])
+    dxs = []
+    for i in range(period, len(trs)):
+        atr = atr - atr / p + trs[i]
+        pdm = pdm - pdm / p + pdms[i]
+        ndm = ndm - ndm / p + ndms[i]
+        if atr <= 0:
+            continue
+        pdi, ndi = 100 * pdm / atr, 100 * ndm / atr
+        if pdi + ndi > 0:
+            dxs.append(100 * abs(pdi - ndi) / (pdi + ndi))
+    if len(dxs) < period:
+        return None
+    adx = sum(dxs[:period]) / p
+    for dx in dxs[period:]:
+        adx = (adx * (p - 1) + dx) / p
+    return adx
+
+
 def get_higher_trend(inst_id, bar="1H"):
     """
     大周期趋势判断（EMA21 + EMA55）
@@ -1450,10 +1502,21 @@ def calculate_signal(inst_id):
             side = "SHORT"
             score = 5
 
+    # V3.5.0: 趋势确认（15m 必须与 1H 同向，1H ADX >= MIN_ADX）
+    adx = None
+    if side is not None and mode == "TREND":
+        if trend_15m != higher_trend:
+            return None
+        adx = calculate_adx(get_candles(inst_id, "1H", 120), ADX_PERIOD)
+        if adx is None or adx < MIN_ADX:
+            return None
+        score += 1
+
     if side is None:
         return None
 
     return {
+        "adx": adx,
         "instId": inst_id,
         "side": side,
         "score": score,
@@ -2631,6 +2694,10 @@ def place_oco(
             "mark"
     }
 
+    if not get_position(inst_id):
+        log(f"ℹ️ {inst_id} 仓位已不存在，跳过OCO")
+        return {}
+
     log(
         f"📌 提交OCO | "
         f"{inst_id} | "
@@ -2638,12 +2705,16 @@ def place_oco(
         f"SL={fmt_decimal(plan['sl'])}"
     )
 
-    rows = okx_request(
-        "POST",
-        "/api/v5/trade/order-algo",
-        body=body,
-        private=True
-    )
+    try:
+        rows = okx_request(
+            "POST",
+            "/api/v5/trade/order-algo",
+            body=body,
+            private=True
+        )
+    except PositionGoneError:
+        log(f"ℹ️ {inst_id} 51023 仓位已不存在，跳过OCO")
+        return {}
 
     if not rows:
 
@@ -2908,6 +2979,8 @@ def ensure_protection(
                 adopted=adopted
             )
 
+            plan = apply_breakeven(current_pos, plan)
+
             log(
                 f"🎯 保护计划 | "
                 f"TP={fmt_decimal(plan['tp'])} | "
@@ -2916,10 +2989,11 @@ def ensure_protection(
                 f"SL距离={fmt_decimal(plan['sl_pct'] * 100, 4)}%"
             )
 
-            place_oco(
+            if not place_oco(
                 current_pos,
                 plan
-            )
+            ):
+                return True
 
             time.sleep(
                 OCO_VERIFY_WAIT
@@ -3175,6 +3249,8 @@ def print_closed_position_result(
         )
 
         return {
+            "instId":
+                inst_id,
             "realizedPnl":
                 realized,
 
@@ -3229,6 +3305,12 @@ def update_trade_result(
             "realizedPnl"
         )
     )
+
+    record_daily_pnl(realized)
+    inst = result.get("instId")
+    if realized < 0 and inst:
+        symbol_loss_time[inst] = time.time()
+        log(f"🧊 {inst} 亏损平仓，该品种冷却 {SYMBOL_STOP_COOLDOWN_SEC // 3600} 小时")
 
     if realized < 0:
 
@@ -3426,6 +3508,9 @@ def manage_existing_positions():
 # ============================================================
 
 def can_open_new_trade():
+
+    if daily_loss_cap_hit():
+        return False
 
     positions = get_positions()
 
@@ -3727,6 +3812,12 @@ def scan_candidates():
             "instId"
         )
 
+        if inst_id not in SYMBOL_WHITELIST:
+            continue
+
+        if symbol_in_cooldown(inst_id):
+            continue
+
         ticker = tickers.get(
             inst_id
         )
@@ -3837,6 +3928,11 @@ def print_candidates(
 
 fee_rates = {"taker": DEFAULT_TAKER_FEE, "maker": DEFAULT_MAKER_FEE, "ts": 0.0}
 entry_fee_cache = {}
+net_tp_confirm = {}
+net_tp_state = {"pct": MIN_NET_PROFIT_PCT, "bad": 0}
+breakeven_done = set()
+symbol_loss_time = {}
+daily_state = {"day": None, "pnl": Decimal("0"), "start_equity": None}
 
 
 def refresh_fee_rates(force=False):
@@ -3897,54 +3993,244 @@ def get_funding_since(inst_id, open_ts_ms):
     return paid
 
 
-def check_net_profit_close(pos):
+def symbol_in_cooldown(inst_id):
+    t = symbol_loss_time.get(inst_id)
+    return bool(t) and time.time() - t < SYMBOL_STOP_COOLDOWN_SEC
+
+
+def _today():
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+
+
+def record_daily_pnl(realized):
+    day = _today()
+    if daily_state["day"] != day:
+        daily_state.update(day=day, pnl=Decimal("0"), start_equity=None)
+    daily_state["pnl"] += D(realized)
+
+
+def daily_loss_cap_hit():
+    day = _today()
+    if daily_state["day"] != day:
+        daily_state.update(day=day, pnl=Decimal("0"), start_equity=None)
+    if daily_state["start_equity"] is None:
+        try:
+            daily_state["start_equity"] = get_equity()
+        except Exception:
+            return False
+    cap = daily_state["start_equity"] * DAILY_LOSS_CAP_PCT
+    if cap > 0 and daily_state["pnl"] <= -cap:
+        log(f"⛔ [DAILY-CAP] 今日已亏 {fmt_decimal(daily_state['pnl'], 2)}U，达到上限 {fmt_decimal(cap, 2)}U，今日停止开仓")
+        return True
+    return False
+
+
+def apply_breakeven(pos, plan):
+    """浮盈达到触发值后，把止损移到开仓价 ± 缓冲（覆盖双边手续费），只向有利方向移动"""
+    inst_id = pos.get("instId")
+    avg = D(pos.get("avgPx"))
+    if avg <= 0:
+        return plan
+    roi = D(pos.get("uplRatio")) * 100
+    if inst_id not in breakeven_done and roi < BREAKEVEN_TRIGGER_ROI_PCT:
+        return plan
+    side = position_side(pos)
+    if side == "LONG":
+        be = avg * (Decimal("1") + BREAKEVEN_BUFFER_PCT)
+        if be > plan["sl"]:
+            plan["sl"] = be
+    elif side == "SHORT":
+        be = avg * (Decimal("1") - BREAKEVEN_BUFFER_PCT)
+        if be < plan["sl"]:
+            plan["sl"] = be
+    breakeven_done.add(inst_id)
+    return plan
+
+
+def maybe_move_breakeven(pos):
+    inst_id = pos.get("instId")
+    if inst_id in breakeven_done:
+        return
+    roi = D(pos.get("uplRatio")) * 100
+    if roi >= BREAKEVEN_TRIGGER_ROI_PCT:
+        log(f"[BE] {inst_id} ROI={fmt_decimal(roi, 3)}% >= {BREAKEVEN_TRIGGER_ROI_PCT}%，止损移至保本")
+        breakeven_done.add(inst_id)
+        try:
+            cancel_existing_algos(inst_id)
+            ensure_protection(pos, adopted=True, new_position=False)
+        except PositionGoneError:
+            pass
+        except Exception as e:
+            log(f"⚠️ [BE] {inst_id} 移动保本失败: {e}")
+
+
+def estimate_net(pos):
     inst_id = pos.get("instId")
     upl = D(pos.get("upl"))
-    if upl <= 0:
-        return False
     notional = abs(D(pos.get("notionalUsd")))
     if notional <= 0:
         notional = abs(D(pos.get("pos"))) * D(pos.get("markPx")) * D(pos.get("ctVal") or "0")
     open_ts = int(pos.get("cTime") or 0)
     fee_in = get_entry_fee(inst_id, open_ts) if open_ts else Decimal("0")
     if fee_in <= 0:
-        fee_in = notional * fee_rates["taker"]  # 读不到时按 taker 估算
+        fee_in = notional * fee_rates["taker"]
     fee_out = notional * fee_rates["taker"]
     funding = get_funding_since(inst_id, open_ts) if open_ts else Decimal("0")
     slip = notional * SLIPPAGE_BPS / Decimal("10000")
     net = upl - fee_in - fee_out - funding - slip
-    if net > MIN_NET_PROFIT_USDT:
-        log(
-            f"[NET-TP] inst={inst_id} upl={fmt_decimal(upl, 4)} fee_in={fmt_decimal(fee_in, 4)} "
-            f"fee_out_est={fmt_decimal(fee_out, 4)} funding={fmt_decimal(funding, 4)} "
-            f"slip={fmt_decimal(slip, 4)} net={fmt_decimal(net, 4)} -> CLOSE"
-        )
+    return {"upl": upl, "notional": notional, "fee_in": fee_in, "fee_out": fee_out,
+            "funding": funding, "slip": slip, "net": net}
+
+
+def net_tp_threshold(notional):
+    return max(MIN_NET_PROFIT_USDT, notional * net_tp_state["pct"])
+
+
+def get_best_book(inst_id):
+    rows = okx_request("GET", "/api/v5/market/books", params={"instId": inst_id, "sz": "1"})
+    if not rows or not rows[0].get("bids") or not rows[0].get("asks"):
+        raise RuntimeError("盘口为空")
+    return D(rows[0]["bids"][0][0]), D(rows[0]["asks"][0][0])
+
+
+def safe_close(pos):
+    """IOC 限价吃对手价，最多 NET_TP_IOC_TRIES 次；剩余用 close-position 市价兜底。返回是否已发出平仓"""
+    inst_id = pos.get("instId")
+    side = position_side(pos)
+    bid, ask = get_best_book(inst_id)
+    mid = (bid + ask) / 2
+    spread_bps = (ask - bid) / mid * 10000 if mid > 0 else Decimal("9999")
+    if spread_bps > MAX_CLOSE_SPREAD_BPS:
+        log(f"[NET-TP] {inst_id} 点差 {fmt_decimal(spread_bps, 2)}bps > {MAX_CLOSE_SPREAD_BPS}，本轮不平")
+        return False
+    try:
+        cancel_existing_algos(inst_id)
+    except Exception as e:
+        log(f"⚠️ [NET-TP] 撤销算法单失败: {e}")
+    for i in range(NET_TP_IOC_TRIES):
+        cur = get_position(inst_id)
+        if not cur:
+            return True
+        qty = abs(D(cur.get("pos")))
+        bid, ask = get_best_book(inst_id)
+        px = bid if side == "LONG" else ask
         try:
-            cancel_existing_algos(inst_id)
+            rows = okx_request("POST", "/api/v5/trade/order", body={
+                "instId": inst_id, "tdMode": TD_MODE,
+                "side": "sell" if side == "LONG" else "buy",
+                "posSide": "net", "ordType": "ioc", "px": fmt_decimal(px),
+                "sz": fmt_decimal(qty), "reduceOnly": True
+            }, private=True)
+            log(f"[NET-TP] {inst_id} IOC#{i + 1} px={fmt_decimal(px)} sz={fmt_decimal(qty)} ordId={rows[0].get('ordId') if rows else None}")
+        except PositionGoneError:
+            return True
         except Exception as e:
-            log(f"⚠️ [NET-TP] 撤销算法单失败: {e}")
-        okx_request(
-            "POST", "/api/v5/trade/close-position",
-            body={"instId": inst_id, "mgnMode": TD_MODE, "autoCxl": True},
-            private=True
-        )
-        log(f"[NET-TP] {inst_id} 平仓请求已发送")
+            log(f"⚠️ [NET-TP] IOC 失败: {e}")
+        time.sleep(0.5)
+    if get_position(inst_id):
+        log(f"[NET-TP] {inst_id} IOC 未完全成交，市价 close-position 兜底")
+        try:
+            okx_request("POST", "/api/v5/trade/close-position",
+                        body={"instId": inst_id, "mgnMode": TD_MODE, "autoCxl": True}, private=True)
+        except PositionGoneError:
+            pass
+    return True
+
+
+def report_real_result(inst_id, est_net):
+    real = None
+    for _ in range(6):
+        time.sleep(1)
+        try:
+            row = get_latest_closed_result(inst_id)
+            if row and int(row.get("uTime") or 0) >= int(time.time() * 1000) - 60000:
+                real = D(row.get("realizedPnl"))
+                break
+        except Exception:
+            pass
+    if real is None:
+        log(f"[NET-TP-REAL] {inst_id} 未取到实际结果 est={fmt_decimal(est_net, 4)}")
+        return None
+    diff = real - est_net
+    log(f"[NET-TP-REAL] {inst_id} est={fmt_decimal(est_net, 4)} real={fmt_decimal(real, 4)} diff={fmt_decimal(diff, 4)}")
+    on_net_tp_divergence(diff)
+    return real
+
+
+def on_net_tp_divergence(diff):
+    global ENABLE_NET_TP
+    if diff < -NET_TP_DIVERGENCE_USDT:
+        net_tp_state["bad"] += 1
+    else:
+        net_tp_state["bad"] = 0
+        return
+    if net_tp_state["bad"] >= NET_TP_DISABLE_AFTER:
+        ENABLE_NET_TP = False
+        log(f"[NET-TP] 连续 {net_tp_state['bad']} 次大幅负偏差，自动关闭 NET-TP（保留OCO止盈止损）")
+    elif net_tp_state["bad"] >= NET_TP_RAISE_AFTER:
+        net_tp_state["pct"] = net_tp_state["pct"] * Decimal("1.5")
+        log(f"[NET-TP] 连续 {net_tp_state['bad']} 次负偏差，门槛提高到名义 {fmt_decimal(net_tp_state['pct'] * 100, 3)}%")
+
+
+def check_net_profit_close(pos):
+    inst_id = pos.get("instId")
+    if not ENABLE_NET_TP:
+        return False
+    if D(pos.get("upl")) <= 0:
+        net_tp_confirm[inst_id] = 0
+        return False
+    e = estimate_net(pos)
+    thr = net_tp_threshold(e["notional"])
+    if e["net"] <= thr:
+        net_tp_confirm[inst_id] = 0
+        return False
+    # last / mark 一致性
+    try:
+        t = get_ticker(inst_id)
+        last, mark = D(t.get("last")), D(t.get("markPx"))
+        if mark > 0 and last > 0 and abs(last - mark) / mark * 10000 > PRICE_CONSISTENCY_BPS:
+            log(f"[NET-TP] {inst_id} last/mark 偏差过大 last={fmt_decimal(last)} mark={fmt_decimal(mark)}，跳过")
+            net_tp_confirm[inst_id] = 0
+            return False
+    except Exception as ex:
+        log(f"⚠️ [NET-TP] ticker 失败: {ex}")
+        return False
+    net_tp_confirm[inst_id] = net_tp_confirm.get(inst_id, 0) + 1
+    if net_tp_confirm[inst_id] < NET_TP_CONFIRM_CHECKS:
+        log(f"[NET-TP] {inst_id} net={fmt_decimal(e['net'], 4)} > {fmt_decimal(thr, 4)} 确认 {net_tp_confirm[inst_id]}/{NET_TP_CONFIRM_CHECKS}")
+        return False
+    log(
+        f"[NET-TP] inst={inst_id} upl={fmt_decimal(e['upl'], 4)} fee_in={fmt_decimal(e['fee_in'], 4)} "
+        f"fee_out_est={fmt_decimal(e['fee_out'], 4)} funding={fmt_decimal(e['funding'], 4)} "
+        f"slip={fmt_decimal(e['slip'], 4)} net={fmt_decimal(e['net'], 4)} thr={fmt_decimal(thr, 4)} -> CLOSE"
+    )
+    net_tp_confirm[inst_id] = 0
+    if safe_close(pos):
+        report_real_result(inst_id, e["net"])
         return True
     return False
 
 
 def net_pnl_monitor_loop():
-    log(f"[NET-TP] 净利润监控启动 | 间隔={NET_PNL_POLL_SEC}s | 最小净利={MIN_NET_PROFIT_USDT} USDT")
+    log(f"[NET-TP] 净利润监控启动 | 间隔={NET_PNL_POLL_SEC}s | 门槛=max({MIN_NET_PROFIT_USDT}U, 名义*{MIN_NET_PROFIT_PCT}) | 确认{NET_TP_CONFIRM_CHECKS}次")
     while True:
         try:
             refresh_fee_rates()
-            for pos in get_positions():
+            positions = get_positions()
+            live = {p.get("instId") for p in positions}
+            for k in list(breakeven_done):
+                if k not in live:
+                    breakeven_done.discard(k)
+            for pos in positions:
                 try:
-                    check_net_profit_close(pos)
-                except Exception as e:
-                    log(f"⚠️ [NET-TP] {pos.get('instId')} 检查失败: {e}")
-        except Exception as e:
-            log(f"⚠️ [NET-TP] 监控异常: {e}")
+                    if not check_net_profit_close(pos):
+                        maybe_move_breakeven(pos)
+                except PositionGoneError:
+                    pass
+                except Exception as ex:
+                    log(f"⚠️ [NET-TP] {pos.get('instId')} 检查失败: {ex}")
+        except Exception as ex:
+            log(f"⚠️ [NET-TP] 监控异常: {ex}")
         time.sleep(NET_PNL_POLL_SEC)
 
 
