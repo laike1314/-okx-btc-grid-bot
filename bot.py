@@ -2,8 +2,16 @@
 
 """
 ============================================================
-OKX 永续自动交易模拟盘 V3.5.0
+OKX 永续自动交易模拟盘 V3.6.0
 ============================================================
+
+V3.6.0 更新（针对 V3.5.0 6小时 -303U / 4胜5负 / 均盈+7.5 均亏-66.7）：
+- 保本触发：ROI 1% -> 价格走到 TP 距离的 50%（BE_TRIGGER_TP_FRACTION）；之后追踪锁定 40% 浮盈
+- 移止损改用 amend-algos 修改现有 OCO（不再撤单重下，修复 51088）；标记价已贴近/越过保本线时直接平仓
+- 51304/51088 等业务错误不再重试刷屏（仅限流类错误重试）
+- RISK_REWARD 1.5 -> 2.0（TP >= 2倍SL距离）；可选 1R 部分止盈（PARTIAL_TP_ENABLED，默认关）
+- 修复启动日志"同时最多三个持仓"，改为显示 MAX_POSITIONS 实际值
+
 
 V3.5.0 更新（针对 V3.4.0 6小时 -594U / 2胜8负 / PF 0.12）：
 - NET-TP 门槛按名义价值：max(MIN_NET_PROFIT_USDT, 名义*MIN_NET_PROFIT_PCT)，
@@ -102,7 +110,7 @@ import requests
 # 版本
 # ============================================================
 
-VERSION = "V3.5.0"
+VERSION = "V3.6.0"
 
 
 # ============================================================
@@ -249,10 +257,14 @@ ADX_PERIOD = 14
 MIN_ADX = Decimal("25")
 SYMBOL_STOP_COOLDOWN_SEC = 4 * 3600
 DAILY_LOSS_CAP_PCT = Decimal("0.02")
-BREAKEVEN_TRIGGER_ROI_PCT = Decimal("1.0")  # 浮盈 ROI 达 1% 移保本
+BE_TRIGGER_TP_FRACTION = Decimal("0.5")     # V3.6.0: 原 ROI 1% -> 达到 TP 距离的 50% 才移保本
+TRAIL_LOCK_FRACTION = Decimal("0.4")        # 之后止损锁定已走浮动的 40%
+TRAIL_MIN_STEP_PCT = Decimal("0.0005")      # 每次至少改善 0.05% 才修改止损
+PARTIAL_TP_ENABLED = False                  # 1R 部分止盈（默认关闭）
+PARTIAL_TP_FRACTION = Decimal("0.5")
 BREAKEVEN_BUFFER_PCT = Decimal("0.0012")    # 保本价额外覆盖双边手续费+滑点
 
-RISK_REWARD = Decimal("1.5")
+RISK_REWARD = Decimal("2.0")  # V3.6.0: 1.5 -> 2.0
 
 ATR_SL_FRACTION = Decimal("1.5")  # V3.5.0: 0.6 -> 1.5
 
@@ -492,8 +504,17 @@ def make_signature(
 # OKX 请求（带简单重试）
 # ============================================================
 
-class PositionGoneError(RuntimeError):
+class OkxBusinessError(RuntimeError):
+    """OKX 业务错误（非限流），不重试"""
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+
+
+class PositionGoneError(OkxBusinessError):
     """OKX 51023: 仓位已不存在"""
+    def __init__(self, msg, code="51023"):
+        super().__init__(code, msg)
 
 
 def okx_request(
@@ -574,11 +595,19 @@ def okx_request(
                     raise PositionGoneError(f"51023 仓位不存在: {path}")
                 if err_code in ("50011", "50013", "50026"):  # 常见限流/临时错误
                     raise RuntimeError(f"OKX 临时错误: {data}")
-                raise RuntimeError(f"OKX API错误: {data}")
+                sub = ""
+                try:
+                    sub = str((data.get("data") or [{}])[0].get("sCode") or "")
+                except Exception:
+                    pass
+                code = sub if sub and sub != "0" else err_code
+                if code == "51088":
+                    log(f"ℹ️ 51088 已存在TP/SL，跳过重复下单: {path}")
+                raise OkxBusinessError(code, f"OKX API错误: {data}")
 
             return data.get("data", [])
 
-        except PositionGoneError:
+        except OkxBusinessError:
             raise
         except Exception as e:
             last_error = e
@@ -2715,6 +2744,11 @@ def place_oco(
     except PositionGoneError:
         log(f"ℹ️ {inst_id} 51023 仓位已不存在，跳过OCO")
         return {}
+    except OkxBusinessError as e:
+        if e.code == "51088":
+            log(f"ℹ️ {inst_id} 已有TP/SL(51088)，不重复下单")
+            return {}
+        raise
 
     if not rows:
 
@@ -3931,6 +3965,7 @@ entry_fee_cache = {}
 net_tp_confirm = {}
 net_tp_state = {"pct": MIN_NET_PROFIT_PCT, "bad": 0}
 breakeven_done = set()
+trail_state = {}
 symbol_loss_time = {}
 daily_state = {"day": None, "pnl": Decimal("0"), "start_equity": None}
 
@@ -4026,42 +4061,117 @@ def daily_loss_cap_hit():
 
 
 def apply_breakeven(pos, plan):
-    """浮盈达到触发值后，把止损移到开仓价 ± 缓冲（覆盖双边手续费），只向有利方向移动"""
-    inst_id = pos.get("instId")
-    avg = D(pos.get("avgPx"))
-    if avg <= 0:
-        return plan
-    roi = D(pos.get("uplRatio")) * 100
-    if inst_id not in breakeven_done and roi < BREAKEVEN_TRIGGER_ROI_PCT:
+    """V3.6.0: ensure_protection 重建OCO时，沿用已锁定的保本/追踪止损（只向有利方向）"""
+    st = trail_state.get(pos.get("instId"))
+    if not st or not st.get("locked_sl"):
         return plan
     side = position_side(pos)
-    if side == "LONG":
-        be = avg * (Decimal("1") + BREAKEVEN_BUFFER_PCT)
-        if be > plan["sl"]:
-            plan["sl"] = be
-    elif side == "SHORT":
-        be = avg * (Decimal("1") - BREAKEVEN_BUFFER_PCT)
-        if be < plan["sl"]:
-            plan["sl"] = be
-    breakeven_done.add(inst_id)
+    lsl = st["locked_sl"]
+    if (side == "LONG" and lsl > plan["sl"]) or (side == "SHORT" and lsl < plan["sl"]):
+        plan["sl"] = lsl
+    if st.get("tp"):
+        plan["tp"] = st["tp"]
     return plan
 
 
-def maybe_move_breakeven(pos):
+def get_live_oco(inst_id):
+    for row in get_pending_algos(inst_id, "oco") or []:
+        if row.get("state", "live") in ("", "live", "effective", "partially_effective") and D(row.get("slTriggerPx")) > 0:
+            return row
+    return None
+
+
+def close_now(pos, reason):
     inst_id = pos.get("instId")
-    if inst_id in breakeven_done:
+    log(f"[TRAIL] {inst_id} {reason} -> 立即平仓")
+    try:
+        if not safe_close(pos):
+            emergency_close(inst_id)
+    except PositionGoneError:
+        pass
+
+
+def amend_sl(inst_id, algo_id, new_sl):
+    """修改已有OCO的止损价（不重复下单，避免51088）。返回 True/False/'through'"""
+    try:
+        okx_request("POST", "/api/v5/trade/amend-algos", body={
+            "instId": inst_id, "algoId": algo_id,
+            "newSlTriggerPx": fmt_decimal(new_sl), "newSlOrdPx": "-1",
+            "newSlTriggerPxType": "mark"
+        }, private=True)
+        return True
+    except PositionGoneError:
+        return False
+    except OkxBusinessError as e:
+        if e.code in ("51304", "51280", "51281", "51282"):
+            log(f"ℹ️ [TRAIL] {inst_id} 止损价已越过标记价({e.code})")
+            return "through"
+        log(f"⚠️ [TRAIL] {inst_id} 修改止损失败({e.code})，不重试")
+        return False
+
+
+def maybe_move_breakeven(pos):
+    """V3.6.0: 价格达到 TP 距离的 BE_TRIGGER_TP_FRACTION 才移保本，之后追踪锁定 TRAIL_LOCK_FRACTION 的浮盈"""
+    inst_id = pos.get("instId")
+    side = position_side(pos)
+    s = Decimal("1") if side == "LONG" else Decimal("-1") if side == "SHORT" else None
+    entry = D(pos.get("avgPx"))
+    if s is None or entry <= 0:
         return
-    roi = D(pos.get("uplRatio")) * 100
-    if roi >= BREAKEVEN_TRIGGER_ROI_PCT:
-        log(f"[BE] {inst_id} ROI={fmt_decimal(roi, 3)}% >= {BREAKEVEN_TRIGGER_ROI_PCT}%，止损移至保本")
-        breakeven_done.add(inst_id)
-        try:
-            cancel_existing_algos(inst_id)
-            ensure_protection(pos, adopted=True, new_position=False)
-        except PositionGoneError:
-            pass
-        except Exception as e:
-            log(f"⚠️ [BE] {inst_id} 移动保本失败: {e}")
+    st = trail_state.setdefault(inst_id, {})
+    oco = get_live_oco(inst_id)
+    if oco:
+        st.setdefault("tp", D(oco.get("tpTriggerPx")) or None)
+        st.setdefault("orig_sl", D(oco.get("slTriggerPx")))
+        cur_sl = D(oco.get("slTriggerPx"))
+    else:
+        cur_sl = st.get("locked_sl") or st.get("orig_sl")
+    tp = st.get("tp")
+    if not tp or not cur_sl:
+        return
+    tp_dist = s * (tp - entry)
+    if tp_dist <= 0:
+        return
+    mark = D(get_ticker(inst_id)["markPx"])
+    move = s * (mark - entry)
+
+    # 可选：1R 部分止盈
+    risk = s * (entry - st.get("orig_sl", cur_sl))
+    if PARTIAL_TP_ENABLED and not st.get("partial_done") and risk > 0 and move >= risk:
+        st["partial_done"] = True
+        qty = round_down(abs(D(pos.get("pos"))) * PARTIAL_TP_FRACTION, D(get_instrument(inst_id).get("lotSz") or "1"))
+        if qty > 0:
+            bid, ask = get_best_book(inst_id)
+            try:
+                okx_request("POST", "/api/v5/trade/order", body={
+                    "instId": inst_id, "tdMode": TD_MODE, "side": "sell" if s > 0 else "buy",
+                    "posSide": "net", "ordType": "ioc", "px": fmt_decimal(bid if s > 0 else ask),
+                    "sz": fmt_decimal(qty), "reduceOnly": True}, private=True)
+                log(f"[PTP] {inst_id} 1R 部分止盈 sz={fmt_decimal(qty)}")
+            except Exception as e:
+                log(f"⚠️ [PTP] {inst_id} 部分止盈失败: {e}")
+
+    if move < BE_TRIGGER_TP_FRACTION * tp_dist:
+        return
+    lock = max(entry * BREAKEVEN_BUFFER_PCT, move * TRAIL_LOCK_FRACTION)
+    target = entry + s * lock
+    if s * (target - cur_sl) <= entry * TRAIL_MIN_STEP_PCT:
+        return  # 改善不足，不动
+    if s * (mark - target) <= entry * MIN_TRIGGER_GAP_PCT:
+        close_now(pos, f"标记价 {fmt_decimal(mark)} 已贴近/越过保本线 {fmt_decimal(target)}")
+        return
+    if not oco:
+        return
+    r = amend_sl(inst_id, oco.get("algoId"), target)
+    if r is True:
+        st["locked_sl"] = target
+        log(f"[BE] {inst_id} 进度={fmt_decimal(move / tp_dist * 100, 1)}%TP | SL {fmt_decimal(cur_sl)} -> {fmt_decimal(target)}")
+    elif r == "through":
+        cur = get_position(inst_id)
+        if cur:
+            m2 = D(get_ticker(inst_id)["markPx"])
+            if s * (m2 - target) <= 0:
+                close_now(cur, "修改止损时价格已越过保本线")
 
 
 def estimate_net(pos):
@@ -4218,9 +4328,9 @@ def net_pnl_monitor_loop():
             refresh_fee_rates()
             positions = get_positions()
             live = {p.get("instId") for p in positions}
-            for k in list(breakeven_done):
+            for k in list(trail_state):
                 if k not in live:
-                    breakeven_done.discard(k)
+                    trail_state.pop(k, None)
             for pos in positions:
                 try:
                     if not check_net_profit_close(pos):
@@ -4277,7 +4387,7 @@ def main():
     )
 
     log(
-        "📌 同时最多三个持仓"
+        f"📌 同时最多 {MAX_POSITIONS} 个持仓"
     )
 
     log(
