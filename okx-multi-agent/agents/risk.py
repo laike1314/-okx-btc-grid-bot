@@ -1,11 +1,17 @@
 """Risk 代理（对应推文的 Rug 检测）：任何一项不过就拒绝开仓，并写明原因。
 
-检查项：当日亏损上限、连亏冷却、单币冷却、最大持仓/同币已有仓位、
-        点差、资金费率极端、波动率区间、预期利润是否覆盖双边手续费。
+检查项：当日亏损上限、连亏冷却、单币冷却、持仓个数上限（MAX_POSITIONS<=0 则不限制）/
+        同币已有仓位、点差、资金费率极端、波动率区间、预期利润是否覆盖双边手续费。
 """
 import config
 
 AGENT = "risk"
+
+
+def position_cap_reached(n):
+    """同时持仓数是否已经顶到上限。MAX_POSITIONS<=0 表示不限制个数。"""
+    cap = config.MAX_POSITIONS
+    return cap > 0 and n >= cap
 
 
 class RiskGate:
@@ -27,8 +33,9 @@ class RiskGate:
         g = self.global_block(equity)
         if g:
             return False, g
-        if len(positions) >= config.MAX_POSITIONS:
+        if position_cap_reached(len(positions)):
             return False, f"持仓数 {len(positions)} 已达上限 {config.MAX_POSITIONS}"
+        # 同一合约只留一个方向：已有多或空都不再开，避免同向加仓和反向对锁。
         if any(p["instId"] == inst for p in positions):
             return False, "该币已有持仓"
         until = self.s.d["symbol_cooldown"].get(inst, 0)
@@ -76,3 +83,19 @@ class RiskGate:
         else:
             self.s.d["consecutive_losses"] = 0
         self.s.save()
+
+
+def offline_self_check():
+    """不联网。MAX_POSITIONS<=0 时不得因为别的仓已经存在而触顶。"""
+    old = config.MAX_POSITIONS
+    try:
+        config.MAX_POSITIONS = 0
+        assert position_cap_reached(0) is False
+        assert position_cap_reached(50) is False
+        config.MAX_POSITIONS = 1
+        assert position_cap_reached(0) is False
+        assert position_cap_reached(1) is True
+        config.MAX_POSITIONS = -1
+        assert position_cap_reached(3) is False
+    finally:
+        config.MAX_POSITIONS = old

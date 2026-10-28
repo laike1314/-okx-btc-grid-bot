@@ -59,6 +59,18 @@ class OkxClient:
         self.base = base_url.rstrip("/")
         self.s = requests.Session()
         self._inst_cache = {}
+        self._next_get_at = 0.0
+
+    def _pace_get(self):
+        """公开/私有 GET 之间留一点间隔，持仓多、交易池大时不把 OKX 限速打满。"""
+        gap = float(getattr(config, "PUBLIC_REQ_GAP_SEC", 0) or 0)
+        if gap <= 0:
+            return
+        now = time.monotonic()
+        wait = self._next_get_at - now
+        if wait > 0:
+            time.sleep(wait)
+        self._next_get_at = time.monotonic() + gap
 
     # ---------- 底层 ----------
     def _sign(self, ts, method, path, body):
@@ -72,6 +84,8 @@ class OkxClient:
         body_text = json.dumps(body, separators=(",", ":")) if method == "POST" else ""
         last = None
         for attempt in range(1, retries + 1):
+            if method == "GET":
+                self._pace_get()
             headers = {"Content-Type": "application/json", "x-simulated-trading": config.SIMULATED_TRADING}
             if private:
                 ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")

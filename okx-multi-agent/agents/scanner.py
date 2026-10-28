@@ -1,4 +1,4 @@
-"""Scanner 代理：扫描 BTC/ETH/SOL 永续，寻找「强趋势 + 量能/价格异动」机会并打分。
+"""Scanner 代理：扫描交易池里的 USDT 永续（加密 + 股票类），寻找「强趋势 + 量能/价格异动」并打分。
 
 打分（满分 8）:
   1H 大周期 EMA 方向         2 分（必须）
@@ -67,9 +67,14 @@ class Scanner:
         info.update(direction=direction, score=score, reasons=reasons)
         return info, "、".join(reasons)
 
-    def scan(self):
+    def scan(self, symbols=None, skip=None):
+        symbols = list(config.SYMBOLS if symbols is None else symbols)
+        skip = set(skip or ())
         out = []
-        for inst in config.SYMBOLS:
+        for inst in symbols:
+            if inst in skip:
+                self.j.log(AGENT, "skip_held", f"{inst} 已有持仓，不重复开仓", inst=inst)
+                continue
             try:
                 info, why = self.analyze(inst)
             except Exception as e:

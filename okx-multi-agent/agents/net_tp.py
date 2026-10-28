@@ -15,11 +15,16 @@ class NetTpMonitor:
     def __init__(self, client, journal, fees, executor, state):
         self.c, self.j, self.fees, self.ex, self.s = client, journal, fees, executor, state
         self.confirm = {}
-        self.cost_cache = {}   # inst -> (ts, fee_in, funding)
+        self.cost_cache = {}   # (inst, side, cTime) -> (ts, fee_in, funding)
         self.last_report = {}
+        self._last_summary = None
+        self._last_summary_at = 0.0
+
+    def _pkey(self, p):
+        return f"{p.get('instId')}:{p.get('side') or ''}"
 
     def _costs(self, p):
-        key = (p["instId"], p["cTime"])
+        key = (p["instId"], p.get("side"), p["cTime"])
         hit = self.cost_cache.get(key)
         if hit and time.time() - hit[0] < 30:
             return hit[1], hit[2]
@@ -53,34 +58,52 @@ class NetTpMonitor:
                 "funding": funding, "slip": slip, "net": net}
 
     def check(self, positions):
+        """每个监控周期走完交易所返回的全部持仓。某一仓失败只记日志，不跳过后面的仓。"""
+        positions = list(positions or [])
+        summary = ",".join(self._pkey(p) for p in positions)
+        now = time.time()
+        if positions and (summary != self._last_summary or now - self._last_summary_at >= 60):
+            self._last_summary = summary
+            self._last_summary_at = now
+            self.j.log(AGENT, "monitor_all",
+                       f"本轮监控全部 {len(positions)} 个持仓: {summary}")
         for p in positions:
-            inst = p["instId"]
-            e = self.estimate(p)
-            thr = max(config.NET_TP_MIN_USDT, e["notional"] * config.NET_TP_MIN_PCT)
-            if time.time() - self.last_report.get(inst, 0) > 60:
-                self.last_report[inst] = time.time()
-                self.j.log(AGENT, "net_pnl", f"{inst} 浮盈 {e['upl']:+.2f} 开仓费 {e['fee_in']:.2f} 平仓费 "
-                           f"{e['fee_out']:.2f} 资金费 {e['funding']:+.2f} 滑点 {e['slip']:.2f} → 净 {e['net']:+.2f}"
-                           f"（门槛 {thr:.2f}）", inst=inst, **e, threshold=thr)
-            self._maybe_breakeven(p, e)
-            if not config.ENABLE_NET_TP or e["net"] <= thr:
-                self.confirm[inst] = 0
-                continue
-            self.confirm[inst] = self.confirm.get(inst, 0) + 1
-            if self.confirm[inst] < config.NET_TP_CONFIRM_CHECKS:
-                continue
-            t = self.c.ticker(inst)
-            mid = (t["bid"] + t["ask"]) / 2
-            spread = (t["ask"] - t["bid"]) / mid * 1e4 if mid else 1e9
-            if spread > config.MAX_CLOSE_SPREAD_BPS:
-                self.j.log(AGENT, "wait_spread", f"{inst} 净利够了但点差 {spread:.2f}bps 太大，本轮不平", inst=inst)
-                continue
-            self.j.log(AGENT, "trigger", f"{inst} 净利 {e['net']:+.2f} > 门槛 {thr:.2f}，连续 "
-                       f"{self.confirm[inst]} 次确认 → 平仓落袋", inst=inst, est_net=e["net"])
-            meta = self.s.d["open_meta"].setdefault(inst, {})
-            meta["close_reason"], meta["est_net"] = "NET-TP 净利止盈", e["net"]
-            self.ex.close(p, "NET-TP 净利止盈")
-            self.confirm[inst] = 0
+            try:
+                self._check_one(p)
+            except Exception as e:
+                self.j.log(AGENT, "monitor_error",
+                           f"{p.get('instId')} 本轮监控失败，其余仓位继续，下轮重试该仓: "
+                           f"{type(e).__name__}: {e}", inst=p.get("instId"))
+
+    def _check_one(self, p):
+        inst = p["instId"]
+        key = self._pkey(p)
+        e = self.estimate(p)
+        thr = max(config.NET_TP_MIN_USDT, e["notional"] * config.NET_TP_MIN_PCT)
+        if time.time() - self.last_report.get(key, 0) > 60:
+            self.last_report[key] = time.time()
+            self.j.log(AGENT, "net_pnl", f"{inst} {p.get('side')} 浮盈 {e['upl']:+.2f} 开仓费 {e['fee_in']:.2f} "
+                       f"平仓费 {e['fee_out']:.2f} 资金费 {e['funding']:+.2f} 滑点 {e['slip']:.2f} → 净 {e['net']:+.2f}"
+                       f"（门槛 {thr:.2f}）", inst=inst, side=p.get("side"), **e, threshold=thr)
+        self._maybe_breakeven(p, e)
+        if not config.ENABLE_NET_TP or e["net"] <= thr:
+            self.confirm[key] = 0
+            return
+        self.confirm[key] = self.confirm.get(key, 0) + 1
+        if self.confirm[key] < config.NET_TP_CONFIRM_CHECKS:
+            return
+        t = self.c.ticker(inst)
+        mid = (t["bid"] + t["ask"]) / 2
+        spread = (t["ask"] - t["bid"]) / mid * 1e4 if mid else 1e9
+        if spread > config.MAX_CLOSE_SPREAD_BPS:
+            self.j.log(AGENT, "wait_spread", f"{inst} 净利够了但点差 {spread:.2f}bps 太大，本轮不平", inst=inst)
+            return
+        self.j.log(AGENT, "trigger", f"{inst} 净利 {e['net']:+.2f} > 门槛 {thr:.2f}，连续 "
+                   f"{self.confirm[key]} 次确认 → 平仓落袋", inst=inst, est_net=e["net"])
+        meta = self.s.d["open_meta"].setdefault(inst, {})
+        meta["close_reason"], meta["est_net"] = "NET-TP 净利止盈", e["net"]
+        self.ex.close(p, "NET-TP 净利止盈")
+        self.confirm[key] = 0
 
     def _maybe_breakeven(self, p, e):
         meta = self.s.d["open_meta"].get(p["instId"])
@@ -101,3 +124,69 @@ class NetTpMonitor:
             self.j.log(AGENT, "breakeven", f"{p['instId']} 已走 50% 止盈距离，止损移到保本+成本 {be}",
                        inst=p["instId"], sl=be)
             self.s.save()
+
+
+def offline_self_check():
+    """不联网。一个仓位报错时，后面的仓位仍要被检查到。"""
+    import os
+    import tempfile
+    from agents.journal import Journal
+    from agents.state import SharedState
+    from agents.fees import FeeBook
+
+    class _Fake:
+        is_mock = True
+
+        def instrument(self, inst):
+            if inst == "BAD-USDT-SWAP":
+                raise RuntimeError("down")
+            return {"ctVal": 0.01, "lotSz": "0.01", "minSz": 0.01, "tickSz": "0.1", "maxLever": 10}
+
+        def ticker(self, inst):
+            return {"last": 100.0, "bid": 99.99, "ask": 100.01}
+
+        def entry_fee(self, inst, since):
+            return 0.01
+
+        def funding_paid(self, inst, since):
+            return 0.0
+
+    class _NoClose:
+        def close(self, *a, **k):
+            raise AssertionError("净利不够不该平仓")
+
+        def amend_sl(self, *a, **k):
+            return False
+
+    d = tempfile.mkdtemp(prefix="ma-mon-")
+    j = Journal(d, echo=False)
+    try:
+        c = _Fake()
+        state = SharedState(d)
+        fees = FeeBook(c, j)
+        mon = NetTpMonitor(c, j, fees, _NoClose(), state)
+        positions = [
+            {"instId": "BAD-USDT-SWAP", "side": "long", "cTime": 1, "upl": 0.0,
+             "notional": 0, "qty": 1, "markPx": 100.0, "avgPx": 100.0},
+            {"instId": "ETH-USDT-SWAP", "side": "long", "cTime": 2, "upl": 0.0,
+             "notional": 100.0, "qty": 1, "markPx": 100.0, "avgPx": 100.0},
+            {"instId": "SOL-USDT-SWAP", "side": "short", "cTime": 3, "upl": 0.0,
+             "notional": 50.0, "qty": 1, "markPx": 100.0, "avgPx": 100.0},
+        ]
+        seen = []
+        real = mon._check_one
+
+        def wrap(p):
+            seen.append(p["instId"])
+            return real(p)
+
+        mon._check_one = wrap
+        mon.check(positions)
+        assert seen == ["BAD-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"], seen
+        assert "ETH-USDT-SWAP:long" in mon.last_report
+        assert "SOL-USDT-SWAP:short" in mon.last_report
+        text = open(os.path.join(d, "decisions.jsonl"), encoding="utf-8").read()
+        assert "monitor_error" in text and "BAD-USDT-SWAP" in text
+        assert "monitor_all" in text and "SOL-USDT-SWAP:short" in text
+    finally:
+        j.close()

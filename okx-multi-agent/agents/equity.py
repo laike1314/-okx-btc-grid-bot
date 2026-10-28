@@ -16,6 +16,7 @@ class EquityTracker:
         self.c, self.j, self.s, self.risk = client, journal, state, risk
         self.dir = data_dir
         self.known = set(self.s.d["open_meta"].keys())
+        self._last_live = None
         self.trades_csv = os.path.join(data_dir, "trades.csv")
         self.equity_csv = os.path.join(data_dir, "equity.csv")
         self.equity_json = os.path.join(data_dir, "equity.json")
@@ -29,18 +30,40 @@ class EquityTracker:
         self.s.save()
 
     def sync(self, positions):
-        live = {p["instId"] for p in positions}
+        positions = list(positions or [])
+        live_ids, seen = [], set()
+        for p in positions:
+            inst = p.get("instId")
+            if inst and inst not in seen:
+                seen.add(inst)
+                live_ids.append(inst)
+        live = set(live_ids)
+        if live != self._last_live:
+            self._last_live = set(live)
+            shown = ",".join(live_ids) if live_ids else "无"
+            self.j.log(AGENT, "positions", f"交易所当前持仓 {len(live)} 个: {shown}")
         for inst in list(self.known - live):
-            self._on_closed(inst)
-        for p in positions:                       # 程序重启后接管已有仓位
-            if p["instId"] not in self.known:
-                self.known.add(p["instId"])
-                self.s.d["open_meta"].setdefault(p["instId"], {
-                    "direction": p["side"], "qty": p["qty"], "entry": p["avgPx"],
-                    "opened_at": "接管", "open_ms": p["cTime"]})
-                self.j.log(AGENT, "adopt", f"发现已有仓位 {p['instId']} {p['side']} {p['qty']}张，纳入监控",
-                           inst=p["instId"])
-                self.s.save()
+            try:
+                self._on_closed(inst)
+            except Exception as e:
+                self.j.log(AGENT, "close_sync_error", f"{inst} 平仓记账失败，下轮重试: {e}", inst=inst)
+        for p in positions:                       # 程序重启后接管已有仓位；逐个做，一笔失败不挡后面的
+            try:
+                self._adopt_if_needed(p)
+            except Exception as e:
+                self.j.log(AGENT, "adopt_error", f"{p.get('instId')} 接管失败，下轮重试: {e}",
+                           inst=p.get("instId"))
+
+    def _adopt_if_needed(self, p):
+        if p["instId"] in self.known:
+            return
+        self.known.add(p["instId"])
+        self.s.d["open_meta"].setdefault(p["instId"], {
+            "direction": p["side"], "qty": p["qty"], "entry": p["avgPx"],
+            "opened_at": "接管", "open_ms": p["cTime"]})
+        self.j.log(AGENT, "adopt", f"发现已有仓位 {p['instId']} {p['side']} {p['qty']}张，纳入监控",
+                   inst=p["instId"])
+        self.s.save()
 
     def _on_closed(self, inst):
         meta = self.s.d["open_meta"].pop(inst, {})
