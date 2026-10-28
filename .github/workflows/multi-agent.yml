@@ -1,0 +1,96 @@
+name: OKX Multi-Agent Demo
+
+# 手动触发的多代理模拟盘。与 demo.yml（旧 bot.py）互不影响。
+# 私有仓库免费 Actions 分钟有限；平台大约 6 小时会强制取消 job。
+# 默认 --hours 5.8 --stop-after-flat：到时后等最后一笔平仓再退出，方便后面的 artifact 步骤跑完。
+# Secrets（仓库 Settings → Secrets and variables → Actions，与旧工作流共用）：
+#   OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE
+# 本项目代码里 SIMULATED_TRADING 固定为模拟盘，这里不会改成实盘。
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "运行小时数（once 为 true 时忽略）。默认 5.8，留出余量避开约 6 小时强制取消。"
+        required: false
+        default: "5.8"
+        type: string
+      once:
+        description: "只跑一轮扫描后退出（检查连通性/信号）。默认 false，按 hours 持续运行。"
+        required: false
+        default: false
+        type: boolean
+
+# 只取消本工作流上一次手动运行，不会动 demo.yml。
+concurrency:
+  group: okx-multi-agent-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r okx-multi-agent/requirements.txt
+
+      - name: Syntax check
+        run: |
+          python -m py_compile \
+            okx-multi-agent/main.py \
+            okx-multi-agent/config.py \
+            okx-multi-agent/okx_client.py \
+            okx-multi-agent/agents/*.py
+          echo "syntax OK"
+
+      # 离线冒烟：Mock 行情，不联网、不读密钥。产物在 data_smoke/，不进正式 data/。
+      - name: Offline smoke
+        working-directory: okx-multi-agent
+        run: python main.py --smoke --steps 30
+
+      - name: Run one scan round
+        if: ${{ inputs.once }}
+        working-directory: okx-multi-agent
+        env:
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+        run: |
+          echo "单轮扫描（--once）..."
+          python -u main.py --once
+
+      - name: Run timed demo
+        if: ${{ !inputs.once }}
+        working-directory: okx-multi-agent
+        env:
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+          RUN_HOURS: ${{ inputs.hours }}
+        run: |
+          echo "持续运行 ${RUN_HOURS} 小时，到时后等持仓平完再退出..."
+          python -u main.py --hours "$RUN_HOURS" --stop-after-flat
+
+      # job 失败、到时退出或被取消后都尽量留下日志和权益曲线。
+      - name: Upload data artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-multi-agent-data-${{ github.run_id }}
+          path: okx-multi-agent/data/
+          retention-days: 7
+          if-no-files-found: warn
