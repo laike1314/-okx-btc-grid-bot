@@ -1,7 +1,8 @@
 """Risk 代理（对应推文的 Rug 检测）：任何一项不过就拒绝开仓，并写明原因。
 
-检查项：当日亏损上限、连亏冷却、单币冷却、持仓个数上限（MAX_POSITIONS<=0 则不限制）/
-        同币已有仓位、点差、资金费率极端、波动率区间、预期利润是否覆盖双边手续费。
+检查项：当日亏损上限、连亏冷却、单币冷却（秒数 <=0 则关闭，含已落盘的到期时间）、
+        持仓个数上限（MAX_POSITIONS<=0 则不限制）/同币已有仓位、点差、资金费率极端、
+        波动率区间、预期利润是否覆盖双边手续费。
 """
 import config
 
@@ -23,7 +24,8 @@ class RiskGate:
         start = self.s.day_start_equity(equity)
         if self.s.daily_pnl() <= -abs(start) * config.DAILY_LOSS_CAP_PCT:
             return f"当日已亏 {self.s.daily_pnl():.2f} USDT，达到上限 {config.DAILY_LOSS_CAP_PCT:.1%}"
-        if self.s.now() < self.s.d["global_cooldown_until"]:
+        # 0 = 关闭。旧 state.json 里未过期的 global_cooldown_until 也不再挡开仓。
+        if config.LOSS_COOLDOWN_SEC > 0 and self.s.now() < self.s.d["global_cooldown_until"]:
             left = int(self.s.d["global_cooldown_until"] - self.s.now())
             return f"连亏冷却中，还剩 {left}s"
         return None
@@ -38,9 +40,10 @@ class RiskGate:
         # 同一合约只留一个方向：已有多或空都不再开，避免同向加仓和反向对锁。
         if any(p["instId"] == inst for p in positions):
             return False, "该币已有持仓"
-        until = self.s.d["symbol_cooldown"].get(inst, 0)
-        if self.s.now() < until:
-            return False, f"该币止损冷却中，还剩 {int(until - self.s.now())}s"
+        if config.SYMBOL_COOLDOWN_SEC > 0:
+            until = self.s.d["symbol_cooldown"].get(inst, 0)
+            if self.s.now() < until:
+                return False, f"该币止损冷却中，还剩 {int(until - self.s.now())}s"
         t = self.c.ticker(inst)
         mid = (t["bid"] + t["ask"]) / 2
         spread_bps = (t["ask"] - t["bid"]) / mid * 1e4 if mid else 1e9
@@ -72,22 +75,27 @@ class RiskGate:
         self.s.add_daily_pnl(net)
         if net < 0:
             self.s.d["consecutive_losses"] += 1
-            self.s.d["symbol_cooldown"][inst] = self.s.now() + config.SYMBOL_COOLDOWN_SEC
-            if self.s.d["consecutive_losses"] >= config.MAX_CONSECUTIVE_LOSSES:
+            armed_global = self.s.d["consecutive_losses"] >= config.MAX_CONSECUTIVE_LOSSES
+            if config.SYMBOL_COOLDOWN_SEC > 0:
+                self.s.d["symbol_cooldown"][inst] = self.s.now() + config.SYMBOL_COOLDOWN_SEC
+            if armed_global and config.LOSS_COOLDOWN_SEC > 0:
                 self.s.d["global_cooldown_until"] = self.s.now() + config.LOSS_COOLDOWN_SEC
                 self.j.log(AGENT, "cooldown", f"连亏 {self.s.d['consecutive_losses']} 次，全局冷却 "
                            f"{config.LOSS_COOLDOWN_SEC}s", inst=inst)
-                self.s.d["consecutive_losses"] = 0
-            else:
+            elif config.SYMBOL_COOLDOWN_SEC > 0:
                 self.j.log(AGENT, "symbol_cooldown", f"{inst} 亏损，单币冷却 {config.SYMBOL_COOLDOWN_SEC}s", inst=inst)
+            if armed_global:
+                self.s.d["consecutive_losses"] = 0
         else:
             self.s.d["consecutive_losses"] = 0
         self.s.save()
 
 
 def offline_self_check():
-    """不联网。MAX_POSITIONS<=0 时不得因为别的仓已经存在而触顶。"""
-    old = config.MAX_POSITIONS
+    """不联网。仓位上限，以及冷却秒数 <=0 时不因落盘的到期时间拒绝开仓。"""
+    old_cap = config.MAX_POSITIONS
+    old_loss = config.LOSS_COOLDOWN_SEC
+    old_sym = config.SYMBOL_COOLDOWN_SEC
     try:
         config.MAX_POSITIONS = 0
         assert position_cap_reached(0) is False
@@ -97,5 +105,56 @@ def offline_self_check():
         assert position_cap_reached(1) is True
         config.MAX_POSITIONS = -1
         assert position_cap_reached(3) is False
+
+        class _State:
+            d = {"global_cooldown_until": 10**12, "symbol_cooldown": {"BTC-USDT-SWAP": 10**12},
+                 "consecutive_losses": 0, "daily": {}, "day_start_equity": {}, "open_meta": {}}
+
+            def now(self):
+                return 1_000.0
+
+            def daily_pnl(self):
+                return 0.0
+
+            def day_start_equity(self, eq):
+                return 10_000.0
+
+            def add_daily_pnl(self, v):
+                pass
+
+            def save(self):
+                pass
+
+        class _Journal:
+            def log(self, *a, **k):
+                pass
+
+        class _Client:
+            def __init__(self):
+                self.hit = False
+
+            def ticker(self, inst):
+                self.hit = True
+                raise RuntimeError("past-cooldown")
+
+        config.LOSS_COOLDOWN_SEC = 0
+        config.SYMBOL_COOLDOWN_SEC = 0
+        client = _Client()
+        gate = RiskGate(client, _Journal(), _State(), None)
+        assert gate.global_block(10_000) is None
+        try:
+            gate.check({"instId": "BTC-USDT-SWAP", "direction": "long", "atr_pct": 0.01}, [], 10_000)
+        except RuntimeError as e:
+            assert str(e) == "past-cooldown"
+        assert client.hit, "冷却为 0 时不应在询价前拒绝"
+
+        config.LOSS_COOLDOWN_SEC = 1800
+        assert gate.global_block(10_000) is not None
+        config.LOSS_COOLDOWN_SEC = 0
+        config.SYMBOL_COOLDOWN_SEC = 3600
+        ok, why = gate.check({"instId": "BTC-USDT-SWAP", "direction": "long", "atr_pct": 0.01}, [], 10_000)
+        assert ok is False and "冷却" in why
     finally:
-        config.MAX_POSITIONS = old
+        config.MAX_POSITIONS = old_cap
+        config.LOSS_COOLDOWN_SEC = old_loss
+        config.SYMBOL_COOLDOWN_SEC = old_sym

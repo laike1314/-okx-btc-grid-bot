@@ -52,7 +52,7 @@ BASE_URL = _env("OKX_BASE_URL", "https://www.okx.com")
 # 模拟盘开关：固定为 "1"。本项目只允许模拟盘，main.py 启动时会再检查一次。
 SIMULATED_TRADING = "1"
 
-VERSION = "MA-1.1.0"
+VERSION = "MA-1.1.1"
 
 # ---------------- 交易池 ----------------
 # SYMBOLS 非空 = 调试强制列表，跳过市值排名和股票发现。不设则启动时自动组建。
@@ -66,8 +66,8 @@ SCAN_BATCH = max(1, _env("SCAN_BATCH", 8, int))   # 每批扫完穿插一次全�
 PUBLIC_REQ_GAP_SEC = max(0.0, _env("PUBLIC_REQ_GAP_SEC", 0.12, float))  # GET 最小间隔，给限速留余量
 
 # ---------------- Scanner 扫描代理 ----------------
-SIGNAL_BAR = _env("SIGNAL_BAR", "5m")          # 信号周期
-TREND_BAR = _env("TREND_BAR", "1H")            # 大周期方向过滤
+SIGNAL_BAR = _env("SIGNAL_BAR", "1m")          # 信号周期
+TREND_BAR = _env("TREND_BAR", "5m")            # 大周期方向过滤
 CANDLE_LIMIT = 120
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -85,8 +85,9 @@ MAX_ATR_PCT = _env("MAX_ATR_PCT", 0.012, float)              # ATR/价格 太大
 MIN_ATR_PCT = _env("MIN_ATR_PCT", 0.0008, float)             # 太小 = 赚不够双边手续费
 DAILY_LOSS_CAP_PCT = _env("DAILY_LOSS_CAP_PCT", 0.02, float) # 当日亏损达权益 2% 停止开仓
 MAX_CONSECUTIVE_LOSSES = _env("MAX_CONSECUTIVE_LOSSES", 2, int)
-LOSS_COOLDOWN_SEC = _env("LOSS_COOLDOWN_SEC", 1800, int)     # 连亏后全局冷却
-SYMBOL_COOLDOWN_SEC = _env("SYMBOL_COOLDOWN_SEC", 4 * 3600, int)  # 单币止损后冷却
+# <=0 表示关闭。关闭时连亏/止损都不挡再开仓，state.json 里残留的到期时间也不再生效。
+LOSS_COOLDOWN_SEC = _env("LOSS_COOLDOWN_SEC", 0, int)         # 连亏后全局冷却
+SYMBOL_COOLDOWN_SEC = _env("SYMBOL_COOLDOWN_SEC", 0, int)     # 单币止损后冷却
 MIN_EDGE_FEE_MULT = 3.0   # 预期止盈距离必须 >= 双边手续费+滑点 的 3 倍
 
 # ---------------- Position 仓位代理 ----------------
