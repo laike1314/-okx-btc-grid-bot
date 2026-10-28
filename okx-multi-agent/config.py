@@ -35,6 +35,15 @@ def _env(name, default, cast=str):
     return cast(raw)
 
 
+def _csv_env(name):
+    """逗号分隔列表。未设置或空字符串返回 None（表示「走自动交易池」）。"""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return None
+    items = [s.strip() for s in str(raw).split(",") if s.strip()]
+    return items or None
+
+
 # ---------------- 账户 / 安全 ----------------
 OKX_API_KEY = os.getenv("OKX_API_KEY", "")
 OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY", "")
@@ -43,10 +52,20 @@ BASE_URL = _env("OKX_BASE_URL", "https://www.okx.com")
 # 模拟盘开关：固定为 "1"。本项目只允许模拟盘，main.py 启动时会再检查一次。
 SIMULATED_TRADING = "1"
 
-VERSION = "MA-1.0.0"
+VERSION = "MA-1.1.0"
+
+# ---------------- 交易池 ----------------
+# SYMBOLS 非空 = 调试强制列表，跳过市值排名和股票发现。不设则启动时自动组建。
+SYMBOLS_OVERRIDE = _csv_env("SYMBOLS")
+SYMBOLS = list(SYMBOLS_OVERRIDE or [])          # 实际扫描列表，由 universe.apply 填充
+UNIVERSE_META = {"source": "unset", "crypto": [], "stocks": [], "symbols": []}
+CRYPTO_TOP_N = max(0, _env("CRYPTO_TOP_N", 30, int))
+ENABLE_US_STOCKS = _env("ENABLE_US_STOCKS", True, bool)
+UNIVERSE_REFRESH_SEC = max(0, _env("UNIVERSE_REFRESH_SEC", 3600, int))  # 0 = 只在启动时建一次
+SCAN_BATCH = max(1, _env("SCAN_BATCH", 8, int))   # 每批扫完穿插一次全持仓监控
+PUBLIC_REQ_GAP_SEC = max(0.0, _env("PUBLIC_REQ_GAP_SEC", 0.12, float))  # GET 最小间隔，给限速留余量
 
 # ---------------- Scanner 扫描代理 ----------------
-SYMBOLS = _env("SYMBOLS", ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"], list)
 SIGNAL_BAR = _env("SIGNAL_BAR", "5m")          # 信号周期
 TREND_BAR = _env("TREND_BAR", "1H")            # 大周期方向过滤
 CANDLE_LIMIT = 120
@@ -73,7 +92,8 @@ MIN_EDGE_FEE_MULT = 3.0   # 预期止盈距离必须 >= 双边手续费+滑点 �
 # ---------------- Position 仓位代理 ----------------
 RISK_PER_TRADE_PCT = _env("RISK_PER_TRADE_PCT", 0.0025, float)  # 每笔止损最多亏权益 0.25%
 MAX_MARGIN_PCT = _env("MAX_MARGIN_PCT", 0.05, float)            # 单笔保证金不超过权益 5%
-MAX_POSITIONS = _env("MAX_POSITIONS", 1, int)
+# <=0 表示不限制同时持仓个数。同一 instId 仍只留一个方向（见 risk.check）。
+MAX_POSITIONS = _env("MAX_POSITIONS", 0, int)
 LEVERAGE = _env("LEVERAGE", 5, int)
 MAX_LEVERAGE = 10
 TD_MODE = "cross"

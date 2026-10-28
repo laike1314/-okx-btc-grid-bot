@@ -7,7 +7,8 @@
   python main.py --hours 6       # 跑 6 小时；配 --stop-after-flat 则到时后等最后一笔平仓再退出
 
 调度顺序（每轮）:
-  Equity 同步持仓 → Net-TP 监控(每 2s) → [每 20s] Scanner → Risk → Position → Executor → Equity 登记
+  Equity 同步全部持仓 → Net-TP 逐仓监控 → [每 SCAN_INTERVAL] 分批 Scanner → Risk → Position → Executor
+  扫描批次之间会再监控一遍全部持仓，避免交易池很大时漏看。
   Logger(journal) 贯穿所有代理，每个决策带原因写入 data/decisions.jsonl 和 data/bot.log
 """
 import argparse
@@ -17,12 +18,13 @@ import sys
 import time
 
 import config
+import universe
 from okx_client import OkxClient, MockOkxClient
 from agents.journal import Journal
 from agents.state import SharedState
 from agents.fees import FeeBook
 from agents.scanner import Scanner
-from agents.risk import RiskGate
+from agents.risk import RiskGate, position_cap_reached
 from agents.position import PositionManager
 from agents.executor import Executor
 from agents.net_tp import NetTpMonitor
@@ -63,39 +65,128 @@ def build(mock, data_dir):
     return agents
 
 
-def scan_and_trade(a):
-    c, j = a["client"], a["journal"]
-    equity = c.equity()
-    positions = c.positions()
-    a["equity"].sync(positions)        # 先结算刚平掉的仓位，避免同币立刻重开时漏记
+def _offline_self_checks():
+    """冒烟启动前跑纯本地断言：交易池筛选、仓位上限、全持仓监控。不联网。"""
+    from agents.risk import offline_self_check as risk_check
+    from agents.net_tp import offline_self_check as mon_check
+    universe.offline_self_check()
+    risk_check()
+    mon_check()
+
+
+def monitor_positions(a):
+    """Equity + Net-TP 覆盖交易所返回的每一个未平仓 SWAP，不因某一仓失败而停。
+
+    Net-TP 若在本轮平掉了仓，先把平仓记账完成，再把平仓后的持仓交回开仓逻辑，
+    避免用平仓前的列表把刚平掉的合约当成「已有持仓」。
+    """
+    positions = a["client"].positions()
+    a["equity"].sync(positions)
+    before = {p["instId"] for p in positions}
+    a["net_tp"].check(positions)
+    after = a["client"].positions()
+    if {p["instId"] for p in after} != before:
+        a["equity"].sync(after)
+        return after
+    return positions
+
+
+def _can_open(a, positions):
+    j = a["journal"]
+    try:
+        equity = a["client"].equity()
+    except Exception as e:
+        j.log("risk", "equity_error", f"读取权益失败，本轮不开仓: {e}")
+        return False
     block = a["risk"].global_block(equity)
     if block:
         j.log("risk", "blocked", f"暂停开仓：{block}")
-        return
-    if len(positions) >= config.MAX_POSITIONS:
+        return False
+    if position_cap_reached(len(positions)):
         j.log("risk", "full", f"持仓 {len(positions)}/{config.MAX_POSITIONS}，本轮只监控不开仓")
+        return False
+    return True
+
+
+def _maybe_refresh_universe(a, data_dir):
+    if a["client"].is_mock or config.SYMBOLS_OVERRIDE:
         return
-    for cand in a["scanner"].scan():
-        ok, why = a["risk"].check(cand, positions, equity)
-        j.log("risk", "approve" if ok else "reject", f"{cand['instId']} {why}", inst=cand["instId"], ok=ok)
-        if not ok:
+    every = config.UNIVERSE_REFRESH_SEC
+    if every <= 0 or time.time() - a["universe_at"] < every:
+        return
+    try:
+        universe.apply(a["client"], a["journal"], data_dir)
+    except Exception as e:
+        a["journal"].log("universe", "refresh_error", f"刷新交易池失败，继续用上一份: {e}")
+    a["universe_at"] = time.time()
+
+
+def scan_and_trade(a):
+    c, j = a["client"], a["journal"]
+    positions = monitor_positions(a)   # 先结算刚平掉的仓，避免同币立刻重开时漏记
+    if not _can_open(a, positions):
+        return
+    symbols = list(config.SYMBOLS)
+    if not symbols:
+        j.log("scanner", "empty", "交易池为空，本轮不开仓")
+        return
+    batch = max(1, int(config.SCAN_BATCH))
+    for i in range(0, len(symbols), batch):
+        if i and not c.is_mock:
+            positions = monitor_positions(a)
+            if not _can_open(a, positions):
+                return
+        held = {p["instId"] for p in positions}
+        try:
+            candidates = a["scanner"].scan(symbols[i:i + batch], skip=held)
+        except Exception as e:
+            j.log("scanner", "scan_error", f"本批扫描失败（继续下一批）: {e}")
             continue
-        plan = a["position"].plan(cand, equity)
-        if not plan:
-            continue
-        fill = a["executor"].open(plan)
-        if fill:
-            a["equity"].register_open(plan, fill)
-            positions = c.positions()
-        if len(positions) >= config.MAX_POSITIONS:
-            break
+        for cand in candidates:
+            try:
+                equity = c.equity()
+                ok, why = a["risk"].check(cand, positions, equity)
+            except Exception as e:
+                j.log("risk", "error", f"{cand.get('instId')} 风控检查失败: {e}", inst=cand.get("instId"))
+                continue
+            j.log("risk", "approve" if ok else "reject", f"{cand['instId']} {why}", inst=cand["instId"], ok=ok)
+            if not ok:
+                continue
+            try:
+                plan = a["position"].plan(cand, equity)
+                fill = a["executor"].open(plan) if plan else None
+            except Exception as e:
+                j.log("executor", "error", f"{cand['instId']} 开仓流程失败: {e}", inst=cand["instId"])
+                continue
+            if fill:
+                a["equity"].register_open(plan, fill)
+                positions = c.positions()
+            if position_cap_reached(len(positions)):
+                j.log("risk", "full", f"持仓 {len(positions)}/{config.MAX_POSITIONS}，本轮停止继续开仓")
+                return
+
+
+def _start_line():
+    meta = config.UNIVERSE_META or {}
+    cap = "不限" if config.MAX_POSITIONS <= 0 else str(config.MAX_POSITIONS)
+    source = meta.get("source") or "unset"
+    if str(source).startswith("SYMBOLS"):
+        pool = f"交易池 {len(config.SYMBOLS)} 个（SYMBOLS 强制列表）"
+    else:
+        pool = (f"交易池 {len(config.SYMBOLS)} 个（加密 {len(meta.get('crypto') or [])}"
+                f" + 股票永续 {len(meta.get('stocks') or [])}，{source}）")
+    return (f"多代理系统 {config.VERSION} 启动，{pool}，"
+            f"杠杆 {config.LEVERAGE}x，同时持仓 {cap}，单笔风险 {config.RISK_PER_TRADE_PCT:.2%}")
 
 
 def run(args):
+    if args.smoke:
+        _offline_self_checks()
     a = build(args.smoke, args.data_dir)
     c, j = a["client"], a["journal"]
-    j.log("main", "start", f"多代理系统 {config.VERSION} 启动，币种 {','.join(config.SYMBOLS)}，"
-          f"杠杆 {config.LEVERAGE}x，最多 {config.MAX_POSITIONS} 仓，单笔风险 {config.RISK_PER_TRADE_PCT:.2%}")
+    universe.apply(c, j, args.data_dir)
+    a["universe_at"] = time.time()
+    j.log("main", "start", _start_line())
     if not c.is_mock:
         try:
             eq = c.equity()
@@ -108,7 +199,6 @@ def run(args):
     a["equity"].snapshot()
 
     if args.once:
-        a["equity"].sync(c.positions())
         scan_and_trade(a)
         j.log("main", "done", "--once 单轮完成")
         return
@@ -126,17 +216,18 @@ def run(args):
         try:
             c.step()                                   # Mock：推进一根 K 线；真实客户端无操作
             a["fees"].refresh()
-            positions = c.positions()
-            a["equity"].sync(positions)
-            a["net_tp"].check(positions)
             expired = deadline and time.time() >= deadline
             if expired:
+                monitor_positions(a)
                 if not args.stop_after_flat or not c.positions():
                     j.log("main", "stop", "到达运行时长" + ("，且已无持仓" if args.stop_after_flat else ""))
                     break
             elif args.smoke or time.time() - last_scan >= config.SCAN_INTERVAL_SEC:
                 last_scan = time.time()
+                _maybe_refresh_universe(a, args.data_dir)
                 scan_and_trade(a)
+            else:
+                monitor_positions(a)
         except Exception as e:
             j.log("main", "loop_error", f"本轮异常（继续运行）: {type(e).__name__}: {e}")
             time.sleep(0 if args.smoke else 5)

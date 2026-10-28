@@ -54,6 +54,7 @@ jobs:
             okx-multi-agent/main.py \
             okx-multi-agent/config.py \
             okx-multi-agent/okx_client.py \
+            okx-multi-agent/universe.py \
             okx-multi-agent/agents/*.py
           echo "syntax OK"
 
