@@ -54,6 +54,31 @@ def same_dir_crypto_count(positions, direction):
                if p.get("side") == direction and p.get("instId") not in stocks)
 
 
+def chase_blocked(direction, ref, bid, ask, limit):
+    """价格已经顺着方向跑过信号收盘，就不要追。"""
+    if not ref or limit <= 0:
+        return False
+    if direction == "long":
+        return float(ask) > float(ref) * (1 + limit)
+    return float(bid) < float(ref) * (1 - limit)
+
+
+def exit_bar_blocked(stored_ts, latest_ts):
+    """平仓之后，要等一根更新的趋势 K 线收盘。没有记录则不挡。"""
+    if not stored_ts:
+        return False
+    return int(latest_ts or 0) <= int(stored_ts)
+
+
+def note_exit_trend_bar(state, inst):
+    """记下平仓时上一根已收盘的趋势 K 线。下一笔要等更晚的收盘。"""
+    sec = bar_seconds(config.TREND_BAR) or 900
+    now_ms = int(state.now() * 1000)
+    span = sec * 1000
+    current_open = (now_ms // span) * span
+    state.d.setdefault("last_exit_trend_bar", {})[inst] = current_open - span
+
+
 class RiskGate:
     def __init__(self, client, journal, state, fees):
         self.c, self.j, self.s, self.fees = client, journal, state, fees
@@ -94,6 +119,22 @@ class RiskGate:
         spread_bps = (t["ask"] - t["bid"]) / mid * 1e4 if mid else 1e9
         if spread_bps > config.MAX_SPREAD_BPS:
             return False, f"点差 {spread_bps:.2f}bps > {config.MAX_SPREAD_BPS}"
+        vol = float(t.get("vol_usdt_24h") or 0)
+        if config.MIN_VOL_USDT_24H > 0 and vol < config.MIN_VOL_USDT_24H:
+            return False, f"24h成交额 {vol:.0f}U < {config.MIN_VOL_USDT_24H:.0f}U"
+        if chase_blocked(cand["direction"], cand.get("price"), t["bid"], t["ask"], config.CHASE_LIMIT_PCT):
+            return False, (f"不追价：盘口相对信号收盘 {cand.get('price')} "
+                           f"已超过 {config.CHASE_LIMIT_PCT:.2%}")
+        try:
+            mark = float(self.c.mark_price(inst))
+            idx = float(self.c.index_price(inst))
+        except Exception as e:
+            return False, f"标记/指数价不可用: {e}"
+        if mark <= 0 or idx <= 0:
+            return False, "标记或指数价为空"
+        gap_bps = abs(mark - idx) / idx * 1e4
+        if gap_bps > config.MAX_MARK_INDEX_BPS:
+            return False, f"标记价偏离指数 {gap_bps:.1f}bps > {config.MAX_MARK_INDEX_BPS:.0f}"
         fr = self.c.funding_rate(inst)
         if abs(fr) > config.MAX_ABS_FUNDING_RATE:
             return False, f"资金费率极端 {fr:.4%}"
@@ -112,6 +153,9 @@ class RiskGate:
         tp_pct = sl_pct * config.RISK_REWARD
         if tp_pct < round_trip * config.MIN_EDGE_FEE_MULT:
             return False, f"止盈距离 {tp_pct:.3%} < 双边成本 {round_trip:.3%} x{config.MIN_EDGE_FEE_MULT}"
+        if config.MAX_COST_TO_R > 0 and sl_pct > 0 and round_trip / sl_pct > config.MAX_COST_TO_R:
+            return False, (f"双边成本 {round_trip:.3%} 占止损 {sl_pct:.3%} 的 "
+                           f"{round_trip / sl_pct:.0%}，超过 {config.MAX_COST_TO_R:.0%}")
         cand.update(spread_bps=spread_bps, funding=fr, bid=t["bid"], ask=t["ask"])
         bar_name = reentry_bar_name()
         try:
@@ -123,6 +167,15 @@ class RiskGate:
         bar_ts = int(bars[-1]["ts"])
         if reentry_blocked(self.s, inst, cand["direction"], bar_ts):
             return False, f"同向再入场需等新的 {bar_name} K线收盘"
+        trend_name = config.TREND_BAR or "15m"
+        try:
+            trend_bars = self.c.candles(inst, trend_name, 3)
+        except Exception as e:
+            return False, f"趋势周期 {trend_name} K线失败: {e}"
+        trend_ts = int(trend_bars[-1]["ts"]) if trend_bars else 0
+        stored_exit = (self.s.d.get("last_exit_trend_bar") or {}).get(inst)
+        if exit_bar_blocked(stored_exit, trend_ts):
+            return False, f"平仓后需等新的 {trend_name} K线收盘"
         cand["reentry_bar_ts"] = bar_ts
         return True, f"通过：点差 {spread_bps:.2f}bps 资金费 {fr:.4%} ATR {ap:.3%}"
 
@@ -223,6 +276,13 @@ def offline_self_check():
         assert reentry_bar_name() == "5m"
         config.REENTRY_BAR = "15m"
         assert reentry_bar_name() == "15m"
+        assert chase_blocked("long", 100, 100, 100.2, 0.0015) is True
+        assert chase_blocked("long", 100, 100, 100.05, 0.0015) is False
+        assert chase_blocked("short", 100, 99.8, 100, 0.0015) is True
+        assert exit_bar_blocked(0, 100) is False
+        assert exit_bar_blocked(1000, 1000) is True
+        assert exit_bar_blocked(1000, 2000) is False
+        assert (0.0014 / 0.004) > 0.30
 
         import tempfile
         from agents.state import SharedState

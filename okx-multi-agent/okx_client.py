@@ -137,11 +137,21 @@ class OkxClient:
 
     def ticker(self, inst_id):
         r = self.request("GET", "/api/v5/market/ticker", {"instId": inst_id})[0]
-        return {"last": _f(r["last"]), "bid": _f(r["bidPx"]), "ask": _f(r["askPx"])}
+        last = _f(r["last"])
+        # 永续的 volCcy24h 是基础币数量，乘最新价得到 USDT 成交额。
+        vol_usdt = _f(r.get("volCcy24h")) * last
+        return {"last": last, "bid": _f(r["bidPx"]), "ask": _f(r["askPx"]), "vol_usdt_24h": vol_usdt}
 
     def mark_price(self, inst_id):
         r = self.request("GET", "/api/v5/public/mark-price", {"instType": "SWAP", "instId": inst_id})[0]
         return _f(r["markPx"])
+
+    def index_price(self, inst_id):
+        idx = inst_id[:-5] if str(inst_id).endswith("-SWAP") else inst_id
+        rows = self.request("GET", "/api/v5/market/index-tickers", {"instId": idx})
+        if not rows:
+            return 0.0
+        return _f(rows[0].get("idxPx"))
 
     def candles(self, inst_id, bar, limit=120):
         rows = self.request("GET", "/api/v5/market/candles", {"instId": inst_id, "bar": bar, "limit": str(limit)})
@@ -323,9 +333,13 @@ class MockOkxClient:
 
     def ticker(self, inst_id):
         last = self._last(inst_id)
-        return {"last": last, "bid": last * (1 - 0.00005), "ask": last * (1 + 0.00005)}
+        return {"last": last, "bid": last * (1 - 0.00005), "ask": last * (1 + 0.00005),
+                "vol_usdt_24h": 50_000_000.0}
 
     def mark_price(self, inst_id):
+        return self._last(inst_id)
+
+    def index_price(self, inst_id):
         return self._last(inst_id)
 
     def candles(self, inst_id, bar, limit=120):

@@ -100,6 +100,8 @@ class EquityTracker:
             self.j.log(AGENT, "skip_zero_close", f"{inst} 记录张数为 0，不写 trade_closed", inst=inst)
             self.s.save()
             return
+        from .risk import note_exit_trend_bar
+        note_exit_trend_bar(self.s, inst)
         res = None
         for _ in range(1 if self.c.is_mock else 6):
             try:

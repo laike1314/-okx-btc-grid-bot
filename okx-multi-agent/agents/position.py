@@ -74,7 +74,8 @@ class PositionManager:
         plan = {"instId": inst, "direction": cand["direction"], "qty": float(fmt_num(qty, spec["lotSz"])),
                 "lever": lever, "entry_ref": entry, "sl": sl, "tp": tp, "sl_pct": sl_pct, "tp_pct": tp_pct,
                 "notional": notional, "margin": notional / lever,
-                "risk_usdt": qty * per_ct_loss, "score": cand["score"]}
+                "risk_usdt": qty * per_ct_loss, "score": cand["score"],
+                "signal_px": cand.get("price")}
         self.j.log(AGENT, "plan", f"{inst} {cand['direction']} {plan['qty']}张 名义 {notional:.1f}U "
                    f"保证金 {plan['margin']:.1f}U {lever}x 止损 {sl}({sl_pct:.2%}) 止盈 {tp}({tp_pct:.2%}) "
                    f"最大亏损≈{plan['risk_usdt']:.2f}U", **plan)

@@ -21,6 +21,7 @@ class NetTpMonitor:
         self.last_report = {}
         self._last_summary = None
         self._last_summary_at = 0.0
+        self._audit_at = {}
 
     def _pkey(self, p):
         return f"{p.get('instId')}:{p.get('side') or ''}"
@@ -77,9 +78,27 @@ class NetTpMonitor:
                            f"{p.get('instId')} 本轮监控失败，其余仓位继续，下轮重试该仓: "
                            f"{type(e).__name__}: {e}", inst=p.get("instId"))
 
+    def _audit_protection(self, p):
+        if config.PROTECT_AUDIT_SEC <= 0:
+            return False
+        inst = p["instId"]
+        now = self.s.now()
+        if now - self._audit_at.get(inst, 0) < config.PROTECT_AUDIT_SEC:
+            return False
+        self._audit_at[inst] = now
+        meta = self.s.d.get("open_meta", {}).get(inst) or {}
+        result = self.ex.audit_bracket(p, meta)
+        if isinstance(result, tuple) and len(result) == 2:
+            meta = self.s.d["open_meta"].setdefault(inst, {})
+            meta["sl"], meta["tp"] = result
+            self.s.save()
+        return result == "closed"
+
     def _check_one(self, p):
         inst = p["instId"]
         key = self._pkey(p)
+        if self._audit_protection(p):
+            return
         if self._maybe_max_hold(p):
             self.confirm[key] = 0
             return
@@ -206,6 +225,9 @@ def offline_self_check():
 
         def amend_sl(self, *a, **k):
             return False
+
+        def audit_bracket(self, p, meta=None):
+            return True
 
     d = tempfile.mkdtemp(prefix="ma-mon-")
     j = Journal(d, echo=False)
