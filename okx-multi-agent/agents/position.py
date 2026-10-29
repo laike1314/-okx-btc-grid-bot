@@ -31,6 +31,19 @@ def stop_is_valid(side, sl, mark):
     return sl > mark
 
 
+def round_trip_cost_pct(maker, taker, spread_bps):
+    """开仓按 maker、平仓按 taker，再加一次点差和配置里的双边滑点。"""
+    return (float(maker) + float(taker) + float(spread_bps or 0) / 1e4
+            + 2 * config.SLIPPAGE_BPS / 1e4)
+
+
+def planned_sl_pct(atr_pct, round_trip):
+    """止损至少 max(ATR 倍数, 最小止损, 来回成本 × 倍数)。不超过 MAX_SL_PCT。"""
+    need = float(round_trip) * config.MIN_EDGE_FEE_MULT / max(float(config.RISK_REWARD), 1e-9)
+    sl = max(float(atr_pct) * config.ATR_SL_MULT, config.MIN_SL_PCT, need)
+    return min(sl, config.MAX_SL_PCT), need
+
+
 def bracket_from_fill(direction, fill_px, sl_pct, tp_pct, tick):
     if direction == "long":
         sl = round_px(fill_px * (1 - sl_pct), tick, "down")
@@ -49,10 +62,17 @@ class PositionManager:
         inst = cand["instId"]
         spec = self.c.instrument(inst)
         lever = int(min(config.LEVERAGE, config.MAX_LEVERAGE, spec["maxLever"]))
-        entry = cand["ask"] if cand["direction"] == "long" else cand["bid"]
-        sl_pct = min(max(cand["atr_pct"] * config.ATR_SL_MULT, config.MIN_SL_PCT), config.MAX_SL_PCT)
+        # maker 进场：多单挂买一，空单挂卖一，不吃对手价。
+        entry = cand["bid"] if cand["direction"] == "long" else cand["ask"]
+        rt = round_trip_cost_pct(self.fees.maker, self.fees.taker, cand.get("spread_bps") or 0)
+        sl_pct, need = planned_sl_pct(cand["atr_pct"], rt)
         tp_pct = sl_pct * config.RISK_REWARD
-        cost_pct = 2 * self.fees.taker + 2 * config.SLIPPAGE_BPS / 1e4
+        if tp_pct + 1e-12 < rt * config.MIN_EDGE_FEE_MULT:
+            self.j.log(AGENT, "cost_too_wide",
+                       f"{inst} 来回成本 {rt:.3%}×{config.MIN_EDGE_FEE_MULT:g} 需要止损 {need:.2%}，"
+                       f"超过上限 {config.MAX_SL_PCT:.2%}，放弃", inst=inst)
+            return None
+        cost_pct = rt
         per_ct_notional = entry * spec["ctVal"]
         per_ct_loss = per_ct_notional * (sl_pct + cost_pct)
         risk_usdt = equity * config.RISK_PER_TRADE_PCT

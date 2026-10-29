@@ -70,10 +70,12 @@ def _offline_self_checks():
     from agents.risk import offline_self_check as risk_check
     from agents.net_tp import offline_self_check as mon_check
     from agents.executor import offline_self_check as exec_check
+    from agents.equity import offline_self_check as eq_check
     universe.offline_self_check()
     risk_check()
     mon_check()
     exec_check()
+    eq_check()
 
 
 def monitor_positions(a):
@@ -161,6 +163,8 @@ def scan_and_trade(a):
                 j.log("executor", "error", f"{cand['instId']} 开仓流程失败: {e}", inst=cand["instId"])
                 continue
             if fill and a["equity"].register_open(plan, fill):
+                if fill.get("flattened"):
+                    a["equity"].sync(c.positions())
                 positions = c.positions()
             if position_cap_reached(len(positions)):
                 j.log("risk", "full", f"持仓 {len(positions)}/{config.MAX_POSITIONS}，本轮停止继续开仓")
