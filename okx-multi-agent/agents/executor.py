@@ -9,8 +9,21 @@
 import time
 import config
 from okx_client import OkxError, fmt_num
+from .position import bracket_from_fill, round_px, stop_is_valid
 
 AGENT = "executor"
+
+
+def parse_fill_sz(raw):
+    """成交张数。空值返回 None（未知）；字符串 \"0\" 是 0.0，不能当成已成交。"""
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw.strip() == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 class Executor:
@@ -56,28 +69,126 @@ class Executor:
                 return None
             r = {}
         ord_id = r.get("ordId")
-        fill_px, filled = px, plan["qty"]
-        time.sleep(0 if self.c.is_mock else config.ORDER_FILL_WAIT_SEC)
-        if ord_id:
-            try:
-                o = self.c.get_order(inst, ord_id)
-                fill_px = float(o.get("avgPx") or px)
-                filled = float(o.get("accFillSz") or filled)
-            except OkxError as e:
-                self.j.log(AGENT, "order_query", f"{inst} 查询订单失败: {e}", inst=inst)
+        fill_px, filled = self._await_fill(inst, ord_id)
+        if not filled or filled <= 0 or not fill_px or fill_px <= 0:
+            self.j.log(AGENT, "no_fill", f"{inst} 没有真实成交（accFillSz={filled}），不记账、不当成持仓",
+                       inst=inst, ordId=ord_id, qty=filled or 0)
+            return None
+        ref = float(plan.get("entry_ref") or fill_px)
+        slip = abs(fill_px - ref) / ref if ref else 0.0
+        if slip > config.MAX_FILL_SLIP_PCT:
+            self.j.log(AGENT, "slip_cancel", f"{inst} 成交价 {fill_px} 偏离计划 {ref} 达 {slip:.3%}，"
+                       f"超过 {config.MAX_FILL_SLIP_PCT:.3%}，市价撤掉且不记账", inst=inst, slip=slip)
+            self.close({"instId": inst, "side": d, "posSide": self._pos_side(d)}, "成交滑点过大")
+            return None
+        sl, tp = bracket_from_fill(d, fill_px, plan["sl_pct"], plan["tp_pct"], spec["tickSz"])
+        mark = self._mark(inst, fill_px)
+        if not stop_is_valid(d, sl, mark):
+            self.j.log(AGENT, "stop_invalid", f"{inst} 按成交价算出的止损 {sl} 在标记价 {mark} 错误一侧，平掉",
+                       inst=inst, sl=sl, mark=mark)
+            self.close({"instId": inst, "side": d, "posSide": self._pos_side(d)}, "止损无法放在正确一侧")
+            return None
+        plan["sl"], plan["tp"] = sl, tp
+        self._replace_bracket(inst, d, sl, tp)
+        self.ensure_stop(inst, d, sl, tp)
         self.j.log(AGENT, "opened", f"{inst} 开{('多' if d == 'long' else '空')} {filled}张 @ {fill_px} "
-                   f"SL {plan['sl']} TP {plan['tp']}", inst=inst, ordId=ord_id, fill_px=fill_px, qty=filled,
-                   sl=plan["sl"], tp=plan["tp"])
-        self.ensure_stop(inst, d, plan["sl"])
+                   f"SL {sl} TP {tp}", inst=inst, ordId=ord_id, fill_px=fill_px, qty=filled,
+                   sl=sl, tp=tp)
         return {"ordId": ord_id, "fill_px": fill_px, "qty": filled}
 
-    def ensure_stop(self, inst, d, sl):
+    def _mark(self, inst, fallback):
+        try:
+            px = float(self.c.mark_price(inst))
+            return px if px > 0 else fallback
+        except Exception:
+            return fallback
+
+    def _await_fill(self, inst, ord_id):
+        """等到 accFillSz > 0。字符串 \"0\" 不是成交。查不到就看交易所持仓，仍为 0 则放弃。"""
+        if not ord_id:
+            return None, 0.0
+        tries = 1 if self.c.is_mock else max(1, int(config.FILL_POLL_TRIES))
+        last_sz = None
+        for i in range(tries):
+            if not self.c.is_mock:
+                time.sleep(config.ORDER_FILL_WAIT_SEC)
+            try:
+                o = self.c.get_order(inst, ord_id)
+            except OkxError as e:
+                self.j.log(AGENT, "order_query", f"{inst} 查询订单失败: {e}", inst=inst)
+                continue
+            state = str(o.get("state") or "")
+            sz = parse_fill_sz(o.get("accFillSz"))
+            px = parse_fill_sz(o.get("avgPx"))
+            last_sz = sz
+            if sz is not None and sz > 0 and px is not None and px > 0:
+                return px, sz
+            if state in ("canceled", "cancelled", "mmp_canceled"):
+                return None, 0.0
+            if i + 1 < tries:
+                self.j.log(AGENT, "fill_wait", f"{inst} 成交尚未确认 state={state or '?'} accFillSz={o.get('accFillSz')}",
+                           inst=inst)
+        live = self._still_open(inst)
+        if live and float(live.get("qty") or 0) > 0 and float(live.get("avgPx") or 0) > 0:
+            return float(live["avgPx"]), float(live["qty"])
+        return None, 0.0 if last_sz is None else last_sz
+
+    def _replace_bracket(self, inst, direction, sl, tp):
+        try:
+            ids = [a.get("algoId") for a in self.c.pending_algos(inst) if a.get("algoId")]
+            if ids:
+                self.c.cancel_algos(inst, ids)
+        except OkxError as e:
+            self.j.log(AGENT, "cancel_warn", f"{inst} 撤掉原止盈止损失败（继续重挂）: {e}", inst=inst)
+        try:
+            self.c.place_sl_algo(inst, "sell" if direction == "long" else "buy",
+                                 self._pos_side(direction), sl, tp)
+            self.j.log(AGENT, "bracket", f"{inst} 按成交价重挂止损 {sl} 止盈 {tp}", inst=inst, sl=sl, tp=tp)
+            return True
+        except OkxError as e:
+            if e.code == "51088":
+                return True
+            self.j.log(AGENT, "bracket_fail", f"{inst} 重挂止盈止损失败: {e}", inst=inst, code=e.code)
+            return False
+
+    def protect_adopted(self, p):
+        """接管或孤儿仓：一定补上止损和止盈。止损放不进正确一侧就市价平掉。"""
+        inst, side = p["instId"], p.get("side") or "long"
+        entry = float(p.get("avgPx") or 0) or float(p.get("markPx") or 0)
+        mark = float(p.get("markPx") or 0) or self._mark(inst, entry)
+        if entry <= 0 or mark <= 0:
+            self.j.log(AGENT, "adopt_flat", f"{inst} 没有有效均价，无法保护，市价平", inst=inst)
+            self.close(p, "接管仓缺少价格")
+            return None
+        spec = self.c.instrument(inst)
+        sl_pct = config.MIN_SL_PCT
+        tp_pct = sl_pct * config.RISK_REWARD
+        sl, tp = bracket_from_fill(side, entry, sl_pct, tp_pct, spec["tickSz"])
+        if not stop_is_valid(side, sl, mark):
+            buf = max(float(spec["tickSz"]) * 2, mark * 0.002)
+            sl = round_px(mark - buf if side == "long" else mark + buf, spec["tickSz"],
+                          "down" if side == "long" else "up")
+        if side == "long" and tp <= mark:
+            tp = round_px(mark * (1 + tp_pct), spec["tickSz"], "up")
+        if side == "short" and tp >= mark:
+            tp = round_px(mark * (1 - tp_pct), spec["tickSz"], "down")
+        if not stop_is_valid(side, sl, mark):
+            self.j.log(AGENT, "adopt_bad_stop", f"{inst} 接管止损 {sl} 相对标记价 {mark} 无效，市价平",
+                       inst=inst, sl=sl, mark=mark)
+            self.close(p, "接管后无法挂出有效止损")
+            return None
+        self._replace_bracket(inst, side, sl, tp)
+        self.ensure_stop(inst, side, sl, tp)
+        self.j.log(AGENT, "adopt_protect", f"{inst} 接管仓已挂 SL {sl} TP {tp}", inst=inst, sl=sl, tp=tp)
+        return sl, tp
+
+    def ensure_stop(self, inst, d, sl, tp=None):
         try:
             algos = self.c.pending_algos(inst)
             if any(a.get("slTriggerPx") for a in algos):
                 self.j.log(AGENT, "sl_ok", f"{inst} 交易所止损已在位", inst=inst)
                 return True
-            self.c.place_sl_algo(inst, "sell" if d == "long" else "buy", self._pos_side(d), sl)
+            self.c.place_sl_algo(inst, "sell" if d == "long" else "buy", self._pos_side(d), sl, tp)
             self.j.log(AGENT, "sl_added", f"{inst} 附带止损缺失，已补挂 SL {sl}", inst=inst, sl=sl)
             return True
         except OkxError as e:
@@ -100,8 +211,9 @@ class Executor:
             self.j.log(AGENT, "sl_amended", f"{inst} 止损上移到 {new_sl}", inst=inst, sl=new_sl)
             return True
         except OkxError as e:
-            if e.code == "51304":
-                self.j.log(AGENT, "sl_51304", f"{inst} 新止损 {new_sl} 已越过标记价，本次不改", inst=inst)
+            if e.code in ("51302", "51304"):
+                self.j.log(AGENT, "sl_reject", f"{inst} 新止损 {new_sl} 在标记价错误一侧 ({e.code})，本次不改",
+                           inst=inst, code=e.code)
             elif e.code == "51023":
                 self.j.log(AGENT, "gone", f"{inst} 仓位已不存在 (51023)", inst=inst)
             else:
@@ -147,3 +259,62 @@ class Executor:
                     return False
         self.j.log(AGENT, "closed", f"{inst} 已平仓：{reason}", inst=inst, reason=reason)
         return True
+
+
+def offline_self_check():
+    """字符串 \"0\" 不能当成已成交；0 张不能返回开仓结果。"""
+    import tempfile
+    from agents.journal import Journal
+
+    assert parse_fill_sz("0") == 0.0
+    assert parse_fill_sz(0) == 0.0
+    assert parse_fill_sz("2.5") == 2.5
+    assert parse_fill_sz("") is None
+    assert parse_fill_sz(None) is None
+    assert ("0" or 3) == "0"  # 这就是旧 bug：非空字符串会盖住真正的张数
+
+    class _C:
+        is_mock = True
+
+        def instrument(self, inst):
+            return {"ctVal": 0.01, "lotSz": "0.01", "minSz": 0.01, "tickSz": "0.1", "maxLever": 20}
+
+        def set_leverage(self, *a, **k):
+            return None
+
+        def ticker(self, inst):
+            return {"last": 100.0, "bid": 99.99, "ask": 100.01}
+
+        def mark_price(self, inst):
+            return 100.0
+
+        def pos_mode(self):
+            return "net_mode"
+
+        def place_order(self, body):
+            return {"ordId": "oid-1", "sCode": "0"}
+
+        def get_order(self, inst, oid):
+            return {"state": "filled", "avgPx": "100.0", "accFillSz": "0"}
+
+        def positions(self):
+            return []
+
+        def pending_algos(self, inst):
+            return []
+
+        def cancel_algos(self, inst, ids):
+            return []
+
+        def place_sl_algo(self, *a, **k):
+            raise AssertionError("0 成交不应去挂止损")
+
+    j = Journal(tempfile.mkdtemp(), echo=False)
+    try:
+        ex = Executor(_C(), j)
+        ex.long_short = False
+        plan = {"instId": "AMD-USDT-SWAP", "direction": "long", "qty": 1.0, "lever": 5,
+                "entry_ref": 100.0, "sl": 99.0, "tp": 101.0, "sl_pct": 0.01, "tp_pct": 0.01, "score": 7}
+        assert ex.open(plan) is None
+    finally:
+        j.close()

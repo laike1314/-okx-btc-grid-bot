@@ -3,10 +3,12 @@
 净利 = 未实现盈亏 - 开仓手续费(实际成交) - 平仓手续费(按 taker 预估) - 已付资金费 - (滑点缓冲 + 半个点差)
 门槛 = max(NET_TP_MIN_USDT, 名义价值 x NET_TP_MIN_PCT)，需连续 N 次满足，且点差正常。
 
-另外做保本保护：浮盈走到止盈距离 50% 时，把交易所止损移到「开仓价 + 双边成本」。
+另外：浮盈达到止损距离的一小段后，把止损抬到锁定大部分利润（必须在标记价正确一侧）。
+持仓超过 MAX_HOLD_SEC 就市价平，不再干等远处的 2R。
 """
 import time
 import config
+from .position import round_px, stop_is_valid
 
 AGENT = "net_tp"
 
@@ -78,6 +80,9 @@ class NetTpMonitor:
     def _check_one(self, p):
         inst = p["instId"]
         key = self._pkey(p)
+        if self._maybe_max_hold(p):
+            self.confirm[key] = 0
+            return
         e = self.estimate(p)
         thr = max(config.NET_TP_MIN_USDT, e["notional"] * config.NET_TP_MIN_PCT)
         if time.time() - self.last_report.get(key, 0) > 60:
@@ -85,7 +90,7 @@ class NetTpMonitor:
             self.j.log(AGENT, "net_pnl", f"{inst} {p.get('side')} 浮盈 {e['upl']:+.2f} 开仓费 {e['fee_in']:.2f} "
                        f"平仓费 {e['fee_out']:.2f} 资金费 {e['funding']:+.2f} 滑点 {e['slip']:.2f} → 净 {e['net']:+.2f}"
                        f"（门槛 {thr:.2f}）", inst=inst, side=p.get("side"), **e, threshold=thr)
-        self._maybe_breakeven(p, e)
+        self._maybe_trail(p, e)
         if not config.ENABLE_NET_TP or e["net"] <= thr:
             self.confirm[key] = 0
             return
@@ -105,24 +110,68 @@ class NetTpMonitor:
         self.ex.close(p, "NET-TP 净利止盈")
         self.confirm[key] = 0
 
-    def _maybe_breakeven(self, p, e):
-        meta = self.s.d["open_meta"].get(p["instId"])
-        if not meta or meta.get("be_done") or not meta.get("tp"):
+    def _opened_ts(self, p):
+        meta = self.s.d.get("open_meta", {}).get(p["instId"]) or {}
+        if meta.get("opened_ts"):
+            return float(meta["opened_ts"])
+        ms = meta.get("open_ms") or p.get("cTime") or 0
+        if ms and float(ms) > 1e11:
+            return float(ms) / 1000.0
+        return None
+
+    def _maybe_max_hold(self, p):
+        if config.MAX_HOLD_SEC <= 0:
+            return False
+        opened = self._opened_ts(p)
+        if opened is None:
+            return False
+        age = self.s.now() - opened
+        if age < config.MAX_HOLD_SEC:
+            return False
+        meta = self.s.d["open_meta"].setdefault(p["instId"], {})
+        meta["close_reason"] = "超时平仓"
+        self.j.log(AGENT, "max_hold", f"{p['instId']} 已持有 {int(age)}s，超过 {config.MAX_HOLD_SEC}s，市价平",
+                   inst=p["instId"], age=age)
+        self.ex.close(p, "超时平仓")
+        self.s.save()
+        return True
+
+    def _maybe_trail(self, p, e):
+        """浮盈够一段就把止损抬到锁定大部分利润。新止损必须在标记价的保护一侧。"""
+        meta = self.s.d.get("open_meta", {}).get(p["instId"])
+        if not meta:
             return
-        entry, tp, mark = p["avgPx"], meta["tp"], p["markPx"]
+        entry, mark = float(p.get("avgPx") or 0), float(p.get("markPx") or 0)
+        if entry <= 0 or mark <= 0:
+            return
         long = p["side"] == "long"
         moved = (mark - entry) if long else (entry - mark)
-        if moved < abs(tp - entry) * 0.5:
+        risk = abs(entry - float(meta.get("sl") or entry)) or entry * config.MIN_SL_PCT
+        if moved <= 0 or moved < risk * config.TRAIL_ARM_R:
             return
         cost = entry * (2 * self.fees.taker + 2 * config.SLIPPAGE_BPS / 1e4)
-        be = entry + cost if long else entry - cost
+        locked = max(cost, moved * config.TRAIL_LOCK_FRAC)
+        raw = entry + locked if long else entry - locked
         tick = self.c.instrument(p["instId"])["tickSz"]
-        from .position import round_px
-        be = round_px(be, tick, "up" if long else "down")
-        if self.ex.amend_sl(p["instId"], be):
+        buf = max(float(tick) * 2, mark * 0.0003)
+        if long:
+            raw = min(raw, mark - buf)
+            new_sl = round_px(raw, tick, "down")
+        else:
+            raw = max(raw, mark + buf)
+            new_sl = round_px(raw, tick, "up")
+        if not stop_is_valid(p["side"], new_sl, mark):
+            self.j.log(AGENT, "trail_skip", f"{p['instId']} 跟踪止损 {new_sl} 在标记价 {mark} 错误一侧，不改",
+                       inst=p["instId"], sl=new_sl, mark=mark)
+            return
+        prev = float(meta.get("sl") or 0)
+        if prev and ((long and new_sl <= prev) or (not long and new_sl >= prev)):
+            return
+        if self.ex.amend_sl(p["instId"], new_sl):
+            meta["sl"] = new_sl
             meta["be_done"] = True
-            self.j.log(AGENT, "breakeven", f"{p['instId']} 已走 50% 止盈距离，止损移到保本+成本 {be}",
-                       inst=p["instId"], sl=be)
+            self.j.log(AGENT, "trail", f"{p['instId']} 浮盈 {moved:.4f}，止损上移锁定利润到 {new_sl}",
+                       inst=p["instId"], sl=new_sl)
             self.s.save()
 
 
@@ -188,5 +237,29 @@ def offline_self_check():
         text = open(os.path.join(d, "decisions.jsonl"), encoding="utf-8").read()
         assert "monitor_error" in text and "BAD-USDT-SWAP" in text
         assert "monitor_all" in text and "SOL-USDT-SWAP:short" in text
+
+        class _Amend:
+            def __init__(self):
+                self.calls = []
+
+            def amend_sl(self, inst, sl):
+                self.calls.append((inst, sl))
+                return True
+
+            def close(self, *a, **k):
+                raise AssertionError("不该因跟踪止损去平仓")
+
+        amend = _Amend()
+        mon2 = NetTpMonitor(c, j, fees, amend, state)
+        state.d["open_meta"]["ETH-USDT-SWAP"] = {"sl": 99.0, "tp": 100.2, "entry": 100.0}
+        # 止损会算到标记价外侧：不改
+        mon2._maybe_trail({"instId": "ETH-USDT-SWAP", "side": "long", "avgPx": 100.0,
+                           "markPx": 100.12, "upl": 0.1, "notional": 100, "qty": 1, "cTime": 0}, {"net": 0})
+        assert amend.calls == []
+        # 标记价已经走远，止损落在正确一侧，可以改
+        mon2._maybe_trail({"instId": "ETH-USDT-SWAP", "side": "long", "avgPx": 100.0,
+                           "markPx": 101.0, "upl": 1, "notional": 100, "qty": 1, "cTime": 0}, {"net": 1})
+        assert amend.calls and amend.calls[0][0] == "ETH-USDT-SWAP"
+        assert amend.calls[0][1] < 101.0
     finally:
         j.close()

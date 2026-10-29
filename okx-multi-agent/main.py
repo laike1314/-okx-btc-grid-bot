@@ -60,7 +60,7 @@ def build(mock, data_dir):
         "client": client, "journal": j, "state": state, "fees": fees,
         "scanner": Scanner(client, j), "risk": risk, "position": PositionManager(client, j, fees),
         "executor": ex, "net_tp": NetTpMonitor(client, j, fees, ex, state),
-        "equity": EquityTracker(client, j, state, risk, data_dir),
+        "equity": EquityTracker(client, j, state, risk, data_dir, ex),
     }
     return agents
 
@@ -69,9 +69,11 @@ def _offline_self_checks():
     """冒烟启动前跑纯本地断言：交易池筛选、仓位上限、全持仓监控。不联网。"""
     from agents.risk import offline_self_check as risk_check
     from agents.net_tp import offline_self_check as mon_check
+    from agents.executor import offline_self_check as exec_check
     universe.offline_self_check()
     risk_check()
     mon_check()
+    exec_check()
 
 
 def monitor_positions(a):
@@ -158,8 +160,7 @@ def scan_and_trade(a):
             except Exception as e:
                 j.log("executor", "error", f"{cand['instId']} 开仓流程失败: {e}", inst=cand["instId"])
                 continue
-            if fill:
-                a["equity"].register_open(plan, fill)
+            if fill and a["equity"].register_open(plan, fill):
                 positions = c.positions()
             if position_cap_reached(len(positions)):
                 j.log("risk", "full", f"持仓 {len(positions)}/{config.MAX_POSITIONS}，本轮停止继续开仓")

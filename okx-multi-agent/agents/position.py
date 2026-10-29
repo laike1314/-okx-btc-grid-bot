@@ -18,6 +18,29 @@ def round_px(px, tick, mode="nearest"):
     return float(fmt_num(n * t, tick))
 
 
+def stop_is_valid(side, sl, mark):
+    """止损必须在标记价的保护一侧，否则 OKX 会回 51302/51304。"""
+    try:
+        sl, mark = float(sl), float(mark)
+    except (TypeError, ValueError):
+        return False
+    if sl <= 0 or mark <= 0:
+        return False
+    if side == "long":
+        return sl < mark
+    return sl > mark
+
+
+def bracket_from_fill(direction, fill_px, sl_pct, tp_pct, tick):
+    if direction == "long":
+        sl = round_px(fill_px * (1 - sl_pct), tick, "down")
+        tp = round_px(fill_px * (1 + tp_pct), tick, "up")
+    else:
+        sl = round_px(fill_px * (1 + sl_pct), tick, "up")
+        tp = round_px(fill_px * (1 - tp_pct), tick, "down")
+    return sl, tp
+
+
 class PositionManager:
     def __init__(self, client, journal, fees):
         self.c, self.j, self.fees = client, journal, fees

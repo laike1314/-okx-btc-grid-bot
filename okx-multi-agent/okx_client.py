@@ -240,12 +240,14 @@ class OkxClient:
         return self.request("POST", "/api/v5/trade/cancel-algos",
                             body=[{"instId": inst_id, "algoId": a} for a in algo_ids], private=True)
 
-    def place_sl_algo(self, inst_id, close_side, pos_side, sl):
-        """单独挂交易所止损（附带止损失败时的兜底），closeFraction=1 全平。"""
-        return self.request("POST", "/api/v5/trade/order-algo", body={
-            "instId": inst_id, "tdMode": config.TD_MODE, "side": close_side, "posSide": pos_side,
-            "ordType": "conditional", "closeFraction": "1", "reduceOnly": True,
-            "slTriggerPx": str(sl), "slOrdPx": "-1", "slTriggerPxType": "mark"}, private=True)[0]
+    def place_sl_algo(self, inst_id, close_side, pos_side, sl, tp=None):
+        """单独挂交易所止损，可选同时带止盈。closeFraction=1 全平。"""
+        body = {"instId": inst_id, "tdMode": config.TD_MODE, "side": close_side, "posSide": pos_side,
+                "ordType": "conditional", "closeFraction": "1", "reduceOnly": True,
+                "slTriggerPx": str(sl), "slOrdPx": "-1", "slTriggerPxType": "mark"}
+        if tp:
+            body.update({"tpTriggerPx": str(tp), "tpOrdPx": "-1", "tpTriggerPxType": "last"})
+        return self.request("POST", "/api/v5/trade/order-algo", body=body, private=True)[0]
 
     def amend_sl(self, inst_id, algo_id, new_sl):
         return self.request("POST", "/api/v5/trade/amend-algos",
@@ -328,14 +330,18 @@ class MockOkxClient:
 
     def candles(self, inst_id, bar, limit=120):
         bars = self.bars[inst_id]
-        if bar == "1H":
+        # 内部 K 线是 5 分钟。15m / 1H 按根数聚合，趋势过滤在冒烟里仍然和信号周期不同。
+        factor = {"15m": 3, "30m": 6, "1H": 12, "2H": 24, "4H": 48}.get(bar, 1)
+        if factor > 1:
             agg = []
-            for i in range(len(bars) - 12 * limit, len(bars), 12):
-                chunk = bars[max(i, 0):i + 12]
-                if chunk:
-                    agg.append({"ts": chunk[0]["ts"], "o": chunk[0]["o"], "h": max(b["h"] for b in chunk),
-                                "l": min(b["l"] for b in chunk), "c": chunk[-1]["c"],
-                                "vol": sum(b["vol"] for b in chunk), "confirm": True})
+            start = len(bars) - factor * limit
+            for i in range(start, len(bars), factor):
+                chunk = bars[max(i, 0):i + factor]
+                if len(chunk) < factor:
+                    continue
+                agg.append({"ts": chunk[0]["ts"], "o": chunk[0]["o"], "h": max(b["h"] for b in chunk),
+                            "l": min(b["l"] for b in chunk), "c": chunk[-1]["c"],
+                            "vol": sum(b["vol"] for b in chunk), "confirm": True})
             return agg[-limit:]
         return [dict(b) for b in bars[-limit:]]
 
@@ -442,10 +448,11 @@ class MockOkxClient:
         self.algos.pop(inst_id, None)
         return [{}]
 
-    def place_sl_algo(self, inst_id, close_side, pos_side, sl):
+    def place_sl_algo(self, inst_id, close_side, pos_side, sl, tp=None):
         if inst_id not in self.pos:
             raise OkxError("51023", "Position does not exist")
-        self.algos[inst_id] = {"algoId": "algo-" + uuid.uuid4().hex[:8], "sl": float(sl), "tp": None}
+        self.algos[inst_id] = {"algoId": "algo-" + uuid.uuid4().hex[:8], "sl": float(sl),
+                               "tp": float(tp) if tp else None}
         return {"algoId": self.algos[inst_id]["algoId"], "sCode": "0"}
 
     def amend_sl(self, inst_id, algo_id, new_sl):
