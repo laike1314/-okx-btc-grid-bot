@@ -33,6 +33,22 @@ permissions:
 jobs:
   demo:
     runs-on: ubuntu-latest
+    env:
+      # 与 config.py 的 MA-1.2.0 剥头皮默认一致，避免 Actions 环境里残留旧变量。
+      ENABLE_US_STOCKS: "0"
+      SIGNAL_BAR: "5m"
+      TREND_BAR: "15m"
+      MIN_SIGNAL_SCORE: "7"
+      MIN_ADX: "28"
+      ATR_SL_MULT: "2.5"
+      MIN_SL_PCT: "0.004"
+      RISK_REWARD: "1.0"
+      MAX_HOLD_SEC: "900"
+      SYMBOL_COOLDOWN_SEC: "900"
+      LOSS_COOLDOWN_SEC: "1800"
+      MAX_CONSECUTIVE_LOSSES: "3"
+      MAX_SAME_DIR_CRYPTO: "2"
+      REENTRY_BAR: "5m"
 
     steps:
       - name: Checkout

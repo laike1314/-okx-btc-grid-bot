@@ -1,8 +1,9 @@
 """Scanner 代理：扫描交易池里的 USDT 永续（加密 + 股票类），寻找「强趋势 + 量能/价格异动」并打分。
 
 打分（满分 8）:
-  TREND_BAR 大周期 EMA 方向   2 分（必须，默认 5m）
-  SIGNAL_BAR EMA9/21 同向 + 收盘在慢线同侧  2 分（必须，默认 1m）
+  TREND_BAR 大周期 EMA 方向   2 分（必须，默认 15m）
+  SIGNAL_BAR EMA9/21 同向 + 收盘在慢线同侧  2 分（必须，默认 5m）
+  ADX >= MIN_ADX             硬条件，不够直接放弃
   ADX >= MIN_ADX             1 分
   DI 方向一致                1 分
   成交量异动 (> 均量 x 倍数)  1 分
@@ -46,6 +47,9 @@ class Scanner:
         direction = "long" if big > 0 else "short"
         score += 4
         reasons.append(f"{config.TREND_BAR}+{config.SIGNAL_BAR}同向")
+        if adx_v < config.MIN_ADX:
+            info.update(direction=direction, score=score)
+            return info, f"ADX{adx_v:.0f}<{config.MIN_ADX:.0f}"
         if adx_v >= config.MIN_ADX:
             score += 1
             reasons.append(f"ADX{adx_v:.0f}")

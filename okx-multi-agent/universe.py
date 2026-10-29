@@ -12,7 +12,8 @@
   官方 ``instCategory``：1 Crypto，3 Stocks，4 Commodities，5 Forex，6 Bonds。
   股票永续一律是 SWAP，instId 形如 ``AAPL-USDT-SWAP``。
   帮助中心说明该产品线同时包含美股、韩股、日股、港股和少量 pre-market。
-  因此 ENABLE_US_STOCKS=1 时纳入 **全部** instCategory=3 且 live 的 USDT 线性永续，
+  ENABLE_US_STOCKS=1 时纳入 **全部** instCategory=3 且 live 的 USDT 线性永续。
+  默认关闭：模拟盘股票永续点差宽，价格也容易失真。
   不手写代码表，也不把商品（XAU 等，category 4）算进去。
 
 SYMBOLS 环境变量若非空，则整表替换自动交易池（调试用）。
