@@ -10,8 +10,19 @@ import time
 import config
 from okx_client import OkxError, fmt_num
 from .position import bracket_from_fill, round_px, stop_is_valid
+from .risk import chase_blocked
 
 AGENT = "executor"
+
+
+def _algo_set(algo, key):
+    raw = (algo or {}).get(key)
+    if raw in (None, "", "0", 0):
+        return False
+    try:
+        return float(raw) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def parse_fill_sz(raw):
@@ -52,6 +63,11 @@ class Executor:
         # 用最新盘口复核止损没越过当前价（防 51304）
         t = self.c.ticker(inst)
         px = t["ask"] if d == "long" else t["bid"]
+        sig = float(plan.get("signal_px") or plan.get("entry_ref") or 0)
+        if chase_blocked(d, sig, t["bid"], t["ask"], config.CHASE_LIMIT_PCT):
+            self.j.log(AGENT, "no_chase", f"{inst} 下单前价格已偏离信号 {sig} 超过 "
+                       f"{config.CHASE_LIMIT_PCT:.2%}，不追", inst=inst)
+            return None
         if (d == "long" and plan["sl"] >= px) or (d == "short" and plan["sl"] <= px):
             self.j.log(AGENT, "abort", f"{inst} 行情已越过止损价 {plan['sl']}，放弃开仓", inst=inst)
             return None
@@ -181,6 +197,30 @@ class Executor:
         self.ensure_stop(inst, side, sl, tp)
         self.j.log(AGENT, "adopt_protect", f"{inst} 接管仓已挂 SL {sl} TP {tp}", inst=inst, sl=sl, tp=tp)
         return sl, tp
+
+    def audit_bracket(self, p, meta=None):
+        """每个持仓都要同时有止损和止盈。缺了就按记录重挂，挂不出有效止损就平仓。"""
+        inst = p["instId"]
+        meta = meta or {}
+        side = p.get("side") or meta.get("direction") or "long"
+        try:
+            algos = self.c.pending_algos(inst)
+        except Exception as e:
+            self.j.log(AGENT, "protect_check_err", f"{inst} 检查止盈止损失败: {e}", inst=inst)
+            return False
+        has_sl = any(_algo_set(a, "slTriggerPx") for a in algos)
+        has_tp = any(_algo_set(a, "tpTriggerPx") for a in algos)
+        if has_sl and has_tp:
+            return True
+        self.j.log(AGENT, "protect_missing", f"{inst} 保护单不完整 sl={has_sl} tp={has_tp}，补挂", inst=inst)
+        mark = float(p.get("markPx") or 0) or self._mark(inst, float(p.get("avgPx") or meta.get("entry") or 0))
+        sl, tp = meta.get("sl"), meta.get("tp")
+        if sl and tp and stop_is_valid(side, sl, mark):
+            self._replace_bracket(inst, side, sl, tp)
+            self.ensure_stop(inst, side, sl, tp)
+            return True
+        protected = self.protect_adopted(p)
+        return "closed" if protected is None else protected
 
     def ensure_stop(self, inst, d, sl, tp=None):
         try:

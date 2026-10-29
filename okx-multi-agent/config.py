@@ -52,7 +52,7 @@ BASE_URL = _env("OKX_BASE_URL", "https://www.okx.com")
 # 模拟盘开关：固定为 "1"。本项目只允许模拟盘，main.py 启动时会再检查一次。
 SIMULATED_TRADING = "1"
 
-VERSION = "MA-1.2.0"
+VERSION = "MA-1.2.1"
 
 # ---------------- 交易池 ----------------
 # SYMBOLS 非空 = 调试强制列表，跳过市值排名和股票发现。不设则启动时自动组建。
@@ -81,6 +81,12 @@ MIN_SIGNAL_SCORE = _env("MIN_SIGNAL_SCORE", 7, int)       # 满分 8
 
 # ---------------- Risk 风控闸门（对应推文里的 Rug 检测） ----------------
 MAX_SPREAD_BPS = _env("MAX_SPREAD_BPS", 6.0, float)          # 开仓点差上限（模拟盘 ETH 常见 ~4bps）
+MIN_VOL_USDT_24H = _env("MIN_VOL_USDT_24H", 10_000_000.0, float)  # 24h 成交额下限，过滤稀薄合约
+MAX_MARK_INDEX_BPS = _env("MAX_MARK_INDEX_BPS", 50.0, float)  # 标记价相对指数偏离上限
+# 双边成本 / 计划止损距离。超过就拒绝，避免手续费吃掉太多 R。0 = 不检查。
+MAX_COST_TO_R = _env("MAX_COST_TO_R", 0.30, float)
+# 信号收盘后价格又朝有利方向跑超过这个比例，视为在追尖峰，不开仓。
+CHASE_LIMIT_PCT = _env("CHASE_LIMIT_PCT", 0.0015, float)
 MAX_ABS_FUNDING_RATE = _env("MAX_ABS_FUNDING_RATE", 0.0005, float)  # |资金费率| > 0.05% 视为极端
 MAX_ATR_PCT = _env("MAX_ATR_PCT", 0.012, float)              # ATR/价格 太大 = 波动过猛
 MIN_ATR_PCT = _env("MIN_ATR_PCT", 0.0008, float)             # 太小 = 赚不够双边手续费
@@ -115,6 +121,8 @@ ORDER_FILL_WAIT_SEC = _env("ORDER_FILL_WAIT_SEC", 0.4, float)
 FILL_POLL_TRIES = _env("FILL_POLL_TRIES", 5, int)
 # 成交价偏离计划入场超过这个比例就平掉，不记账。
 MAX_FILL_SLIP_PCT = _env("MAX_FILL_SLIP_PCT", 0.001, float)
+# 每隔这么多秒核对一次每个持仓是否仍有止损和止盈。0 = 只在开仓/接管时检查。
+PROTECT_AUDIT_SEC = _env("PROTECT_AUDIT_SEC", 30, int)
 
 # ---------------- Net-TP 净利止盈监控 ----------------
 ENABLE_NET_TP = _env("ENABLE_NET_TP", True, bool)

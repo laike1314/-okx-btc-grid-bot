@@ -15,7 +15,7 @@ class SharedState:
         self.path = os.path.join(data_dir, "state.json")
         self.d = {"consecutive_losses": 0, "global_cooldown_until": 0, "symbol_cooldown": {},
                   "daily": {}, "open_meta": {}, "day_start_equity": {}, "pnl_events": [],
-                  "last_entry_bar": {}}
+                  "last_entry_bar": {}, "last_exit_trend_bar": {}}
         if os.path.exists(self.path):
             try:
                 self.d.update(json.load(open(self.path, encoding="utf-8")))
