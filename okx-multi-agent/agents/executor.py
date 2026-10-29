@@ -71,8 +71,11 @@ class Executor:
         if (d == "long" and plan["sl"] >= px) or (d == "short" and plan["sl"] <= px):
             self.j.log(AGENT, "abort", f"{inst} 行情已越过止损价 {plan['sl']}，放弃开仓", inst=inst)
             return None
+        # 贴着己方盘口挂 post-only，超时撤单，不用市价去追。
+        limit = t["bid"] if d == "long" else t["ask"]
         body = {"instId": inst, "tdMode": config.TD_MODE, "side": "buy" if d == "long" else "sell",
-                "posSide": self._pos_side(d), "ordType": "market", "sz": fmt_num(plan["qty"], spec["lotSz"]),
+                "posSide": self._pos_side(d), "ordType": "post_only",
+                "px": fmt_num(limit, spec["tickSz"]), "sz": fmt_num(plan["qty"], spec["lotSz"]),
                 "attachAlgoOrds": [{"slTriggerPx": str(plan["sl"]), "slOrdPx": "-1", "slTriggerPxType": "mark",
                                     "tpTriggerPx": str(plan["tp"]), "tpOrdPx": "-1", "tpTriggerPxType": "last"}]}
         try:
@@ -90,13 +93,16 @@ class Executor:
             self.j.log(AGENT, "no_fill", f"{inst} 没有真实成交（accFillSz={filled}），不记账、不当成持仓",
                        inst=inst, ordId=ord_id, qty=filled or 0)
             return None
-        ref = float(plan.get("entry_ref") or fill_px)
+        ref = float(limit or plan.get("entry_ref") or fill_px)
         slip = abs(fill_px - ref) / ref if ref else 0.0
         if slip > config.MAX_FILL_SLIP_PCT:
             self.j.log(AGENT, "slip_cancel", f"{inst} 成交价 {fill_px} 偏离计划 {ref} 达 {slip:.3%}，"
-                       f"超过 {config.MAX_FILL_SLIP_PCT:.3%}，市价撤掉且不记账", inst=inst, slip=slip)
-            self.close({"instId": inst, "side": d, "posSide": self._pos_side(d)}, "成交滑点过大")
-            return None
+                       f"超过 {config.MAX_FILL_SLIP_PCT:.3%}，平掉并记账", inst=inst, slip=slip)
+            closed = self.close({"instId": inst, "side": d, "posSide": self._pos_side(d)}, "成交滑点过大")
+            if not closed:
+                self.j.log(AGENT, "slip_still_open", f"{inst} 滑点平仓未完成，改按持仓接管", inst=inst)
+            return {"ordId": ord_id, "fill_px": fill_px, "qty": filled,
+                    "flattened": bool(closed), "close_reason": "滑点撤单"}
         sl, tp = bracket_from_fill(d, fill_px, plan["sl_pct"], plan["tp_pct"], spec["tickSz"])
         mark = self._mark(inst, fill_px)
         if not stop_is_valid(d, sl, mark):
@@ -119,35 +125,51 @@ class Executor:
         except Exception:
             return fallback
 
+    def _read_order(self, inst, ord_id):
+        o = self.c.get_order(inst, ord_id)
+        state = str(o.get("state") or "")
+        sz = parse_fill_sz(o.get("accFillSz"))
+        px = parse_fill_sz(o.get("avgPx"))
+        if sz is not None and sz > 0 and px is not None and px > 0:
+            return px, sz, state
+        return None, 0.0 if sz is None else sz, state
+
     def _await_fill(self, inst, ord_id):
-        """等到 accFillSz > 0。字符串 \"0\" 不是成交。查不到就看交易所持仓，仍为 0 则放弃。"""
+        """post-only 等到真实成交。字符串 \"0\" 不是成交。超时撤单，撤完再看一眼避免漏记部分成交。"""
         if not ord_id:
             return None, 0.0
-        tries = 1 if self.c.is_mock else max(1, int(config.FILL_POLL_TRIES))
-        last_sz = None
-        for i in range(tries):
-            if not self.c.is_mock:
-                time.sleep(config.ORDER_FILL_WAIT_SEC)
+        deadline = time.time() + max(0.0, float(config.MAKER_ENTRY_TIMEOUT_SEC))
+        last_sz = 0.0
+        while True:
             try:
-                o = self.c.get_order(inst, ord_id)
+                px, sz, state = self._read_order(inst, ord_id)
             except OkxError as e:
                 self.j.log(AGENT, "order_query", f"{inst} 查询订单失败: {e}", inst=inst)
-                continue
-            state = str(o.get("state") or "")
-            sz = parse_fill_sz(o.get("accFillSz"))
-            px = parse_fill_sz(o.get("avgPx"))
+                px, sz, state = None, last_sz, ""
             last_sz = sz
-            if sz is not None and sz > 0 and px is not None and px > 0:
+            if sz and sz > 0 and px:
                 return px, sz
             if state in ("canceled", "cancelled", "mmp_canceled"):
-                return None, 0.0
-            if i + 1 < tries:
-                self.j.log(AGENT, "fill_wait", f"{inst} 成交尚未确认 state={state or '?'} accFillSz={o.get('accFillSz')}",
+                break
+            if self.c.is_mock or time.time() >= deadline:
+                self.j.log(AGENT, "maker_timeout", f"{inst} post-only 未在 {config.MAKER_ENTRY_TIMEOUT_SEC:g}s 内成交，撤单",
                            inst=inst)
+                try:
+                    self.c.cancel_order(inst, ord_id)
+                except Exception as e:
+                    self.j.log(AGENT, "cancel_warn", f"{inst} 撤挂单失败: {e}", inst=inst)
+                try:
+                    px, sz, _state = self._read_order(inst, ord_id)
+                except OkxError:
+                    px, sz = None, 0.0
+                if sz and sz > 0 and px:
+                    return px, sz
+                break
+            time.sleep(config.ORDER_FILL_WAIT_SEC)
         live = self._still_open(inst)
         if live and float(live.get("qty") or 0) > 0 and float(live.get("avgPx") or 0) > 0:
             return float(live["avgPx"]), float(live["qty"])
-        return None, 0.0 if last_sz is None else last_sz
+        return None, last_sz or 0.0
 
     def _replace_bracket(self, inst, direction, sl, tp):
         try:
@@ -332,10 +354,15 @@ def offline_self_check():
             return "net_mode"
 
         def place_order(self, body):
+            self.last_type = body.get("ordType")
             return {"ordId": "oid-1", "sCode": "0"}
 
         def get_order(self, inst, oid):
-            return {"state": "filled", "avgPx": "100.0", "accFillSz": "0"}
+            return {"state": "live", "avgPx": "", "accFillSz": "0"}
+
+        def cancel_order(self, inst, oid):
+            self.cancelled = True
+            return {}
 
         def positions(self):
             return []
@@ -351,10 +378,24 @@ def offline_self_check():
 
     j = Journal(tempfile.mkdtemp(), echo=False)
     try:
-        ex = Executor(_C(), j)
+        client = _C()
+        ex = Executor(client, j)
         ex.long_short = False
         plan = {"instId": "AMD-USDT-SWAP", "direction": "long", "qty": 1.0, "lever": 5,
-                "entry_ref": 100.0, "sl": 99.0, "tp": 101.0, "sl_pct": 0.01, "tp_pct": 0.01, "score": 7}
+                "entry_ref": 99.99, "signal_px": 100.0, "sl": 99.0, "tp": 101.0,
+                "sl_pct": 0.01, "tp_pct": 0.01, "score": 7}
         assert ex.open(plan) is None
+        assert client.cancelled and client.last_type == "post_only"
+
+        class _Slip(_C):
+            def get_order(self, inst, oid):
+                return {"state": "filled", "avgPx": "102", "accFillSz": "1"}
+
+        slip = _Slip()
+        ex2 = Executor(slip, j)
+        ex2.long_short = False
+        ex2.close = lambda *a, **k: True
+        got = ex2.open(dict(plan))
+        assert got and got.get("flattened") and got["qty"] == 1 and got["close_reason"] == "滑点撤单"
     finally:
         j.close()

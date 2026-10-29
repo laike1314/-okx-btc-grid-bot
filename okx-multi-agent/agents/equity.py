@@ -7,8 +7,27 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 
+import config
+
 BJ = timezone(timedelta(hours=8))
 AGENT = "equity"
+
+
+def _pnl_row_trusted(res, meta):
+    """成交价明显不同却回报 0 盈亏时，当成没读到，改走估算。"""
+    if not res:
+        return False
+    try:
+        net = float(res.get("realizedPnl") or 0)
+        exit_px = float(res.get("closeAvgPx") or 0)
+        entry = float(meta.get("entry") or 0)
+    except (TypeError, ValueError):
+        return False
+    if exit_px <= 0:
+        return abs(net) > 1e-8
+    if entry > 0 and abs(exit_px - entry) / entry > 0.0005 and abs(net) < 1e-6:
+        return False
+    return True
 
 
 class EquityTracker:
@@ -39,6 +58,8 @@ class EquityTracker:
         if plan.get("reentry_bar_ts"):
             self.s.d.setdefault("last_entry_bar", {})[inst] = {
                 "direction": plan["direction"], "bar_ts": int(plan["reentry_bar_ts"])}
+        if fill.get("close_reason"):
+            self.s.d["open_meta"][inst]["close_reason"] = fill["close_reason"]
         self.known.add(inst)
         self.s.save()
         return True
@@ -103,17 +124,32 @@ class EquityTracker:
         from .risk import note_exit_trend_bar
         note_exit_trend_bar(self.s, inst)
         res = None
-        for _ in range(1 if self.c.is_mock else 6):
+        open_ms = int(meta.get("open_ms") or 0)
+        for _ in range(1 if self.c.is_mock else 8):
             try:
                 res = self.c.last_closed(inst)
             except Exception:
                 res = None
-            if res and res.get("uTime", 0) >= (meta.get("open_ms") or 0):
+            if res and int(res.get("uTime") or 0) >= open_ms - 30000 and _pnl_row_trusted(res, meta):
                 break
             res = None
-            time.sleep(1)
-        net = res["realizedPnl"] if res else 0.0
-        reason = meta.get("close_reason") or (res.get("why") if res and res.get("why") else "交易所止盈/止损")
+            if not self.c.is_mock:
+                time.sleep(1)
+        est = self._estimate_net(inst, meta)
+        if res and _pnl_row_trusted(res, meta):
+            net = float(res.get("realizedPnl") or 0)
+            reason = meta.get("close_reason") or (res.get("why") if res and res.get("why") else "交易所止盈/止损")
+        elif est is not None:
+            net, gross, fee, exit_px = est
+            res = {"realizedPnl": net, "pnl": gross, "fee": fee, "fundingFee": 0.0,
+                   "closeAvgPx": exit_px, "why": "估算"}
+            reason = (meta.get("close_reason") or "平仓") + "（交易所盈亏未对齐，按成交价估算）"
+            self.j.log(AGENT, "pnl_estimated", f"{inst} 交易所盈亏不可用或为 0，按价格估算净盈亏 {net:+.2f}",
+                       inst=inst, est_net=net)
+        else:
+            net = 0.0
+            reason = meta.get("close_reason") or "交易所止盈/止损"
+            self.j.log(AGENT, "pnl_unknown", f"{inst} 无法取得平仓盈亏，记 0 并保留原因 {reason}", inst=inst)
         try:
             eq = self.c.equity()
         except Exception:
@@ -134,6 +170,24 @@ class EquityTracker:
                    f"{eq if eq is None else round(eq, 2)}", **row)
         self.risk.on_trade_closed(inst, net)
         self.snapshot(eq)
+
+    def _estimate_net(self, inst, meta):
+        entry = float(meta.get("entry") or 0)
+        qty = float(meta.get("qty") or 0)
+        if entry <= 0 or qty <= 0:
+            return None
+        try:
+            t = self.c.ticker(inst)
+            exit_px = t["bid"] if meta.get("direction") == "long" else t["ask"]
+            ct = float(self.c.instrument(inst)["ctVal"])
+        except Exception:
+            return None
+        if not exit_px or ct <= 0:
+            return None
+        sign = 1.0 if meta.get("direction") == "long" else -1.0
+        gross = (float(exit_px) - entry) * qty * ct * sign
+        fee = (entry + float(exit_px)) * qty * ct * config.DEFAULT_TAKER_FEE
+        return gross - fee, gross, -fee, float(exit_px)
 
     def snapshot(self, eq=None):
         if eq is None:
@@ -174,3 +228,51 @@ class EquityTracker:
                  "max_drawdown_pct": round(mdd * 100, 3)}
         json.dump(stats, open(self.equity_json, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
         return stats
+
+
+def offline_self_check():
+    """交易所把一笔有价差的平仓记成 0 时，不能照抄 +0.00。"""
+    import tempfile
+    from agents.journal import Journal
+    from agents.state import SharedState
+
+    class _C:
+        is_mock = True
+
+        def last_closed(self, inst):
+            return {"realizedPnl": 0, "pnl": 0, "fee": 0, "fundingFee": 0,
+                    "closeAvgPx": 110, "uTime": 10**13, "why": "SL"}
+
+        def ticker(self, inst):
+            return {"bid": 110.0, "ask": 110.1, "last": 110.0}
+
+        def instrument(self, inst):
+            return {"ctVal": 1.0}
+
+        def equity(self):
+            return 9900.0
+
+    class _Risk:
+        def __init__(self):
+            self.net = None
+
+        def on_trade_closed(self, inst, net):
+            self.net = net
+
+    d = tempfile.mkdtemp()
+    j = Journal(d, echo=False)
+    try:
+        st = SharedState(d, clock=lambda: 1000)
+        risk = _Risk()
+        eq = EquityTracker(_C(), j, st, risk, d)
+        st.d["open_meta"]["BTC-USDT-SWAP"] = {
+            "direction": "long", "qty": 1, "entry": 100, "open_ms": 1000}
+        eq.known.add("BTC-USDT-SWAP")
+        eq._on_closed("BTC-USDT-SWAP")
+        assert risk.net is not None and abs(risk.net) > 1, risk.net
+        rows = list(csv.DictReader(open(eq.trades_csv, encoding="utf-8")))
+        assert len(rows) == 1
+        assert abs(float(rows[0]["net_pnl"])) > 1
+        assert float(rows[0]["qty"]) > 0
+    finally:
+        j.close()

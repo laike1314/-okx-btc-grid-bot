@@ -52,7 +52,7 @@ BASE_URL = _env("OKX_BASE_URL", "https://www.okx.com")
 # 模拟盘开关：固定为 "1"。本项目只允许模拟盘，main.py 启动时会再检查一次。
 SIMULATED_TRADING = "1"
 
-VERSION = "MA-1.2.1"
+VERSION = "MA-1.2.2"
 
 # ---------------- 交易池 ----------------
 # SYMBOLS 非空 = 调试强制列表，跳过市值排名和股票发现。不设则启动时自动组建。
@@ -100,7 +100,8 @@ SYMBOL_COOLDOWN_SEC = _env("SYMBOL_COOLDOWN_SEC", 900, int)   # 单币止损后�
 REENTRY_BAR = _env("REENTRY_BAR", "5m")
 # 同一方向的加密货币持仓个数上限。0 = 不限制。股票不计入。
 MAX_SAME_DIR_CRYPTO = _env("MAX_SAME_DIR_CRYPTO", 2, int)
-MIN_EDGE_FEE_MULT = 3.0   # 预期止盈距离必须 >= 双边手续费+滑点 的 3 倍
+# 1R（止损距离）至少要盖住来回成本的这么多倍。不够就加宽止损/止盈，加到 MAX_SL 仍不够就跳过。
+MIN_EDGE_FEE_MULT = _env("MIN_EDGE_FEE_MULT", 3.5, float)
 
 # ---------------- Position 仓位代理 ----------------
 RISK_PER_TRADE_PCT = _env("RISK_PER_TRADE_PCT", 0.0025, float)  # 每笔止损最多亏权益 0.25%
@@ -121,6 +122,8 @@ ORDER_FILL_WAIT_SEC = _env("ORDER_FILL_WAIT_SEC", 0.4, float)
 FILL_POLL_TRIES = _env("FILL_POLL_TRIES", 5, int)
 # 成交价偏离计划入场超过这个比例就平掉，不记账。
 MAX_FILL_SLIP_PCT = _env("MAX_FILL_SLIP_PCT", 0.001, float)
+# 新开仓用 post-only 挂在盘口。超过这个秒数还没成交就撤，不改市价去追。
+MAKER_ENTRY_TIMEOUT_SEC = _env("MAKER_ENTRY_TIMEOUT_SEC", 25.0, float)
 # 每隔这么多秒核对一次每个持仓是否仍有止损和止盈。0 = 只在开仓/接管时检查。
 PROTECT_AUDIT_SEC = _env("PROTECT_AUDIT_SEC", 30, int)
 

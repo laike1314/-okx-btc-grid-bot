@@ -232,6 +232,10 @@ class OkxClient:
     def get_order(self, inst_id, ord_id):
         return self.request("GET", "/api/v5/trade/order", {"instId": inst_id, "ordId": ord_id}, private=True)[0]
 
+    def cancel_order(self, inst_id, ord_id):
+        return self.request("POST", "/api/v5/trade/cancel-order",
+                            body={"instId": inst_id, "ordId": ord_id}, private=True)
+
     def close_position(self, inst_id, pos_side="net"):
         return self.request("POST", "/api/v5/trade/close-position",
                             body={"instId": inst_id, "mgnMode": config.TD_MODE, "posSide": pos_side,
@@ -416,6 +420,12 @@ class MockOkxClient:
         inst = body["instId"]
         t = self.ticker(inst)
         px = t["ask"] if body["side"] == "buy" else t["bid"]
+        maker = body.get("ordType") == "post_only"
+        if maker:
+            px = float(body["px"])
+            # 会吃单的价格直接拒，和交易所 post-only 一样。
+            if (body["side"] == "buy" and px >= t["ask"]) or (body["side"] == "sell" and px <= t["bid"]):
+                raise OkxError("51016", "post-only order would take")
         if body.get("ordType") == "ioc":
             lim = float(body["px"])
             if (body["side"] == "buy" and px > lim) or (body["side"] == "sell" and px < lim):
@@ -427,7 +437,7 @@ class MockOkxClient:
             self._close(inst, px, "IOC")
             return {"ordId": "mock-" + uuid.uuid4().hex[:8], "sCode": "0"}
         ct = self.instrument(inst)["ctVal"]
-        fee = px * qty * ct * self.TAKER
+        fee = px * qty * ct * (0.0002 if maker else self.TAKER)
         self.cash -= fee
         self.fills_fee[inst] = fee
         side = "long" if body["side"] == "buy" else "short"
@@ -446,6 +456,9 @@ class MockOkxClient:
         p = self.pos.get(inst_id)
         return {"state": "filled", "avgPx": str(p["avgPx"] if p else self._last(inst_id)),
                 "accFillSz": str(p["qty"] if p else 0)}
+
+    def cancel_order(self, inst_id, ord_id):
+        return {"ordId": ord_id, "sCode": "0"}
 
     def close_position(self, inst_id, pos_side="net"):
         if inst_id not in self.pos:

@@ -147,12 +147,13 @@ class RiskGate:
             return False, f"波动过猛 ATR {ap:.3%} > {config.MAX_ATR_PCT:.3%}"
         if ap < config.MIN_ATR_PCT:
             return False, f"波动太小 ATR {ap:.3%}，不够覆盖手续费"
-        taker = self.fees.taker
-        round_trip = 2 * taker + 2 * config.SLIPPAGE_BPS / 1e4      # 双边手续费 + 双边滑点
-        sl_pct = min(max(ap * config.ATR_SL_MULT, config.MIN_SL_PCT), config.MAX_SL_PCT)
+        from .position import planned_sl_pct, round_trip_cost_pct
+        round_trip = round_trip_cost_pct(self.fees.maker, self.fees.taker, spread_bps)
+        sl_pct, need = planned_sl_pct(ap, round_trip)
         tp_pct = sl_pct * config.RISK_REWARD
-        if tp_pct < round_trip * config.MIN_EDGE_FEE_MULT:
-            return False, f"止盈距离 {tp_pct:.3%} < 双边成本 {round_trip:.3%} x{config.MIN_EDGE_FEE_MULT}"
+        if tp_pct + 1e-12 < round_trip * config.MIN_EDGE_FEE_MULT:
+            return False, (f"最大止损 {config.MAX_SL_PCT:.2%} 仍盖不住来回成本 {round_trip:.3%}"
+                           f"×{config.MIN_EDGE_FEE_MULT:g}（需要 {need:.2%}）")
         if config.MAX_COST_TO_R > 0 and sl_pct > 0 and round_trip / sl_pct > config.MAX_COST_TO_R:
             return False, (f"双边成本 {round_trip:.3%} 占止损 {sl_pct:.3%} 的 "
                            f"{round_trip / sl_pct:.0%}，超过 {config.MAX_COST_TO_R:.0%}")
@@ -283,6 +284,12 @@ def offline_self_check():
         assert exit_bar_blocked(1000, 1000) is True
         assert exit_bar_blocked(1000, 2000) is False
         assert (0.0014 / 0.004) > 0.30
+        from .position import planned_sl_pct
+        sl, need = planned_sl_pct(0.001, 0.002)
+        assert need == 0.002 * config.MIN_EDGE_FEE_MULT / config.RISK_REWARD
+        assert abs(sl - min(config.MAX_SL_PCT, max(0.0025, config.MIN_SL_PCT, need))) < 1e-12
+        sl_cap, _ = planned_sl_pct(0.05, 0.0001)
+        assert sl_cap == config.MAX_SL_PCT
 
         import tempfile
         from agents.state import SharedState
