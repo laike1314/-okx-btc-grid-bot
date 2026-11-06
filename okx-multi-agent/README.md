@@ -219,7 +219,7 @@ python main.py --hours 6 --stop-after-flat  # 跑 6 小时，到时后等最后�
    - 成交量用 4H K 线，资金费用已有的 funding-rate
    这几个统计接口**不带** `x-simulated-trading` 头（带上之后持仓量名义会失真），并丢掉还没走完的那一根。价格在窗口内的波动超过 `SWING_OI_MAX_FLAT_ATR`（1 倍 ATR），或者持仓量没有增加，这条腿记 0。分数由持仓量变化（相对自身历史的 z，以及绝对涨幅）和成交量放大合成，封顶 1。
    **方向按这个顺序，用到第一个能定的：** 主动买卖失衡 ≥ 5% → 多空账户比偏离 1 超过 5%（账户偏多则做多，不反向）→ 残余价格漂移 → 资金费反向（正资金费做空）。
-4. **合成**。趋势市动量 0.7 / OI 0.3，震荡市动量 0.3 / OI 0.7。两条腿同向加 `SWING_AGREE_BONUS`（0.1），总分不超过 1。方向相反则本轮不做。入场要合成分 ≥ `SWING_ENTRY_THRESHOLD`（0.7）。哪条腿的加权贡献更大，出场就按哪个家族。
+4. **合成**。趋势市动量 0.7 / OI 0.3，震荡市动量 0.3 / OI 0.7。两条腿同向加 `SWING_AGREE_BONUS`（0.1），总分不超过 1。方向相反则本轮不做。入场要合成分 ≥ `SWING_ENTRY_THRESHOLD`（0.65）。哪条腿的加权贡献更大，出场就按哪个家族。
 
 ### 出场和费用
 
@@ -272,7 +272,7 @@ python main.py --hours 6 --stop-after-flat  # 跑 6 小时，到时后等最后�
 | `SWING_W_RANGE_MOM` / `SWING_W_RANGE_OI` | 0.3 / 0.7 | 震荡市权重 |
 | `SWING_AGREE_BONUS` | 0.1 | 同向加分 |
 | `SWING_MIN_LEG` | 0.15 | 低于此不算有方向 |
-| `SWING_ENTRY_THRESHOLD` | 0.7 | 入场阈值（0～1） |
+| `SWING_ENTRY_THRESHOLD` | 0.65 | 入场阈值（0～1） |
 | `SWING_EXIT_SCORE` | 0.35 | 最短持仓后，低于此视为信号消失 |
 | `SWING_MOM_TP_ATR` / `SWING_MOM_SL_ATR` / `SWING_MOM_TRAIL_ATR` | 1 / 1.5 / 1 | 动量出场 |
 | `SWING_MOM_MIN_HOLD_SEC` / `SWING_MOM_MAX_HOLD_SEC` | 43200 / 86400 | 12h / 24h |
@@ -295,7 +295,7 @@ python main.py --hours 6 --stop-after-flat  # 跑 6 小时，到时后等最后�
 
 - 两次作业之间，跟踪止损和账户止损不会更新；这段时间只靠交易所上已经挂着的止损和止盈。cron 若延迟，空档可能到数小时。
 - 状态文件丢了以后，开仓家族还能从订单标签恢复，开仓时间用持仓的 `cTime`，跟踪用的价格高点会从当前价重新计，起始权益和峰值会按当前权益重播种（停机状态也会丢，除非 `swing_halted` 还在）。
-- OI 接口失败的合约，这一轮 OI 腿记 0，通常达不到 0.7，等于不做。
+- OI 接口失败的合约，这一轮 OI 腿记 0，通常达不到 0.65，等于不做。
 - `decisions.jsonl` 会随运行变大。权益和成交看 `equity.csv` / `trades.csv` 即可。
 - 公开接口需要能访问 `www.okx.com`。本仓库没有可用的演示密钥时，只能做离线冒烟，不能对模拟盘下单。
 
