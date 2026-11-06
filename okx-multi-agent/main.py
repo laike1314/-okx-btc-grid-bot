@@ -66,16 +66,23 @@ def build(mock, data_dir):
 
 
 def _offline_self_checks():
-    """冒烟启动前跑纯本地断言：交易池筛选、仓位上限、全持仓监控。不联网。"""
+    """冒烟启动前跑纯本地断言。剥头皮断言固定在 scalp 下跑，避免 STRATEGY=swing_combo 串味。"""
     from agents.risk import offline_self_check as risk_check
     from agents.net_tp import offline_self_check as mon_check
     from agents.executor import offline_self_check as exec_check
     from agents.equity import offline_self_check as eq_check
-    universe.offline_self_check()
-    risk_check()
-    mon_check()
-    exec_check()
-    eq_check()
+    from agents.swing import offline_self_check as swing_check
+    saved = config.STRATEGY
+    config.STRATEGY = "scalp"
+    try:
+        universe.offline_self_check()
+        risk_check()
+        mon_check()
+        exec_check()
+        eq_check()
+    finally:
+        config.STRATEGY = saved
+    swing_check()
 
 
 def monitor_positions(a):
@@ -96,6 +103,8 @@ def monitor_positions(a):
 
 
 def _can_open(a, positions):
+    if config.is_swing():
+        return _can_open_swing(a, positions)
     j = a["journal"]
     try:
         equity = a["client"].equity()
@@ -108,6 +117,26 @@ def _can_open(a, positions):
         return False
     if position_cap_reached(len(positions)):
         j.log("risk", "full", f"持仓 {len(positions)}/{config.MAX_POSITIONS}，本轮只监控不开仓")
+        return False
+    return True
+
+
+def _can_open_swing(a, positions):
+    """只数本策略账本里的仓。剥头皮那套 2% 日亏和无限持仓个数在这里不生效。"""
+    from agents.swing import our_position_count
+    j = a["journal"]
+    try:
+        equity = a["client"].equity()
+    except Exception as e:
+        j.log("risk", "equity_error", f"读取权益失败，本轮不开仓: {e}")
+        return False
+    block = a["risk"].global_block(equity)
+    if block:
+        j.log("risk", "blocked", f"暂停开仓：{block}")
+        return False
+    ours = our_position_count(positions, a["state"].d.get("open_meta") or {})
+    if config.SWING_MAX_POSITIONS > 0 and ours >= config.SWING_MAX_POSITIONS:
+        j.log("risk", "full", f"波段持仓 {ours}/{config.SWING_MAX_POSITIONS}，本轮只监控不开仓")
         return False
     return True
 
@@ -126,6 +155,9 @@ def _maybe_refresh_universe(a, data_dir):
 
 
 def scan_and_trade(a):
+    if config.is_swing():
+        from agents.swing import run_cycle
+        return run_cycle(a, monitor_positions, _can_open)
     c, j = a["client"], a["journal"]
     positions = monitor_positions(a)   # 先结算刚平掉的仓，避免同币立刻重开时漏记
     if not _can_open(a, positions):
@@ -180,11 +212,18 @@ def _start_line():
     else:
         pool = (f"交易池 {len(config.SYMBOLS)} 个（加密 {len(meta.get('crypto') or [])}"
                 f" + 股票永续 {len(meta.get('stocks') or [])}，{source}）")
-    return (f"多代理系统 {config.VERSION} 启动，{pool}，"
+    if config.is_swing():
+        return (f"多代理系统 {config.VERSION} 启动，策略 swing_combo，{pool}，"
+                f"杠杆 {config.SWING_LEVERAGE}x，同时持仓 {config.SWING_MAX_POSITIONS}，"
+                f"每笔约权益 {config.SWING_ALLOC_PCT:.0%}/{config.SWING_MAX_POSITIONS}")
+    return (f"多代理系统 {config.VERSION} 启动，策略 scalp，{pool}，"
             f"杠杆 {config.LEVERAGE}x，同时持仓 {cap}，单笔风险 {config.RISK_PER_TRADE_PCT:.2%}")
 
 
 def run(args):
+    if config.STRATEGY not in ("scalp", "swing_combo"):
+        print(f"❌ 未知 STRATEGY={config.STRATEGY}，只支持 scalp 或 swing_combo")
+        sys.exit(2)
     if args.smoke:
         _offline_self_checks()
     a = build(args.smoke, args.data_dir)
@@ -201,6 +240,9 @@ def run(args):
             sys.exit(3)
     a["fees"].refresh(force=True)
     a["executor"].init_mode()
+    if config.is_swing():
+        from agents.swing import reconcile
+        reconcile(c, a["state"], j, a["executor"])
     a["equity"].snapshot()
 
     if args.once:
@@ -222,12 +264,18 @@ def run(args):
             c.step()                                   # Mock：推进一根 K 线；真实客户端无操作
             a["fees"].refresh()
             expired = deadline and time.time() >= deadline
+            scan_every = config.SWING_SCAN_INTERVAL_SEC if config.is_swing() else config.SCAN_INTERVAL_SEC
             if expired:
                 monitor_positions(a)
-                if not args.stop_after_flat or not c.positions():
-                    j.log("main", "stop", "到达运行时长" + ("，且已无持仓" if args.stop_after_flat else ""))
+                # 波段持仓要活过单次 Actions 作业，到点就退出，不在这里等平仓。
+                wait_flat = args.stop_after_flat and not config.is_swing()
+                if not wait_flat or not c.positions():
+                    if config.is_swing():
+                        j.log("main", "stop", "到达运行时长，波段持仓保留在交易所（止损止盈仍挂着）")
+                    else:
+                        j.log("main", "stop", "到达运行时长" + ("，且已无持仓" if args.stop_after_flat else ""))
                     break
-            elif args.smoke or time.time() - last_scan >= config.SCAN_INTERVAL_SEC:
+            elif args.smoke or time.time() - last_scan >= scan_every:
                 last_scan = time.time()
                 _maybe_refresh_universe(a, args.data_dir)
                 scan_and_trade(a)
@@ -237,7 +285,8 @@ def run(args):
             j.log("main", "loop_error", f"本轮异常（继续运行）: {type(e).__name__}: {e}")
             time.sleep(0 if args.smoke else 5)
         if not args.smoke:
-            time.sleep(config.MONITOR_INTERVAL_SEC)
+            pause = config.SWING_MONITOR_INTERVAL_SEC if config.is_swing() else config.MONITOR_INTERVAL_SEC
+            time.sleep(pause)
 
     a["equity"].sync(c.positions())
     stats = a["equity"]._write_stats(c.equity())

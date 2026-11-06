@@ -64,7 +64,16 @@ class Executor:
         t = self.c.ticker(inst)
         px = t["ask"] if d == "long" else t["bid"]
         sig = float(plan.get("signal_px") or plan.get("entry_ref") or 0)
-        if chase_blocked(d, sig, t["bid"], t["ask"], config.CHASE_LIMIT_PCT):
+        if config.is_swing():
+            atr_px = float(plan.get("atr") or 0)
+            if atr_px > 0 and sig > 0 and config.SWING_CHASE_ATR > 0:
+                room = config.SWING_CHASE_ATR * atr_px
+                chased = (d == "long" and px > sig + room) or (d == "short" and px < sig - room)
+                if chased:
+                    self.j.log(AGENT, "no_chase", f"{inst} 下单前价格已偏离信号 {sig} 超过 "
+                               f"{config.SWING_CHASE_ATR:g} ATR，不追", inst=inst)
+                    return None
+        elif chase_blocked(d, sig, t["bid"], t["ask"], config.CHASE_LIMIT_PCT):
             self.j.log(AGENT, "no_chase", f"{inst} 下单前价格已偏离信号 {sig} 超过 "
                        f"{config.CHASE_LIMIT_PCT:.2%}，不追", inst=inst)
             return None
@@ -78,6 +87,8 @@ class Executor:
                 "px": fmt_num(limit, spec["tickSz"]), "sz": fmt_num(plan["qty"], spec["lotSz"]),
                 "attachAlgoOrds": [{"slTriggerPx": str(plan["sl"]), "slOrdPx": "-1", "slTriggerPxType": "mark",
                                     "tpTriggerPx": str(plan["tp"]), "tpOrdPx": "-1", "tpTriggerPxType": "last"}]}
+        if plan.get("tag"):
+            body["tag"] = str(plan["tag"])[:16]
         try:
             r = self.c.place_order(body)
         except OkxError as e:
@@ -189,8 +200,10 @@ class Executor:
             self.j.log(AGENT, "bracket_fail", f"{inst} 重挂止盈止损失败: {e}", inst=inst, code=e.code)
             return False
 
-    def protect_adopted(self, p):
+    def protect_adopted(self, p, meta=None):
         """接管或孤儿仓：一定补上止损和止盈。止损放不进正确一侧就市价平掉。"""
+        if config.is_swing():
+            return self._protect_swing(p, meta or {})
         inst, side = p["instId"], p.get("side") or "long"
         entry = float(p.get("avgPx") or 0) or float(p.get("markPx") or 0)
         mark = float(p.get("markPx") or 0) or self._mark(inst, entry)
@@ -220,6 +233,70 @@ class Executor:
         self.j.log(AGENT, "adopt_protect", f"{inst} 接管仓已挂 SL {sl} TP {tp}", inst=inst, sl=sl, tp=tp)
         return sl, tp
 
+    def _protect_swing(self, p, meta):
+        """波段接管：交易所已经有有效止损和止盈就沿用，不改成剥头皮的窄止损。缺了再按家族 ATR 补。"""
+        from .swing import profile_for, candle_features
+        inst, side = p["instId"], p.get("side") or meta.get("direction") or "long"
+        entry = float(p.get("avgPx") or 0) or float(meta.get("entry") or 0) or float(p.get("markPx") or 0)
+        mark = float(p.get("markPx") or 0) or self._mark(inst, entry)
+        if entry <= 0 or mark <= 0:
+            self.j.log(AGENT, "adopt_flat", f"{inst} 没有有效均价，无法保护，市价平", inst=inst)
+            self.close(p, "接管仓缺少价格")
+            return None
+        try:
+            algos = self.c.pending_algos(inst)
+        except Exception:
+            algos = []
+        sl = tp = None
+        for algo in algos:
+            if _algo_set(algo, "slTriggerPx"):
+                sl = float(algo.get("slTriggerPx"))
+            if _algo_set(algo, "tpTriggerPx"):
+                tp = float(algo.get("tpTriggerPx"))
+        if sl and tp and stop_is_valid(side, sl, mark):
+            self.j.log(AGENT, "adopt_protect", f"{inst} 沿用交易所 SL {sl} TP {tp}", inst=inst, sl=sl, tp=tp)
+            if meta is not None:
+                meta["sl"], meta["tp"] = sl, tp
+            return sl, tp
+        prof = profile_for(meta.get("family") or "unknown")
+        atr_px = float(meta.get("atr") or 0)
+        try:
+            bars = self.c.candles(inst, config.SWING_REGIME_BAR, 120)
+            feat = candle_features(bars)
+        except Exception as e:
+            feat = None
+            self.j.log(AGENT, "adopt_atr_err", f"{inst} 补保护单时 K 线失败: {e}", inst=inst)
+        if feat:
+            atr_px = float(feat["atr"])
+            if meta is not None:
+                meta["atr"] = atr_px
+                meta["atr_pct"] = feat["atr_pct"]
+        spec = self.c.instrument(inst)
+        if atr_px > 0 and entry > 0:
+            sl_pct = atr_px / entry * float(prof["sl_atr"])
+            tp_pct = atr_px / entry * float(prof["tp_atr"])
+        else:
+            sl_pct = max(config.MIN_SL_PCT, 0.01) * float(prof["sl_atr"])
+            tp_pct = max(config.MIN_SL_PCT, 0.01) * float(prof["tp_atr"])
+        sl, tp = bracket_from_fill(side, entry, sl_pct, tp_pct, spec["tickSz"])
+        if not stop_is_valid(side, sl, mark):
+            buf = max(float(spec["tickSz"]) * 2, mark * 0.002)
+            sl = round_px(mark - buf if side == "long" else mark + buf, spec["tickSz"],
+                          "down" if side == "long" else "up")
+        if side == "long" and tp <= mark:
+            tp = round_px(mark * (1 + tp_pct), spec["tickSz"], "up")
+        if side == "short" and tp >= mark:
+            tp = round_px(mark * (1 - tp_pct), spec["tickSz"], "down")
+        if not stop_is_valid(side, sl, mark):
+            self.j.log(AGENT, "adopt_bad_stop", f"{inst} 接管止损 {sl} 相对标记价 {mark} 无效，市价平",
+                       inst=inst, sl=sl, mark=mark)
+            self.close(p, "接管后无法挂出有效止损")
+            return None
+        self._replace_bracket(inst, side, sl, tp)
+        self.ensure_stop(inst, side, sl, tp)
+        self.j.log(AGENT, "adopt_protect", f"{inst} 波段接管已挂 SL {sl} TP {tp}", inst=inst, sl=sl, tp=tp)
+        return sl, tp
+
     def audit_bracket(self, p, meta=None):
         """每个持仓都要同时有止损和止盈。缺了就按记录重挂，挂不出有效止损就平仓。"""
         inst = p["instId"]
@@ -241,7 +318,7 @@ class Executor:
             self._replace_bracket(inst, side, sl, tp)
             self.ensure_stop(inst, side, sl, tp)
             return True
-        protected = self.protect_adopted(p)
+        protected = self.protect_adopted(p, meta)
         return "closed" if protected is None else protected
 
     def ensure_stop(self, inst, d, sl, tp=None):

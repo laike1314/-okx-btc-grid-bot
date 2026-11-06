@@ -52,7 +52,14 @@ BASE_URL = _env("OKX_BASE_URL", "https://www.okx.com")
 # 模拟盘开关：固定为 "1"。本项目只允许模拟盘，main.py 启动时会再检查一次。
 SIMULATED_TRADING = "1"
 
-VERSION = "MA-1.2.2"
+VERSION = "MA-2.0"
+
+# scalp = MA-1.2.2 快进快出（默认，行为不变）。swing_combo = 动量 + OI 脉冲波段。
+STRATEGY = str(_env("STRATEGY", "scalp")).strip().lower()
+
+
+def is_swing():
+    return STRATEGY == "swing_combo"
 
 # ---------------- 交易池 ----------------
 # SYMBOLS 非空 = 调试强制列表，跳过市值排名和股票发现。不设则启动时自动组建。
@@ -147,6 +154,61 @@ SCAN_INTERVAL_SEC = _env("SCAN_INTERVAL_SEC", 20, int)    # 扫描/开仓频率
 MONITOR_INTERVAL_SEC = _env("MONITOR_INTERVAL_SEC", 2, int)  # 持仓净利监控频率
 RUN_HOURS = _env("RUN_HOURS", 0.0, float)                 # 0 = 一直跑
 STOP_AFTER_FLAT = _env("STOP_AFTER_FLAT", False, bool)    # 到时后等最后一笔平仓再退出
+
+# ---------------- Swing 波段（仅 STRATEGY=swing_combo 时读取）----------------
+# 4H 体制：ADX 达到阈值，或价格偏离 MA 达到若干倍 ATR，判为 trend，否则 range。
+SWING_REGIME_BAR = _env("SWING_REGIME_BAR", "4H")
+SWING_REGIME_ADX = _env("SWING_REGIME_ADX", 25.0, float)
+SWING_REGIME_ATR_DIST = _env("SWING_REGIME_ATR_DIST", 1.5, float)
+SWING_MA_PERIOD = _env("SWING_MA_PERIOD", 20, int)
+SWING_ATR_PERIOD = _env("SWING_ATR_PERIOD", 14, int)
+SWING_ADX_PERIOD = _env("SWING_ADX_PERIOD", 14, int)
+# 动量：最近 N 根体制 K 线的收益 / ATR%，再在交易池里做截面排名。
+SWING_MOM_LOOKBACK = _env("SWING_MOM_LOOKBACK", 6, int)
+# OI 脉冲：同一窗口上的持仓量变化 + 成交量。价格偏离超过这么多倍 ATR 就不算「价格没动」。
+SWING_OI_LOOKBACK = _env("SWING_OI_LOOKBACK", 6, int)
+SWING_OI_PERIOD = _env("SWING_OI_PERIOD", "4H")
+SWING_OI_HIST_LIMIT = _env("SWING_OI_HIST_LIMIT", 30, int)
+SWING_OI_MAX_FLAT_ATR = _env("SWING_OI_MAX_FLAT_ATR", 1.0, float)
+# 方向：主动买卖失衡超过这个比例才采纳；否则看多空比偏离、残余漂移、最后反向资金费。
+SWING_TAKER_IMB_MIN = _env("SWING_TAKER_IMB_MIN", 0.05, float)
+SWING_LS_TILT = _env("SWING_LS_TILT", 0.05, float)
+SWING_FUNDING_FADE = _env("SWING_FUNDING_FADE", 0.00005, float)
+# 组合：趋势市偏动量，震荡市偏 OI。两条腿同向加分；方向相反则本轮不做。
+SWING_W_TREND_MOM = _env("SWING_W_TREND_MOM", 0.7, float)
+SWING_W_TREND_OI = _env("SWING_W_TREND_OI", 0.3, float)
+SWING_W_RANGE_MOM = _env("SWING_W_RANGE_MOM", 0.3, float)
+SWING_W_RANGE_OI = _env("SWING_W_RANGE_OI", 0.7, float)
+SWING_AGREE_BONUS = _env("SWING_AGREE_BONUS", 0.1, float)
+SWING_MIN_LEG = _env("SWING_MIN_LEG", 0.15, float)          # 低于此不算「有方向」
+SWING_ENTRY_THRESHOLD = _env("SWING_ENTRY_THRESHOLD", 0.8, float)
+SWING_EXIT_SCORE = _env("SWING_EXIT_SCORE", 0.35, float)    # 最短持仓之后，持仓方向得分低于此就走
+# 出场。倍数都是 ATR。OI 止盈默认 1.75，落在 1.5～2 之间。
+SWING_MOM_TP_ATR = _env("SWING_MOM_TP_ATR", 1.0, float)
+SWING_MOM_SL_ATR = _env("SWING_MOM_SL_ATR", 1.5, float)
+SWING_MOM_TRAIL_ATR = _env("SWING_MOM_TRAIL_ATR", 1.0, float)
+SWING_MOM_MIN_HOLD_SEC = _env("SWING_MOM_MIN_HOLD_SEC", 12 * 3600, int)
+SWING_MOM_MAX_HOLD_SEC = _env("SWING_MOM_MAX_HOLD_SEC", 24 * 3600, int)
+SWING_OI_TP_ATR = _env("SWING_OI_TP_ATR", 1.75, float)
+SWING_OI_SL_ATR = _env("SWING_OI_SL_ATR", 1.2, float)
+SWING_OI_MIN_HOLD_SEC = _env("SWING_OI_MIN_HOLD_SEC", 24 * 3600, int)
+SWING_OI_MAX_HOLD_SEC = _env("SWING_OI_MAX_HOLD_SEC", 48 * 3600, int)
+# 预期止盈距离至少是来回成本的这么多倍，否则不做。
+SWING_MIN_EDGE_FEE_MULT = _env("SWING_MIN_EDGE_FEE_MULT", 3.0, float)
+# 共享风控。每笔名义 ≈ 权益 × ALLOC / MAX_POSITIONS（默认约 1/4）。
+SWING_MAX_POSITIONS = _env("SWING_MAX_POSITIONS", 4, int)
+SWING_MAX_PER_FAMILY = _env("SWING_MAX_PER_FAMILY", 3, int)
+SWING_LEVERAGE = _env("SWING_LEVERAGE", 1, int)
+SWING_ALLOC_PCT = _env("SWING_ALLOC_PCT", 1.0, float)
+SWING_COOLDOWN_SEC = _env("SWING_COOLDOWN_SEC", 8 * 3600, int)
+SWING_ACCOUNT_STOP_PCT = _env("SWING_ACCOUNT_STOP_PCT", 0.20, float)  # 较起始权益，触发后停机并平掉本策略仓
+SWING_PEAK_DD_PCT = _env("SWING_PEAK_DD_PCT", 0.10, float)            # 较峰值，只停开新仓
+SWING_RESET_HALT = _env("SWING_RESET_HALT", False, bool)              # 1 = 本轮清除停机并重设起点
+# 4H 信号不需要几秒扫一次。监控间隔只为了跟踪止损和到期，交易所止损在两次运行之间仍然有效。
+SWING_SCAN_INTERVAL_SEC = _env("SWING_SCAN_INTERVAL_SEC", 900, int)
+SWING_MONITOR_INTERVAL_SEC = _env("SWING_MONITOR_INTERVAL_SEC", 60, int)
+SWING_CHASE_ATR = _env("SWING_CHASE_ATR", 1.0, float)       # 现价相对信号收盘已顺着方向跑超过这么多 ATR 就不追
+SWING_RUBIK_GAP_SEC = _env("SWING_RUBIK_GAP_SEC", 0.45, float)
 
 # ---------------- 文件 ----------------
 DATA_DIR = _env("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))

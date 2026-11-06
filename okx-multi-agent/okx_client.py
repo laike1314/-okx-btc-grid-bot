@@ -60,6 +60,7 @@ class OkxClient:
         self.s = requests.Session()
         self._inst_cache = {}
         self._next_get_at = 0.0
+        self._next_rubik_at = 0.0
 
     def _pace_get(self):
         """公开/私有 GET 之间留一点间隔，持仓多、交易池大时不把 OKX 限速打满。"""
@@ -72,12 +73,23 @@ class OkxClient:
             time.sleep(wait)
         self._next_get_at = time.monotonic() + gap
 
+    def _pace_rubik(self):
+        """Rubik 统计接口比行情更紧，单独再留一段间隔。"""
+        gap = float(getattr(config, "SWING_RUBIK_GAP_SEC", 0.45) or 0)
+        if gap <= 0:
+            return
+        now = time.monotonic()
+        wait = self._next_rubik_at - now
+        if wait > 0:
+            time.sleep(wait)
+        self._next_rubik_at = time.monotonic() + gap
+
     # ---------- 底层 ----------
     def _sign(self, ts, method, path, body):
         mac = hmac.new(self.secret.encode(), (ts + method + path + body).encode(), hashlib.sha256)
         return base64.b64encode(mac.digest()).decode()
 
-    def request(self, method, path, params=None, body=None, private=False, retries=4):
+    def request(self, method, path, params=None, body=None, private=False, retries=4, simulated=True):
         method = method.upper()
         q = {k: v for k, v in (params or {}).items() if v not in (None, "")}
         req_path = path + ("?" + urlencode(q) if q else "")
@@ -86,7 +98,11 @@ class OkxClient:
         for attempt in range(1, retries + 1):
             if method == "GET":
                 self._pace_get()
-            headers = {"Content-Type": "application/json", "x-simulated-trading": config.SIMULATED_TRADING}
+            headers = {"Content-Type": "application/json", "Accept": "application/json",
+                       "User-Agent": f"okx-multi-agent/{config.VERSION}"}
+            # 公开统计（持仓量、主动成交）带上模拟盘头会拿到另一套数字。行情和交易仍始终走模拟盘。
+            if simulated:
+                headers["x-simulated-trading"] = config.SIMULATED_TRADING
             if private:
                 ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
                 headers.update({
@@ -163,6 +179,89 @@ class OkxClient:
     def funding_rate(self, inst_id):
         r = self.request("GET", "/api/v5/public/funding-rate", {"instId": inst_id})[0]
         return _f(r.get("fundingRate"))
+
+    def _rubik(self, path, params):
+        self._pace_rubik()
+        # 不带 x-simulated-trading。带上之后 open-interest-history 的名义规模会失真。
+        return self.request("GET", path, params, simulated=False)
+
+    @staticmethod
+    def _drop_open_bucket(rows, period):
+        """Rubik 的最后一根往往是未收盘桶。公开接口上这一根的主动买量可能是 0。"""
+        if len(rows) < 2:
+            return rows
+        span = {"5m": 300, "15m": 900, "30m": 1800, "1H": 3600, "2H": 7200, "4H": 14400,
+                "6H": 21600, "12H": 43200, "1D": 86400}.get(str(period), 0)
+        if span <= 0:
+            return rows
+        if int(rows[-1].get("ts") or 0) > int(time.time() * 1000) - span * 1000:
+            return rows[:-1]
+        return rows
+
+    def open_interest(self, inst_id):
+        rows = self.request("GET", "/api/v5/public/open-interest",
+                            {"instType": "SWAP", "instId": inst_id}, simulated=False)
+        if not rows:
+            return {"oi": 0.0, "oiUsd": 0.0, "ts": 0}
+        r = rows[0]
+        return {"oi": _f(r.get("oi")), "oiUsd": _f(r.get("oiUsd")), "ts": int(float(r.get("ts") or 0))}
+
+    def open_interest_history(self, inst_id, period="4H", limit=30):
+        """[ts, oi, oiCcy, oiUsd]，返回按时间从旧到新。"""
+        rows = self._rubik("/api/v5/rubik/stat/contracts/open-interest-history",
+                           {"instId": inst_id, "period": period, "limit": str(limit)})
+        out = []
+        for r in rows or []:
+            if not isinstance(r, (list, tuple)) or len(r) < 2:
+                continue
+            out.append({"ts": int(float(r[0])), "oi": _f(r[1]),
+                        "oiCcy": _f(r[2]) if len(r) > 2 else 0.0,
+                        "oiUsd": _f(r[3]) if len(r) > 3 else 0.0})
+        out.sort(key=lambda x: x["ts"])
+        return self._drop_open_bucket(out, period)
+
+    def taker_volume(self, inst_id, period="4H", limit=30):
+        """taker-volume-contract: [ts, sellVol, buyVol]，按时间从旧到新。"""
+        rows = self._rubik("/api/v5/rubik/stat/taker-volume-contract",
+                           {"instId": inst_id, "period": period, "unit": "1", "limit": str(limit)})
+        out = []
+        for r in rows or []:
+            if not isinstance(r, (list, tuple)) or len(r) < 3:
+                continue
+            out.append({"ts": int(float(r[0])), "sell": _f(r[1]), "buy": _f(r[2])})
+        out.sort(key=lambda x: x["ts"])
+        return self._drop_open_bucket(out, period)
+
+    def long_short_ratio(self, inst_id, period="4H", limit=10):
+        """long-short-account-ratio-contract: [ts, ratio]，按时间从旧到新。ratio>1 多头账户更多。"""
+        rows = self._rubik("/api/v5/rubik/stat/contracts/long-short-account-ratio-contract",
+                           {"instId": inst_id, "period": period, "limit": str(limit)})
+        out = []
+        for r in rows or []:
+            if not isinstance(r, (list, tuple)) or len(r) < 2:
+                continue
+            out.append({"ts": int(float(r[0])), "ratio": _f(r[1])})
+        out.sort(key=lambda x: x["ts"])
+        return self._drop_open_bucket(out, period)
+
+    def latest_fill_tag(self, inst_id):
+        rows = self.request("GET", "/api/v5/trade/fills-history",
+                            {"instType": "SWAP", "instId": inst_id, "limit": "30"}, private=True)
+        for r in rows or []:
+            tag = str(r.get("tag") or "").strip()
+            if tag:
+                return tag
+        return ""
+
+    def recent_closed(self, limit=100):
+        rows = self.request("GET", "/api/v5/account/positions-history",
+                            {"instType": "SWAP", "limit": str(limit)}, private=True)
+        out = []
+        for r in rows or []:
+            out.append({"instId": r.get("instId"), "uTime": int(float(r.get("uTime") or 0)),
+                        "realizedPnl": _f(r.get("realizedPnl")),
+                        "direction": r.get("direction") or r.get("posSide")})
+        return out
 
     # ---------- 账户 ----------
     def pos_mode(self):
@@ -366,6 +465,41 @@ class MockOkxClient:
     def funding_rate(self, inst_id):
         return 0.0001
 
+    def open_interest(self, inst_id):
+        hist = self.open_interest_history(inst_id, "4H", 1)
+        return hist[-1] if hist else {"oi": 0.0, "oiUsd": 0.0, "ts": 0}
+
+    def open_interest_history(self, inst_id, period="4H", limit=30):
+        bars = self.candles(inst_id, period, limit)
+        out, oi = [], 1_000_000.0
+        for b in bars:
+            oi *= 1.0 + min(0.05, max(-0.05, (b["vol"] - 1000) / 20000))
+            out.append({"ts": b["ts"], "oi": oi, "oiCcy": oi / max(b["c"], 1), "oiUsd": oi})
+        return out
+
+    def taker_volume(self, inst_id, period="4H", limit=30):
+        bars = self.candles(inst_id, period, limit)
+        out = []
+        for b in bars:
+            buy_frac = 0.62 if b["c"] >= b["o"] else 0.38
+            out.append({"ts": b["ts"], "sell": b["vol"] * (1 - buy_frac), "buy": b["vol"] * buy_frac})
+        return out
+
+    def long_short_ratio(self, inst_id, period="4H", limit=10):
+        bars = self.candles(inst_id, period, limit)
+        return [{"ts": b["ts"], "ratio": 1.15 if b["c"] >= b["o"] else 0.85} for b in bars]
+
+    def latest_fill_tag(self, inst_id):
+        p = self.pos.get(inst_id) or {}
+        tag = p.get("tag") or (self.history.get(inst_id) or {}).get("tag") or ""
+        return str(tag)
+
+    def recent_closed(self, limit=100):
+        rows = [{"instId": inst, "uTime": h.get("uTime") or 0, "realizedPnl": h.get("realizedPnl"),
+                 "direction": h.get("direction")} for inst, h in self.history.items()]
+        rows.sort(key=lambda r: r["uTime"], reverse=True)
+        return rows[:limit]
+
     # ---------- 账户 ----------
     def pos_mode(self):
         return "net_mode"
@@ -414,7 +548,8 @@ class MockOkxClient:
         self.cash += pnl - fee_out
         self.history[inst] = {"realizedPnl": pnl - fee_in - fee_out, "pnl": pnl, "fee": -(fee_in + fee_out),
                               "fundingFee": 0.0, "openAvgPx": p["avgPx"], "closeAvgPx": px,
-                              "uTime": self.now_ms, "why": why}
+                              "uTime": self.now_ms, "why": why, "tag": p.get("tag") or "",
+                              "direction": p.get("side")}
 
     def place_order(self, body):
         inst = body["instId"]
@@ -442,7 +577,8 @@ class MockOkxClient:
         self.fills_fee[inst] = fee
         side = "long" if body["side"] == "buy" else "short"
         self.pos[inst] = {"instId": inst, "side": side, "posSide": "net", "qty": qty, "avgPx": px,
-                          "ctVal": ct, "lever": float(getattr(self, "lever", 5)), "cTime": self.now_ms}
+                          "ctVal": ct, "lever": float(getattr(self, "lever", 5)), "cTime": self.now_ms,
+                          "tag": body.get("tag") or ""}
         algo = None
         for a in body.get("attachAlgoOrds", []):
             algo = {"algoId": "algo-" + uuid.uuid4().hex[:8],

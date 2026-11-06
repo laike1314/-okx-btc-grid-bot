@@ -59,6 +59,8 @@ class PositionManager:
         self.c, self.j, self.fees = client, journal, fees
 
     def plan(self, cand, equity):
+        if config.is_swing():
+            return self._plan_swing(cand, equity)
         inst = cand["instId"]
         spec = self.c.instrument(inst)
         lever = int(min(config.LEVERAGE, config.MAX_LEVERAGE, spec["maxLever"]))
@@ -99,4 +101,45 @@ class PositionManager:
         self.j.log(AGENT, "plan", f"{inst} {cand['direction']} {plan['qty']}张 名义 {notional:.1f}U "
                    f"保证金 {plan['margin']:.1f}U {lever}x 止损 {sl}({sl_pct:.2%}) 止盈 {tp}({tp_pct:.2%}) "
                    f"最大亏损≈{plan['risk_usdt']:.2f}U", **plan)
+        return plan
+
+    def _plan_swing(self, cand, equity):
+        """每笔名义约等于分配权益的 1/N，止损止盈按入场家族的 ATR 倍数。"""
+        from .swing import profile_for, size_qty, fee_allows
+        inst = cand["instId"]
+        spec = self.c.instrument(inst)
+        lever = int(min(max(1, int(config.SWING_LEVERAGE)), config.MAX_LEVERAGE, spec["maxLever"]))
+        entry = cand["bid"] if cand["direction"] == "long" else cand["ask"]
+        prof = profile_for(cand.get("family") or "oi")
+        atr_pct = float(cand.get("atr_pct") or 0)
+        sl_pct = atr_pct * float(prof["sl_atr"])
+        tp_pct = atr_pct * float(prof["tp_atr"])
+        rt = round_trip_cost_pct(self.fees.maker, self.fees.taker, cand.get("spread_bps") or 0)
+        if atr_pct <= 0 or not fee_allows(tp_pct, rt):
+            self.j.log(AGENT, "cost_too_wide",
+                       f"{inst} 止盈 {tp_pct:.3%} 不够来回成本 {rt:.3%}×{config.SWING_MIN_EDGE_FEE_MULT:g}，放弃",
+                       inst=inst)
+            return None
+        qty = size_qty(equity, entry, spec["ctVal"], spec["lotSz"], spec["minSz"])
+        if not qty:
+            self.j.log(AGENT, "too_small", f"{inst} 按权益 1/{config.SWING_MAX_POSITIONS} 算不出最小张数，放弃",
+                       inst=inst)
+            return None
+        sl, tp = bracket_from_fill(cand["direction"], entry, sl_pct, tp_pct, spec["tickSz"])
+        per = entry * spec["ctVal"]
+        notional = qty * per
+        plan = {"instId": inst, "direction": cand["direction"], "qty": float(fmt_num(qty, spec["lotSz"])),
+                "lever": lever, "entry_ref": entry, "sl": sl, "tp": tp, "sl_pct": sl_pct, "tp_pct": tp_pct,
+                "notional": notional, "margin": notional / lever,
+                "risk_usdt": notional * sl_pct, "score": cand.get("combined", cand.get("score")),
+                "signal_px": cand.get("price"), "atr": cand.get("atr"), "atr_pct": atr_pct,
+                "family": prof["family"] if prof["family"] in ("momentum", "oi") else cand.get("family"),
+                "regime": cand.get("regime"), "mom_score": cand.get("mom_score"),
+                "oi_score": cand.get("oi_score"), "combined": cand.get("combined"),
+                "min_hold_sec": prof["min_hold"], "max_hold_sec": prof["max_hold"],
+                "tag": cand.get("tag") or prof["tag"]}
+        self.j.log(AGENT, "plan",
+                   f"{inst} {cand['direction']} {plan['family']} {plan['qty']}张 名义 {notional:.1f}U "
+                   f"{lever}x 止损 {sl}({sl_pct:.2%}) 止盈 {tp}({tp_pct:.2%})", inst=inst, **{
+                       k: plan[k] for k in ("qty", "lever", "sl", "tp", "family", "combined", "notional")})
         return plan
