@@ -181,7 +181,7 @@ SWING_W_RANGE_MOM = _env("SWING_W_RANGE_MOM", 0.3, float)
 SWING_W_RANGE_OI = _env("SWING_W_RANGE_OI", 0.7, float)
 SWING_AGREE_BONUS = _env("SWING_AGREE_BONUS", 0.1, float)
 SWING_MIN_LEG = _env("SWING_MIN_LEG", 0.15, float)          # 低于此不算「有方向」
-SWING_ENTRY_THRESHOLD = _env("SWING_ENTRY_THRESHOLD", 0.7, float)
+SWING_ENTRY_THRESHOLD = _env("SWING_ENTRY_THRESHOLD", 0.65, float)
 SWING_EXIT_SCORE = _env("SWING_EXIT_SCORE", 0.35, float)    # 最短持仓之后，持仓方向得分低于此就走
 # 出场。倍数都是 ATR。OI 止盈默认 1.75，落在 1.5～2 之间。
 SWING_MOM_TP_ATR = _env("SWING_MOM_TP_ATR", 1.0, float)
