@@ -1,8 +1,8 @@
 {
-  "run_id": "42215536950",
+  "run_id": "42221951154",
   "run_attempt": "1",
   "sha": "dde60058c6d08f22196f3c4e94d6b7595d0bd830",
   "ref": "refs/heads/main",
-  "event": "workflow_dispatch",
-  "recorded_at": "2026-11-06T17:40:53Z"
+  "event": "schedule",
+  "recorded_at": "2026-11-06T23:11:34Z"
 }
