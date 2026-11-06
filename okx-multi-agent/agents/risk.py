@@ -85,6 +85,8 @@ class RiskGate:
 
     def global_block(self, equity):
         """不针对具体币种的闸门。返回拒绝原因或 None。"""
+        if config.is_swing():
+            return self._swing_global_block(equity)
         hit, pnl, ref = self.s.loss_cap_hit(equity)
         if hit:
             hours = config.ROLLING_LOSS_WINDOW_SEC / 3600
@@ -96,7 +98,37 @@ class RiskGate:
             return f"连亏冷却中，还剩 {left}s"
         return None
 
+    def _swing_global_block(self, equity):
+        """波段：账户停机、较峰值回撤。不使用剥头皮的 2% 滚动亏损闸门。"""
+        from .swing import AGENT as SWING
+        if self.s.d.get("swing_halted"):
+            return (f"波段账户停机中（较起始权益回撤达到 {config.SWING_ACCOUNT_STOP_PCT:.0%}）。"
+                    f"确认要重新开始时设 SWING_RESET_HALT=1")
+        start = float(self.s.d.get("swing_start_equity") or 0)
+        if start <= 0:
+            self.s.d["swing_start_equity"] = equity
+            self.s.d["swing_peak_equity"] = equity
+            self.s.save()
+            return None
+        if equity <= start * (1 - float(config.SWING_ACCOUNT_STOP_PCT)):
+            self.s.d["swing_halted"] = True
+            self.s.save()
+            self.j.log(SWING, "account_stop",
+                       f"权益 {equity:.2f} 较起始 {start:.2f} 达到停机线")
+            return "波段账户止损已触发"
+        peak = float(self.s.d.get("swing_peak_equity") or 0)
+        if equity > peak:
+            peak = equity
+            self.s.d["swing_peak_equity"] = peak
+            self.s.save()
+        if peak > 0 and (peak - equity) / peak >= float(config.SWING_PEAK_DD_PCT):
+            dd = (peak - equity) / peak
+            return f"权益较峰值 {peak:.2f} 回撤 {dd:.1%}，暂停开新仓（不平已有仓）"
+        return None
+
     def check(self, cand, positions, equity):
+        if config.is_swing():
+            return self._check_swing(cand, positions, equity)
         inst = cand["instId"]
         g = self.global_block(equity)
         if g:
@@ -180,9 +212,78 @@ class RiskGate:
         cand["reentry_bar_ts"] = bar_ts
         return True, f"通过：点差 {spread_bps:.2f}bps 资金费 {fr:.4%} ATR {ap:.3%}"
 
+    def _check_swing(self, cand, positions, equity):
+        """波段闸门：个数、家族、冷却、点差/成交额/标记价、止盈要盖住来回成本。不用剥头皮的 1R/同向个数。"""
+        from .swing import family_counts, our_position_count, fee_allows, profile_for
+        from .position import round_trip_cost_pct
+        inst = cand["instId"]
+        g = self.global_block(equity)
+        if g:
+            return False, g
+        if any(p["instId"] == inst for p in positions):
+            return False, "该合约已有持仓"
+        ours = our_position_count(positions, self.s.d.get("open_meta") or {})
+        if config.SWING_MAX_POSITIONS > 0 and ours >= config.SWING_MAX_POSITIONS:
+            return False, f"波段持仓 {ours} 已达上限 {config.SWING_MAX_POSITIONS}"
+        if config.SWING_COOLDOWN_SEC > 0:
+            until = (self.s.d.get("symbol_cooldown") or {}).get(inst, 0)
+            if self.s.now() < float(until or 0):
+                return False, f"该合约冷却中，还剩 {int(float(until) - self.s.now())}s"
+        fam = cand.get("family")
+        counts = family_counts(positions, self.s.d.get("open_meta") or {})
+        if fam in ("momentum", "oi") and counts.get(fam, 0) >= config.SWING_MAX_PER_FAMILY:
+            return False, f"家族 {fam} 已有 {counts[fam]} 仓，上限 {config.SWING_MAX_PER_FAMILY}"
+        t = self.c.ticker(inst)
+        mid = (t["bid"] + t["ask"]) / 2
+        spread_bps = (t["ask"] - t["bid"]) / mid * 1e4 if mid else 1e9
+        if spread_bps > config.MAX_SPREAD_BPS:
+            return False, f"点差 {spread_bps:.2f}bps > {config.MAX_SPREAD_BPS}"
+        vol = float(t.get("vol_usdt_24h") or 0)
+        if config.MIN_VOL_USDT_24H > 0 and vol < config.MIN_VOL_USDT_24H:
+            return False, f"24h成交额 {vol:.0f}U < {config.MIN_VOL_USDT_24H:.0f}U"
+        try:
+            mark = float(self.c.mark_price(inst))
+            idx = float(self.c.index_price(inst))
+        except Exception as e:
+            return False, f"标记/指数价不可用: {e}"
+        if mark <= 0 or idx <= 0:
+            return False, "标记或指数价为空"
+        gap_bps = abs(mark - idx) / idx * 1e4
+        if gap_bps > config.MAX_MARK_INDEX_BPS:
+            return False, f"标记价偏离指数 {gap_bps:.1f}bps > {config.MAX_MARK_INDEX_BPS:.0f}"
+        fr = self.c.funding_rate(inst)
+        if abs(fr) > config.MAX_ABS_FUNDING_RATE:
+            return False, f"资金费率极端 {fr:.4%}"
+        atr_px = float(cand.get("atr") or 0)
+        sig = float(cand.get("price") or 0)
+        if atr_px > 0 and sig > 0 and config.SWING_CHASE_ATR > 0:
+            room = config.SWING_CHASE_ATR * atr_px
+            if cand["direction"] == "long" and t["ask"] > sig + room:
+                return False, f"不追价：卖一已高出信号收盘 {config.SWING_CHASE_ATR:g} ATR"
+            if cand["direction"] == "short" and t["bid"] < sig - room:
+                return False, f"不追价：买一已低于信号收盘 {config.SWING_CHASE_ATR:g} ATR"
+        prof = profile_for(fam or "oi")
+        tp_pct = float(cand.get("atr_pct") or 0) * float(prof["tp_atr"])
+        round_trip = round_trip_cost_pct(self.fees.maker, self.fees.taker, spread_bps)
+        if not fee_allows(tp_pct, round_trip):
+            return False, (f"止盈距离 {tp_pct:.3%} 盖不住来回成本 {round_trip:.3%}"
+                           f"×{config.SWING_MIN_EDGE_FEE_MULT:g}")
+        cand.update(spread_bps=spread_bps, funding=fr, bid=t["bid"], ask=t["ask"],
+                    tp_atr=prof["tp_atr"], sl_atr=prof["sl_atr"],
+                    min_hold_sec=prof["min_hold"], max_hold_sec=prof["max_hold"], tag=prof["tag"])
+        return True, (f"通过：{cand.get('regime')} {fam} 合成 {float(cand.get('combined') or 0):.2f} "
+                      f"点差 {spread_bps:.2f}bps 止盈 {tp_pct:.2%}")
+
     # ---- 平仓后由 equity 代理回调 ----
     def on_trade_closed(self, inst, net):
         self.s.add_daily_pnl(net)
+        if config.is_swing():
+            if config.SWING_COOLDOWN_SEC > 0:
+                self.s.d.setdefault("symbol_cooldown", {})[inst] = self.s.now() + config.SWING_COOLDOWN_SEC
+                self.j.log(AGENT, "symbol_cooldown",
+                           f"{inst} 已平仓，冷却 {config.SWING_COOLDOWN_SEC}s", inst=inst, net=net)
+            self.s.save()
+            return
         if net < 0:
             self.s.d["consecutive_losses"] += 1
             armed_global = self.s.d["consecutive_losses"] >= config.MAX_CONSECUTIVE_LOSSES

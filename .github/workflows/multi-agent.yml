@@ -20,19 +20,34 @@ on:
         required: false
         default: false
         type: boolean
+      strategy:
+        description: "scalp = 现有快进快出（默认）。swing_combo = 单次波段会话，持仓不会在退出时被平掉。长期跑请用工作流 OKX Swing Combo。"
+        required: false
+        default: scalp
+        type: choice
+        options:
+          - scalp
+          - swing_combo
+      reset_halt:
+        description: "仅 swing_combo：清除账户 -20% 停机并重设起点权益。默认 false。"
+        required: false
+        default: false
+        type: boolean
 
-# 只取消本工作流上一次手动运行，不会动 demo.yml。
-concurrency:
-  group: okx-multi-agent-demo-${{ github.ref }}
-  cancel-in-progress: true
+# 剥头皮沿用原来的并发组，会取消上一次手动运行。
+# 选了 swing_combo 时并入 okx-swing-combo，且不取消正在跑的波段循环，避免两个策略同时打同一个模拟盘。
+# 不会动 demo.yml。
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 jobs:
   demo:
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.event.inputs.strategy == 'swing_combo' && 'okx-swing-combo' || format('okx-multi-agent-demo-{0}', github.ref) }}
+      cancel-in-progress: ${{ github.event.inputs.strategy != 'swing_combo' }}
     env:
       # 与 config.py 的 MA-1.2.2 默认一致，避免 Actions 环境里残留旧变量。
       ENABLE_US_STOCKS: "0"
@@ -84,7 +99,19 @@ jobs:
       # 离线冒烟：Mock 行情，不联网、不读密钥。产物在 data_smoke/，不进正式 data/。
       - name: Offline smoke
         working-directory: okx-multi-agent
+        env:
+          STRATEGY: scalp
         run: python main.py --smoke --steps 30
+
+      - name: Offline smoke swing
+        working-directory: okx-multi-agent
+        env:
+          STRATEGY: swing_combo
+        run: python main.py --smoke --steps 12
+
+      - name: Restore swing-data
+        if: ${{ inputs.strategy == 'swing_combo' }}
+        run: bash okx-multi-agent/scripts/swing_data.sh restore
 
       - name: Run one scan round
         if: ${{ inputs.once }}
@@ -93,8 +120,11 @@ jobs:
           OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
           OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
           OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+          STRATEGY: ${{ inputs.strategy || 'scalp' }}
+          DATA_DIR: ${{ inputs.strategy == 'swing_combo' && format('{0}/swing-data', github.workspace) || format('{0}/okx-multi-agent/data', github.workspace) }}
+          SWING_RESET_HALT: ${{ inputs.reset_halt && '1' || '0' }}
         run: |
-          echo "单轮扫描（--once）..."
+          echo "单轮扫描（--once）strategy=${STRATEGY} ..."
           python -u main.py --once
 
       - name: Run timed demo
@@ -105,9 +135,23 @@ jobs:
           OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
           OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
           RUN_HOURS: ${{ inputs.hours }}
+          STRATEGY: ${{ inputs.strategy || 'scalp' }}
+          DATA_DIR: ${{ inputs.strategy == 'swing_combo' && format('{0}/swing-data', github.workspace) || format('{0}/okx-multi-agent/data', github.workspace) }}
+          SWING_RESET_HALT: ${{ inputs.reset_halt && '1' || '0' }}
         run: |
-          echo "持续运行 ${RUN_HOURS} 小时，到时后等持仓平完再退出..."
-          python -u main.py --hours "$RUN_HOURS" --stop-after-flat
+          if [ "$STRATEGY" = "swing_combo" ]; then
+            echo "swing_combo 运行 ${RUN_HOURS} 小时，到点保留持仓并退出..."
+            python -u main.py --hours "$RUN_HOURS"
+          else
+            echo "持续运行 ${RUN_HOURS} 小时，到时后等持仓平完再退出..."
+            python -u main.py --hours "$RUN_HOURS" --stop-after-flat
+          fi
+
+      - name: Publish swing-data branch
+        if: ${{ always() && inputs.strategy == 'swing_combo' }}
+        env:
+          SWING_DATA_DIR: ${{ github.workspace }}/swing-data
+        run: bash okx-multi-agent/scripts/swing_data.sh publish
 
       # job 失败、到时退出或被取消后都尽量留下日志和权益曲线。
       - name: Upload data artifacts
@@ -117,4 +161,13 @@ jobs:
           name: okx-multi-agent-data-${{ github.run_id }}
           path: okx-multi-agent/data/
           retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload swing-data artifact
+        if: ${{ always() && inputs.strategy == 'swing_combo' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-swing-data-${{ github.run_id }}
+          path: swing-data/
+          retention-days: 14
           if-no-files-found: warn

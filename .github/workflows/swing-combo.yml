@@ -1,0 +1,180 @@
+name: OKX Swing Combo
+
+# 动量 + OI 脉冲波段的持续模拟盘。和「OKX Multi-Agent Demo」（剥头皮）分开：
+# 不同的工作流、不同的并发组，不会互相取消。
+# 定时每 5 小时排队一轮；每轮跑约 5.5 小时后主动退出，持仓留在交易所。
+# 并发组 okx-swing-combo 不取消正在跑的那轮，所以下一轮会等这一轮结束再开始，
+# 形成不间断的循环。平台大约 6 小时会杀掉作业，5.5 小时是为了留出提交数据的时间。
+#
+# 状态和成交记录提交到分支 swing-data（没有密钥）。这些提交也算仓库活动，
+# 用来避免 GitHub 在 60 天没有任何活动后关掉 schedule。
+#
+# 开始：合并到默认分支后，Actions → OKX Swing Combo → Run workflow。
+#       之后 cron 会自己接上。定时任务只在默认分支上的这份文件生效。
+# 停止：Actions → OKX Swing Combo → Disable workflow，并取消正在跑的那一轮。
+#       停掉之后交易所上的仓不会被自动平掉，止损止盈还挂着。
+# 不要和剥头皮工作流同时打同一个模拟盘账户：剥头皮会按 15 分钟规则管理它看得到的仓。
+
+on:
+  schedule:
+    - cron: "20 */5 * * *"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "本轮运行小时数。默认 5.5。到点退出，不平掉持仓。"
+        required: false
+        default: "5.5"
+        type: string
+      once:
+        description: "只跑一轮扫描后退出（检查连通性）。默认 false。"
+        required: false
+        default: false
+        type: boolean
+      reset_halt:
+        description: "清除账户 -20% 停机，并把起点权益重置为当前权益。默认 false。"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: okx-swing-combo
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  swing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      ENABLE_US_STOCKS: "0"
+      STRATEGY: swing_combo
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Mark session start
+        run: date +%s > /tmp/swing_started_at
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r okx-multi-agent/requirements.txt
+
+      - name: Syntax check
+        run: |
+          python -m py_compile \
+            okx-multi-agent/main.py \
+            okx-multi-agent/config.py \
+            okx-multi-agent/okx_client.py \
+            okx-multi-agent/universe.py \
+            okx-multi-agent/agents/*.py
+          echo "syntax OK"
+
+      - name: Offline smoke scalp
+        working-directory: okx-multi-agent
+        env:
+          STRATEGY: scalp
+        run: python main.py --smoke --steps 20
+
+      - name: Offline smoke swing
+        working-directory: okx-multi-agent
+        env:
+          STRATEGY: swing_combo
+        run: python main.py --smoke --steps 12
+
+      - name: Restore swing-data
+        run: bash okx-multi-agent/scripts/swing_data.sh restore
+
+      - name: Run one scan round
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.once }}
+        working-directory: okx-multi-agent
+        env:
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+          STRATEGY: swing_combo
+          DATA_DIR: ${{ github.workspace }}/swing-data
+          SWING_RESET_HALT: ${{ inputs.reset_halt && '1' || '0' }}
+        run: python -u main.py --once
+
+      - name: Run swing session
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.once) }}
+        working-directory: okx-multi-agent
+        env:
+          OKX_API_KEY: ${{ secrets.OKX_API_KEY }}
+          OKX_SECRET_KEY: ${{ secrets.OKX_SECRET_KEY }}
+          OKX_PASSPHRASE: ${{ secrets.OKX_PASSPHRASE }}
+          STRATEGY: swing_combo
+          DATA_DIR: ${{ github.workspace }}/swing-data
+          SWING_RESET_HALT: ${{ inputs.reset_halt && '1' || '0' }}
+          RUN_HOURS: ${{ github.event_name == 'schedule' && '5.5' || inputs.hours }}
+        run: |
+          echo "swing_combo 运行 ${RUN_HOURS} 小时，到点保留持仓并退出..."
+          python -u main.py --hours "$RUN_HOURS"
+
+      - name: Record run manifest
+        if: always()
+        env:
+          DATA_DIR: ${{ github.workspace }}/swing-data
+        run: |
+          mkdir -p "$DATA_DIR"
+          python - "$DATA_DIR/last_run.json" << 'PY'
+          import json, os, sys, time
+          path = sys.argv[1]
+          json.dump({
+              "run_id": os.getenv("GITHUB_RUN_ID"),
+              "run_attempt": os.getenv("GITHUB_RUN_ATTEMPT"),
+              "sha": os.getenv("GITHUB_SHA"),
+              "ref": os.getenv("GITHUB_REF"),
+              "event": os.getenv("GITHUB_EVENT_NAME"),
+              "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+          }, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          PY
+
+      - name: Publish swing-data branch
+        if: always()
+        env:
+          SWING_DATA_DIR: ${{ github.workspace }}/swing-data
+        run: bash okx-multi-agent/scripts/swing_data.sh publish
+
+      - name: Relaunch if this scheduled session died early
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          start="$(cat /tmp/swing_started_at 2>/dev/null || echo 0)"
+          now="$(date +%s)"
+          elapsed="$((now - start))"
+          # 不到 10 分钟就结束：多半是配置/密钥错误，交给下一次 cron，避免空转打满。
+          # 超过 4 小时：本轮基本跑完，5 小时 cron 已经在排队，不再额外派发。
+          if [ "$elapsed" -ge 600 ] && [ "$elapsed" -lt 14400 ]; then
+            echo "本轮提前结束（${elapsed}s），派发下一轮以接上持仓。"
+            curl -fsS -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/swing-combo.yml/dispatches" \
+              -d "{\"ref\":\"${GITHUB_REF_NAME}\"}"
+          else
+            echo "不额外派发（已运行 ${elapsed}s）。"
+          fi
+
+      - name: Upload swing-data artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-swing-data-${{ github.run_id }}
+          path: swing-data/
+          retention-days: 14
+          if-no-files-found: warn

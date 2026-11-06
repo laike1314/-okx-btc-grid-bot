@@ -1,6 +1,6 @@
-# OKX 多代理模拟盘交易系统（MA-1.2.2）
+# OKX 多代理模拟盘交易系统（MA-2.0）
 
-参考推文里「六个代理分工」的思路，交易对象默认是 **市值靠前的 OKX USDT 永续**。股票永续可以打开，但默认关闭。策略是快进快出：止损加宽到能盖住手续费，止盈靠近，浮盈锁定，拿太久就市价走。**只跑模拟盘**：每个请求都带 `x-simulated-trading: 1`，代码里写死 `SIMULATED_TRADING = "1"`，改不成实盘。API 密钥只从环境变量读取。
+参考推文里「六个代理分工」的思路，交易对象默认是 **市值靠前的 OKX USDT 永续**。股票永续可以打开，但默认关闭。默认策略仍是 MA-1.2.2 的快进快出（`STRATEGY=scalp`）：止损加宽到能盖住手续费，止盈靠近，浮盈锁定，拿太久就市价走。另有可选的波段模式 `STRATEGY=swing_combo`，见下方专节。**只跑模拟盘**：每个请求都带 `x-simulated-trading: 1`，代码里写死 `SIMULATED_TRADING = "1"`，改不成实盘。API 密钥只从环境变量读取。
 
 > ⚠️ 冒烟测试（`--smoke`）用的是本地随机行情，盈亏数字**没有任何参考价值**，只用来确认程序能跑通。冒烟不访问 CoinGecko，也不访问 OKX。
 
@@ -116,7 +116,9 @@ okx-multi-agent/
 │   ├── net_tp.py      净利止盈 + 保本（逐仓）
 │   ├── fees.py        账户手续费率
 │   ├── indicators.py  EMA / ATR / ADX
-│   └── state.py       连亏、冷却、当日盈亏，落盘 data/state.json
+│   ├── swing.py       波段：体制、动量、OI、出场、对账
+│   └── state.py       连亏、冷却、当日盈亏、波段账本，落盘 state.json
+├── scripts/swing_data.sh   Actions 恢复/提交 swing-data 分支
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -200,7 +202,102 @@ python main.py --hours 6 --stop-after-flat  # 跑 6 小时，到时后等最后�
 3. 默认 `hours=5.8`、`once=false`，执行 `python -u main.py --hours 5.8 --stop-after-flat`。单个 job 大约 6 小时会被平台取消，5.8 小时是为了平仓后正常退出，并上传 `data/` 产物（保留约 7 天）。
 4. 把 `once` 设为 true 则只跑 `python -u main.py --once`（一轮扫描）。工作流里的离线冒烟不联网。
 
-这是模拟盘演示。私有仓库免费 Actions 分钟有限，长期跑更适合自己的服务器。交易池变大之后，一轮扫描会更久，5.8 小时里真正下单的次数取决于信号，而不是把每个股票合约都扫到就一定开仓。
+这是模拟盘演示。手动跑波段时，把 `strategy` 选成 `swing_combo`（单次会话，到点保留持仓）。要连续收集多日数据，用下面的 **OKX Swing Combo** 工作流，不要靠这一条 5.8 小时的剥头皮任务。
+
+## 波段模式 swing_combo（MA-2.0）
+
+`STRATEGY=scalp`（默认）时，下面的参数全部不参与决策，快进快出和原来一样。`STRATEGY=swing_combo` 才走这一套。交易池仍是市值前 30 的 USDT 永续；`ENABLE_US_STOCKS=1` 才加入股票合约。
+
+### 信号
+
+1. **体制（每张合约自己的 4H）**。用 ADX(14) 和收盘价相对 MA20 的距离（单位是 ATR）。ADX ≥ `SWING_REGIME_ADX`（25）**或者** 偏离 ≥ `SWING_REGIME_ATR_DIST`（1.5 ATR）→ `trend`，否则 `range`。
+2. **动量**。最近 `SWING_MOM_LOOKBACK`（6）根 4H 的收益率，除以这张合约自己的 ATR%。再在整个交易池里做截面排名，映射到 -1～+1：最强为 +1（做多），最弱为 -1（做空）。绝对值得分，低于 `SWING_MIN_LEG`（0.15）视为这条腿没有方向。
+3. **OI 脉冲**。用 OKX 公开接口（请求带 User-Agent）：
+   - `GET /api/v5/rubik/stat/contracts/open-interest-history`：持仓量变化
+   - `GET /api/v5/rubik/stat/taker-volume-contract`：主动买/卖
+   - `GET /api/v5/rubik/stat/contracts/long-short-account-ratio-contract`：多空账户比
+   - 成交量用 4H K 线，资金费用已有的 funding-rate
+   这几个统计接口**不带** `x-simulated-trading` 头（带上之后持仓量名义会失真），并丢掉还没走完的那一根。价格在窗口内的波动超过 `SWING_OI_MAX_FLAT_ATR`（1 倍 ATR），或者持仓量没有增加，这条腿记 0。分数由持仓量变化（相对自身历史的 z，以及绝对涨幅）和成交量放大合成，封顶 1。
+   **方向按这个顺序，用到第一个能定的：** 主动买卖失衡 ≥ 5% → 多空账户比偏离 1 超过 5%（账户偏多则做多，不反向）→ 残余价格漂移 → 资金费反向（正资金费做空）。
+4. **合成**。趋势市动量 0.7 / OI 0.3，震荡市动量 0.3 / OI 0.7。两条腿同向加 `SWING_AGREE_BONUS`（0.1），总分不超过 1。方向相反则本轮不做。入场要合成分 ≥ `SWING_ENTRY_THRESHOLD`（0.8）。哪条腿的加权贡献更大，出场就按哪个家族。
+
+### 出场和费用
+
+交易所止损、止盈在开仓时就挂上，作业之间也一直有效。最短持仓之内不做信号平仓，但止损止盈照常触发。
+
+| 家族 | 止盈 | 止损 | 跟踪 | 最短 / 最长 |
+|---|---|---|---|---|
+| 动量 | 1×ATR | 1.5×ATR | 浮盈盖过来回成本后，按峰值回撤 1×ATR 上移止损 | 12h / 24h |
+| OI | 1.75×ATR（落在 1.5～2） | 1.2×ATR | 不跟踪 | 24h / 48h |
+
+认不出家族的旧仓按 OI 的更长窗口管理，不跟踪，并且不改已经挂着的止损止盈。最短持仓过后，若合成方向不再支持这张仓，或得分低于 `SWING_EXIT_SCORE`（0.35），才市价平。
+
+止盈距离必须 ≥ 来回成本（maker 进、taker 出，加点差和滑点）× `SWING_MIN_EDGE_FEE_MULT`（3），否则跳过。
+
+### 风控
+
+同时最多 `SWING_MAX_POSITIONS`（4）个本策略仓，同一家族最多 `SWING_MAX_PER_FAMILY`（3）。杠杆 `SWING_LEVERAGE`（1）。每笔名义 ≈ 权益 × `SWING_ALLOC_PCT` / 4，默认大约四分之一。任何平仓后该合约冷却 `SWING_COOLDOWN_SEC`（8 小时）。权益较**起始权益**回撤 `SWING_ACCOUNT_STOP_PCT`（20%）就停机并平掉本策略的仓，记下 `swing_halted`，下次还在，直到 `SWING_RESET_HALT=1`。较**峰值**回撤 `SWING_PEAK_DD_PCT`（10%）只停止开新仓，不平已有仓。点差、24h 成交额、标记价偏离、极端资金费这些微观闸门仍然有效。剥头皮的 2% 滚动亏损、15 分钟冷却、同向加密上限，在这个模式里不生效。
+
+没有 `swmom` / `swoi` 订单标签、也不在 `state.json` 里的持仓不会被接管，避免误伤同一账户上别的仓。
+
+### 状态怎么跨过 6 小时的 Actions 限制
+
+持仓在 OKX 上，止损止盈挂在交易所，作业结束不平仓。策略账本（家族、开仓时间、跟踪峰值、冷却、起始权益、峰值权益、是否停机）写在 `state.json`。启动时对账：交易所持仓 + 成交标签 + 最近平仓历史；对不上标签的仓不接管。
+
+持续运行用工作流 **OKX Swing Combo**（`.github/workflows/swing-combo.yml`）：
+
+- cron `20 */5 * * *`（UTC，大约每 5 小时）排队一轮，每轮 `--hours 5.5` 后主动退出。
+- 并发组 `okx-swing-combo`，`cancel-in-progress: false`。下一轮如果来早了就等着，这一轮结束后马上接上，同一时间只有一个实例在交易。
+- 跑完把 `state.json`、`trades.csv`、`equity.csv`、`equity.json`、`decisions.jsonl`、`universe.json` 提交到分支 **`swing-data`**。这个分支只有档案，没有密钥。提交也算仓库活动，用来避免 GitHub 在 60 天没有任何推送后自动关掉 schedule。
+- 定时任务若在 10 分钟到 4 小时之间提前死掉，会再派发一轮；不到 10 分钟（多半是密钥错误）则交给下一次 cron，避免空转。
+
+**开始：** 把本改动合并进默认分支（schedule 只认默认分支上的工作流文件）。Actions → **OKX Swing Combo** → **Run workflow**。不必干等第一次 cron。
+
+**停止：** Actions → **OKX Swing Combo** → **Disable workflow**，需要的话再取消正在跑的那一轮。停掉之后，模拟盘上的仓**不会**被自动平掉，交易所止损止盈还在。要平掉得在 OKX 上手动处理，或重新打开工作流让它接着管。账户停机之后，用 Run workflow 并把 `reset_halt` 设为 true，才会清除停机并按当前权益重设起点。
+
+不要和 **OKX Multi-Agent Demo** 同时打同一个模拟盘。两条工作流不会互相取消，但剥头皮会按 15 分钟规则处理它看见的持仓。
+
+### 波段环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `STRATEGY` | scalp | `swing_combo` 才启用本节 |
+| `SWING_REGIME_BAR` | 4H | 体制 / 动量 K 线 |
+| `SWING_REGIME_ADX` | 25 | 达到则判趋势 |
+| `SWING_REGIME_ATR_DIST` | 1.5 | 价格偏离 MA 的 ATR 倍数，达到则判趋势 |
+| `SWING_MA_PERIOD` | 20 | 体制用的均线 |
+| `SWING_MOM_LOOKBACK` / `SWING_OI_LOOKBACK` | 6 / 6 | 回看根数 |
+| `SWING_OI_MAX_FLAT_ATR` | 1 | 超过则 OI 腿记 0 |
+| `SWING_W_TREND_MOM` / `SWING_W_TREND_OI` | 0.7 / 0.3 | 趋势市权重 |
+| `SWING_W_RANGE_MOM` / `SWING_W_RANGE_OI` | 0.3 / 0.7 | 震荡市权重 |
+| `SWING_AGREE_BONUS` | 0.1 | 同向加分 |
+| `SWING_MIN_LEG` | 0.15 | 低于此不算有方向 |
+| `SWING_ENTRY_THRESHOLD` | 0.8 | 入场阈值（0～1） |
+| `SWING_EXIT_SCORE` | 0.35 | 最短持仓后，低于此视为信号消失 |
+| `SWING_MOM_TP_ATR` / `SWING_MOM_SL_ATR` / `SWING_MOM_TRAIL_ATR` | 1 / 1.5 / 1 | 动量出场 |
+| `SWING_MOM_MIN_HOLD_SEC` / `SWING_MOM_MAX_HOLD_SEC` | 43200 / 86400 | 12h / 24h |
+| `SWING_OI_TP_ATR` / `SWING_OI_SL_ATR` | 1.75 / 1.2 | OI 出场 |
+| `SWING_OI_MIN_HOLD_SEC` / `SWING_OI_MAX_HOLD_SEC` | 86400 / 172800 | 24h / 48h |
+| `SWING_MIN_EDGE_FEE_MULT` | 3 | 止盈距离 / 来回成本 |
+| `SWING_MAX_POSITIONS` | 4 | 同时持仓 |
+| `SWING_MAX_PER_FAMILY` | 3 | 同一家族上限 |
+| `SWING_LEVERAGE` | 1 | 杠杆 |
+| `SWING_ALLOC_PCT` | 1 | 参与分配的权益比例，每笔再除以最大持仓数 |
+| `SWING_COOLDOWN_SEC` | 28800 | 平仓后冷却，8h |
+| `SWING_ACCOUNT_STOP_PCT` | 0.20 | 较起始权益停机 |
+| `SWING_PEAK_DD_PCT` | 0.10 | 较峰值停止开新仓 |
+| `SWING_RESET_HALT` | 0 | 1 = 本轮清除停机并重设起点 |
+| `SWING_SCAN_INTERVAL_SEC` | 900 | 扫描间隔 |
+| `SWING_MONITOR_INTERVAL_SEC` | 60 | 持仓监控间隔 |
+| `SWING_CHASE_ATR` | 1 | 现价顺着方向偏离信号收盘超过这么多 ATR 则不追 |
+
+### 局限
+
+- 两次作业之间，跟踪止损和账户止损不会更新；这段时间只靠交易所上已经挂着的止损和止盈。cron 若延迟，空档可能到数小时。
+- 状态文件丢了以后，开仓家族还能从订单标签恢复，开仓时间用持仓的 `cTime`，跟踪用的价格高点会从当前价重新计，起始权益和峰值会按当前权益重播种（停机状态也会丢，除非 `swing_halted` 还在）。
+- OI 接口失败的合约，这一轮 OI 腿记 0，通常达不到 0.8，等于不做。
+- `decisions.jsonl` 会随运行变大。权益和成交看 `equity.csv` / `trades.csv` 即可。
+- 公开接口需要能访问 `www.okx.com`。本仓库没有可用的演示密钥时，只能做离线冒烟，不能对模拟盘下单。
 
 ## 设计取舍
 

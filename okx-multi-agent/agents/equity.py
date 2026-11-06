@@ -51,10 +51,15 @@ class EquityTracker:
             return False
         now = self.s.now()
         inst = plan["instId"]
-        self.s.d["open_meta"][inst] = {
+        meta = {
             "direction": plan["direction"], "qty": qty, "entry": px, "sl": plan["sl"],
             "tp": plan["tp"], "opened_at": datetime.now(BJ).isoformat(timespec="seconds"),
             "opened_ts": now, "open_ms": int(now * 1000), "score": plan.get("score")}
+        for key in ("family", "regime", "mom_score", "oi_score", "combined", "atr", "atr_pct",
+                    "min_hold_sec", "max_hold_sec", "sl_pct", "tp_pct", "tag"):
+            if plan.get(key) is not None:
+                meta[key] = plan[key]
+        self.s.d["open_meta"][inst] = meta
         if plan.get("reentry_bar_ts"):
             self.s.d.setdefault("last_entry_bar", {})[inst] = {
                 "direction": plan["direction"], "bar_ts": int(plan["reentry_bar_ts"])}
@@ -91,6 +96,10 @@ class EquityTracker:
 
     def _adopt_if_needed(self, p):
         if p["instId"] in self.known:
+            return
+        # 波段只接管账本里已经记下的仓，或对账时按标签写进 open_meta 的仓。
+        # 同一模拟盘上的剥头皮仓没有 swmom/swoi 标签，不能按 15 分钟规则去管，也不能被波段提前平掉。
+        if config.is_swing() and p["instId"] not in (self.s.d.get("open_meta") or {}):
             return
         if float(p.get("qty") or 0) <= 0:
             self.j.log(AGENT, "skip_zero_pos", f"{p.get('instId')} 张数为 0，不接管、不平仓记账",
@@ -150,6 +159,8 @@ class EquityTracker:
             net = 0.0
             reason = meta.get("close_reason") or "交易所止盈/止损"
             self.j.log(AGENT, "pnl_unknown", f"{inst} 无法取得平仓盈亏，记 0 并保留原因 {reason}", inst=inst)
+        if meta.get("family"):
+            reason = f"{reason} [{meta.get('family')}/{meta.get('regime') or '-'}]"
         try:
             eq = self.c.equity()
         except Exception:
@@ -160,16 +171,30 @@ class EquityTracker:
                "fee": res.get("fee") if res else None, "funding": res.get("fundingFee") if res else None,
                "net_pnl": round(net, 4), "est_net": meta.get("est_net"), "reason": reason,
                "equity_after": round(eq, 4) if eq is not None else None}
-        new = not os.path.exists(self.trades_csv)
-        with open(self.trades_csv, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(row))
-            if new:
-                w.writeheader()
-            w.writerow(row)
+        if meta.get("family"):
+            row.update(family=meta.get("family"), regime=meta.get("regime"),
+                       combined=meta.get("combined"))
+        self._append_trade(row)
         self.j.log(AGENT, "trade_closed", f"{inst} 平仓（{reason}）净盈亏 {net:+.2f} USDT，权益 "
                    f"{eq if eq is None else round(eq, 2)}", **row)
         self.risk.on_trade_closed(inst, net)
         self.snapshot(eq)
+
+    def _append_trade(self, row):
+        """已有表头时按旧列写入，避免给剥头皮账本硬加列；新文件带上波段列。"""
+        new = not os.path.exists(self.trades_csv)
+        if not new:
+            with open(self.trades_csv, encoding="utf-8") as f:
+                header = next(csv.reader(f), [])
+            if header:
+                with open(self.trades_csv, "a", newline="", encoding="utf-8") as f:
+                    csv.DictWriter(f, fieldnames=header, extrasaction="ignore").writerow(
+                        {k: row.get(k) for k in header})
+                return
+        with open(self.trades_csv, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(row))
+            w.writeheader()
+            w.writerow(row)
 
     def _estimate_net(self, inst, meta):
         entry = float(meta.get("entry") or 0)

@@ -95,6 +95,8 @@ class NetTpMonitor:
         return result == "closed"
 
     def _check_one(self, p):
+        if config.is_swing():
+            return self._check_swing(p)
         inst = p["instId"]
         key = self._pkey(p)
         if self._audit_protection(p):
@@ -154,6 +156,82 @@ class NetTpMonitor:
         self.ex.close(p, "超时平仓")
         self.s.save()
         return True
+
+    def _check_swing(self, p):
+        """波段：交易所止损止盈一直有效。最短持仓内不做信号平仓（信号平仓在扫描轮）。
+        到期才市价平。动量单浮盈后跟踪止损。不走剥头皮的净利立刻落袋。"""
+        from .swing import time_exit_due
+        inst = p["instId"]
+        meta = (self.s.d.get("open_meta") or {}).get(inst)
+        if not meta:
+            return
+        if self._audit_protection(p):
+            return
+        if time_exit_due(meta, self.s.now()):
+            meta["close_reason"] = "到期平仓"
+            age = self.s.now() - float(meta.get("opened_ts") or self.s.now())
+            self.j.log(AGENT, "max_hold",
+                       f"{inst} {meta.get('family')} 已持有 {int(age)}s，到达最长持仓，市价平",
+                       inst=inst, age=age, family=meta.get("family"))
+            self.ex.close(p, "到期平仓")
+            self.s.save()
+            return
+        self._swing_trail(p)
+        key = self._pkey(p)
+        if time.time() - self.last_report.get(key, 0) > 60:
+            try:
+                e = self.estimate(p)
+            except Exception as err:
+                self.j.log(AGENT, "net_pnl_err", f"{inst} 净利估算失败: {err}", inst=inst)
+                return
+            self.last_report[key] = time.time()
+            self.j.log(AGENT, "net_pnl",
+                       f"{inst} {p.get('side')} {meta.get('family')} 浮盈 {e['upl']:+.2f} 净 {e['net']:+.2f}",
+                       inst=inst, side=p.get("side"), family=meta.get("family"), **e)
+
+    def _swing_trail(self, p):
+        """动量单：价格已经盖过来回成本之后，按峰值回撤 ATR 上移止损。只收紧，不放宽。"""
+        inst = p["instId"]
+        meta = (self.s.d.get("open_meta") or {}).get(inst)
+        if not meta or meta.get("family") != "momentum":
+            return
+        entry = float(p.get("avgPx") or meta.get("entry") or 0)
+        mark = float(p.get("markPx") or 0)
+        atr_px = float(meta.get("atr") or 0)
+        if entry <= 0 or mark <= 0 or atr_px <= 0:
+            return
+        long = p["side"] == "long"
+        rt = self.fees.maker + self.fees.taker + 2 * config.SLIPPAGE_BPS / 1e4
+        in_profit = mark > entry * (1 + rt) if long else mark < entry * (1 - rt)
+        if not in_profit:
+            return
+        if meta.get("peak_px"):
+            peak = float(meta["peak_px"])
+            peak = max(peak, mark) if long else min(peak, mark)
+        else:
+            peak = mark
+        meta["peak_px"] = peak
+        dist = atr_px * float(config.SWING_MOM_TRAIL_ATR)
+        raw = (peak - dist) if long else (peak + dist)
+        tick = self.c.instrument(inst)["tickSz"]
+        buf = max(float(tick) * 2, mark * 0.0003)
+        if long:
+            raw = min(raw, mark - buf)
+            new_sl = round_px(raw, tick, "down")
+        else:
+            raw = max(raw, mark + buf)
+            new_sl = round_px(raw, tick, "up")
+        if not stop_is_valid(p["side"], new_sl, mark):
+            self.s.save()
+            return
+        prev = float(meta.get("sl") or 0)
+        if prev and ((long and new_sl <= prev + float(tick) / 2) or (not long and new_sl >= prev - float(tick) / 2)):
+            self.s.save()
+            return
+        if self.ex.amend_sl(inst, new_sl):
+            meta["sl"] = new_sl
+            self.j.log(AGENT, "trail", f"{inst} 动量单浮盈后止损上移到 {new_sl}", inst=inst, sl=new_sl)
+        self.s.save()
 
     def _maybe_trail(self, p, e):
         """浮盈够一段就把止损抬到锁定大部分利润。新止损必须在标记价的保护一侧。"""
