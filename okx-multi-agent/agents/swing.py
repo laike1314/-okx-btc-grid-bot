@@ -12,6 +12,7 @@ OI 方向（文档约定，按顺序用第一个能定方向的）：
 价格在窗口内的波动超过 SWING_OI_MAX_FLAT_ATR 倍 ATR 时，OI 这条腿记 0（不是「价格没动」）。
 """
 import math
+import time
 
 import config
 from .indicators import atr, adx
@@ -205,8 +206,9 @@ def candle_features(candles):
     ret = (price / prev - 1.0) if prev else 0.0
     atr_pct = a / price
     mom_raw = ret / atr_pct if atr_pct else 0.0
+    bar_ts = int(candles[-1].get("ts") or 0)
     return {"price": price, "atr": a, "atr_pct": atr_pct, "adx": adx_v, "dist_atr": dist,
-            "mom_raw": mom_raw, "regime": classify_regime(adx_v, dist)}
+            "mom_raw": mom_raw, "regime": classify_regime(adx_v, dist), "bar_ts": bar_ts}
 
 
 def _oi_change_z(series, lookback):
@@ -255,22 +257,74 @@ def oi_direction(taker, look, ls_ratio, drift, atr_px, funding):
     return None
 
 
+def bar_span_sec(bar):
+    text = str(bar or "").strip()
+    try:
+        if text.endswith("m"):
+            return int(text[:-1]) * 60
+        if text.endswith("H"):
+            return int(text[:-1]) * 3600
+        if text.endswith("D"):
+            return int(text[:-1]) * 86400
+    except ValueError:
+        return 0
+    return 0
+
+
+def close_age_sec(open_ts_ms, bar_sec, now_ms):
+    """K 线 ts 是开盘时间。新鲜度按收盘时间算，避免把刚收盘的 4H 误判成 8 小时前的缓存。"""
+    if not open_ts_ms or not bar_sec:
+        return None
+    close_ms = int(open_ts_ms) + int(bar_sec) * 1000
+    return (int(now_ms) - close_ms) / 1000.0
+
+
+def oi_block_reason(info, score, direction):
+    """OI 腿为什么是 0。不改变分数，只给日志一个原因。"""
+    info = info or {}
+    if direction in ("long", "short") and float(score or 0) > 0:
+        return ""
+    if info.get("flat") is False:
+        return "not_flat"
+    if info.get("oi_chg") is None:
+        return "no_oi" if info.get("candle_ts") else "no_data"
+    if float(info.get("oi_chg") or 0) <= 0:
+        return "oi_not_up"
+    if direction not in ("long", "short"):
+        return "no_direction"
+    return "below_bar"
+
+
 def oi_pulse(candles, oi_hist, taker, ls_ratio, funding, atr_px):
-    """返回 (score 0-1, direction or None, debug)。价格不平静或 OI 没增加则分数为 0。"""
+    """返回 (score 0-1, direction or None, debug)。价格不平静或 OI 没增加则分数为 0。
+
+    分数公式保持原样：OI 增幅要超过约 2% 或 z>0.5，成交量高于自身均量才开始计分。
+    不因为想开仓就把门槛放低。
+    """
     look = max(1, int(config.SWING_OI_LOOKBACK))
     closes = [c["c"] for c in candles or []]
     vols = [c["vol"] for c in candles or []]
-    info = {"flat": False, "oi_chg": None, "oi_z": None, "vol_ratio": None}
+    info = {"flat": False, "oi_chg": None, "oi_z": None, "vol_ratio": None,
+            "oi_ts": None, "candle_ts": int(candles[-1]["ts"]) if candles else None}
+
+    def done(score, direction):
+        info["reason"] = oi_block_reason(info, score, direction)
+        return score, direction, info
+
     if len(closes) <= look or not atr_px:
-        return 0.0, None, info
+        return done(0.0, None)
     move = abs(float(closes[-1]) - float(closes[-1 - look]))
     flat = move <= float(atr_px) * float(config.SWING_OI_MAX_FLAT_ATR)
     info["flat"] = flat
-    series = [(x.get("oiUsd") or x.get("oi") or 0) for x in (oi_hist or [])]
+    info["move_atr"] = move / float(atr_px) if atr_px else None
+    hist = [x for x in (oi_hist or []) if isinstance(x, dict)]
+    if hist:
+        info["oi_ts"] = int(hist[-1].get("ts") or 0) or None
+    series = [(x.get("oiUsd") or x.get("oi") or 0) for x in hist]
     chg, z = _oi_change_z(series, look)
     info["oi_chg"], info["oi_z"] = chg, z
     if not flat or chg is None or chg <= 0:
-        return 0.0, None, info
+        return done(0.0, None)
     z_part = _clamp((z - 0.5) / 2.5) if z is not None else 0.0
     abs_part = _clamp((chg - 0.02) / 0.15)
     oi_level = max(z_part, abs_part)
@@ -284,8 +338,8 @@ def oi_pulse(candles, oi_hist, taker, ls_ratio, funding, atr_px):
     direction = oi_direction(taker, look, ls_ratio, float(closes[-1]) - float(closes[-1 - look]),
                              atr_px, funding)
     if direction is None:
-        return 0.0, None, info
-    return score, direction, info
+        return done(0.0, None)
+    return done(score, direction)
 
 
 def assemble(features):
@@ -314,6 +368,8 @@ def assemble(features):
             "max_hold_sec": prof["max_hold"] if merged["family"] else None,
             "tag": prof["tag"] if merged["family"] in ("momentum", "oi") else "",
             "oi_info": feat.get("oi_info") or {},
+            "oi_reason": (feat.get("oi_info") or {}).get("reason") or "",
+            "bar_ts": feat.get("bar_ts"),
         })
     rows.sort(key=lambda r: (-(r["combined"] or 0), r["instId"]))
     return rows
@@ -351,21 +407,62 @@ def score_all(client, journal, symbols, pulse=None):
             ls = ls_rows[-1]["ratio"] if ls_rows else None
             funding = client.funding_rate(inst)
             oi_score, oi_dir, oi_info = oi_pulse(candles, hist, taker, ls, funding, feat["atr"])
+            span_ms = (bar_span_sec(config.SWING_OI_PERIOD) or bar_span_sec(bar) or 0) * 1000
+            cts, ots = feat.get("bar_ts"), oi_info.get("oi_ts")
+            if cts and ots and span_ms and abs(int(cts) - int(ots)) > span_ms:
+                oi_info["oi_lag_sec"] = abs(int(cts) - int(ots)) / 1000.0
+                oi_info["reason"] = "oi_misaligned"
+                oi_score, oi_dir = 0.0, None
+                journal.log(AGENT, "oi_misaligned",
+                            f"{inst} OI 末根与 4H 收盘相差 {oi_info['oi_lag_sec']:.0f}s，这根 OI 腿记 0",
+                            inst=inst, lag=oi_info["oi_lag_sec"])
         except Exception as e:
             journal.log(AGENT, "oi_error", f"{inst} OI/主动成交获取失败，本轮 OI 腿记 0: {e}", inst=inst)
+            oi_info = dict(_neutral_oi()[2], reason="fetch_error", error=str(e))
         feat.update(oi_score=oi_score, oi_dir=oi_dir, oi_info=oi_info)
         features[inst] = feat
     rows = assemble(features)
+    _log_freshness(journal, bar, features)
     for row in rows:
+        reason = row.get("oi_reason") or ""
+        chg = (row.get("oi_info") or {}).get("oi_chg")
+        chg_txt = "" if chg is None else f" chg={chg:.3%}"
         why = (f"{row['regime']} mom {row['mom_score']:.2f}/{row['mom_dir']} "
-               f"oi {row['oi_score']:.2f}/{row['oi_dir']} → {row['combined']:.2f}"
+               f"oi {row['oi_score']:.2f}/{row['oi_dir']}"
+               f"{(' ' + reason) if reason else ''}{chg_txt} → {row['combined']:.2f}"
                f"{' 分歧' if row['blocked'] else ''} {row['direction'] or '-'}"
                f"/{row['family'] or '-'}")
         journal.log(AGENT, "score", f"{row['instId']} {why}", inst=row["instId"],
                     regime=row["regime"], mom=row["mom_score"], oi=row["oi_score"],
                     combined=row["combined"], direction=row["direction"], family=row["family"],
-                    blocked=row["blocked"])
+                    blocked=row["blocked"], oi_reason=reason)
     return rows
+
+
+def _log_freshness(journal, bar, features):
+    """每轮一行：已收盘 K 线距今多久。4H 信号在两根收盘之间分数不变，不是行情缓存。"""
+    span = bar_span_sec(bar)
+    if not span:
+        return
+    now_ms = int(time.time() * 1000)
+    ages, stale = [], []
+    for inst, feat in features.items():
+        ts = feat.get("bar_ts")
+        age = close_age_sec(ts, span, now_ms)
+        if age is None:
+            continue
+        ages.append(age)
+        if age > 2 * span:
+            stale.append(inst)
+            journal.log(AGENT, "stale_candle",
+                        f"{inst} {bar} 收盘距今 {age:.0f}s，超过 2 根，怀疑行情没更新",
+                        inst=inst, age=age)
+    if not ages:
+        return
+    journal.log(AGENT, "freshness",
+                f"{bar} 已收盘距今 {min(ages):.0f}-{max(ages):.0f}s"
+                f"（一根 {span}s；超过 2 根才算陈旧，本轮 {len(stale)} 个）",
+                stale=len(stale), symbols=len(ages))
 
 
 def entry_candidates(rows):
@@ -636,6 +733,133 @@ def _apply_signal_exits(agents, positions, by_inst):
     state.save()
 
 
+def _retry_and_gate_checks():
+    """空行情可重试；下单 POST 遇到空响应不重试。波段点差 8bps、成交额 800 万，剥头皮阈值不动。"""
+    import okx_client
+    from okx_client import OkxClient, OkxError
+
+    class _Resp:
+        def __init__(self, status, payload, text=None):
+            self.status_code = status
+            self._payload = payload
+            self.text = text if text is not None else (__import__("json").dumps(payload))
+
+        def json(self):
+            if isinstance(self._payload, Exception):
+                raise self._payload
+            return self._payload
+
+    class _Sess:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.calls = []
+
+        def request(self, method, url, headers=None, data=None, timeout=None):
+            self.calls.append(method)
+            return self.responses.pop(0)
+
+    old_gap = config.PUBLIC_REQ_GAP_SEC
+    config.PUBLIC_REQ_GAP_SEC = 0
+    slept = []
+    real_sleep = okx_client.time.sleep
+    okx_client.time.sleep = lambda s: slept.append(s)
+    try:
+        client = OkxClient.__new__(OkxClient)
+        client.key, client.secret, client.passphrase = "k", "s", "p"
+        client.base = "https://www.okx.com"
+        client._next_get_at = 0.0
+        client._next_rubik_at = 0.0
+        client.s = _Sess([
+            _Resp(200, {}),
+            _Resp(200, {"code": None, "msg": None, "data": None}),
+            _Resp(200, {"code": "0", "data": [{"ok": 1}]}),
+        ])
+        got = client.request("GET", "/api/v5/market/candles", {"instId": "BTC-USDT-SWAP"})
+        assert got == [{"ok": 1}], got
+        assert client.s.calls == ["GET", "GET", "GET"], client.s.calls
+
+        client.s = _Sess([_Resp(200, {"code": None, "msg": None})])
+        try:
+            client.request("POST", "/api/v5/trade/order", body={"instId": "BTC-USDT-SWAP"}, retries=4)
+            raise AssertionError("空的下单响应不该被当成成功")
+        except OkxError as e:
+            assert e.code == "EMPTY", e
+        assert client.s.calls == ["POST"], client.s.calls
+
+        client.s = _Sess([_Resp(200, None, text="")])
+        client.s.responses[0].json = lambda: (_ for _ in ()).throw(ValueError("empty"))
+        try:
+            client.request("POST", "/api/v5/trade/order", body={"sz": "1"}, retries=3)
+            raise AssertionError("下单网络错误不该重试后还返回")
+        except OkxError as e:
+            assert "未重试" in str(e), e
+        assert client.s.calls == ["POST"]
+
+        client.s = _Sess([
+            _Resp(429, {"code": "50011", "msg": "rate"}),
+            _Resp(200, {"code": "0", "data": [{"ordId": "1"}]}),
+        ])
+        got = client.request("POST", "/api/v5/trade/order", body={"instId": "BTC-USDT-SWAP"}, retries=3)
+        assert got == [{"ordId": "1"}], got
+        assert client.s.calls == ["POST", "POST"]
+    finally:
+        config.PUBLIC_REQ_GAP_SEC = old_gap
+        okx_client.time.sleep = real_sleep
+
+    from agents.journal import Journal
+    from agents.fees import FeeBook
+    from agents.risk import RiskGate
+    from agents.state import SharedState
+    import tempfile
+
+    class _C:
+        def ticker(self, inst):
+            return {"bid": 100.0, "ask": 100.07, "last": 100.0, "vol_usdt_24h": 9_000_000.0}
+
+        def mark_price(self, inst):
+            return 100.0
+
+        def index_price(self, inst):
+            return 100.0
+
+        def funding_rate(self, inst):
+            return 0.0
+
+    class _Wide(_C):
+        def ticker(self, inst):
+            return {"bid": 100.0, "ask": 100.09, "last": 100.0, "vol_usdt_24h": 9_000_000.0}
+
+    class _Thin(_C):
+        def ticker(self, inst):
+            return {"bid": 100.0, "ask": 100.01, "last": 100.0, "vol_usdt_24h": 7_000_000.0}
+
+    class _Gap(_C):
+        def mark_price(self, inst):
+            return 102.0
+
+    j = Journal(tempfile.mkdtemp(), echo=False)
+    try:
+        st = SharedState(tempfile.mkdtemp(), clock=lambda: 1_000_000.0)
+        fees = FeeBook(_C(), j)
+        saved = config.STRATEGY
+        config.STRATEGY = "swing_combo"
+        try:
+            cand = {"instId": "ARB-USDT-SWAP", "direction": "long", "family": "momentum",
+                    "regime": "trend", "combined": 0.7, "atr": 1.0, "atr_pct": 0.01, "price": 100.07}
+            ok, why = RiskGate(_C(), j, st, fees).check(cand, [], 10_000)
+            assert ok, why
+            ok, why = RiskGate(_Wide(), j, st, fees).check(dict(cand), [], 10_000)
+            assert ok is False and "点差" in why, why
+            ok, why = RiskGate(_Thin(), j, st, fees).check(dict(cand), [], 10_000)
+            assert ok is False and "成交额" in why, why
+            ok, why = RiskGate(_Gap(), j, st, fees).check(dict(cand), [], 10_000)
+            assert ok is False and "标记价" in why and "50" in why, why
+        finally:
+            config.STRATEGY = saved
+    finally:
+        j.close()
+
+
 def offline_self_check():
     """不联网。体制、截面排名、合成、费用、持仓时间、张数。"""
     assert classify_regime(30, 0.2) == "trend"
@@ -718,6 +942,38 @@ def offline_self_check():
     score, direction, info = oi_pulse(candles, oi, taker, 1.0, 0.0, a)
     assert info["flat"] is True
     assert direction == "long" and score > 0.5, (score, direction, info)
+    assert info["reason"] == ""
+
+    # 持仓量下降：价格再平也是 0，原因是 oi_not_up，不是把分数抬上去。
+    down = [{"oiUsd": 1000 * (1.01 ** (30 - i))} for i in range(30)]
+    score_d, dir_d, info_d = oi_pulse(candles, down, taker, 1.2, 0.0, a)
+    assert score_d == 0 and dir_d is None and info_d["reason"] == "oi_not_up", info_d
+
+    # 24h 波动超过 1 倍 ATR：not_flat，即使 OI 大增也不计分。
+    jumped = [dict(c) for c in candles]
+    jumped[-1] = dict(jumped[-1], c=jumped[-1]["c"] + a * 3)
+    score_j, dir_j, info_j = oi_pulse(jumped, oi, taker, 1.2, 0.0, a)
+    assert score_j == 0 and info_j["reason"] == "not_flat", info_j
+
+    # 缺历史：no_oi。小增幅且量能没放大：below_bar，分数仍是 0。
+    score_m, dir_m, info_m = oi_pulse(candles, [], taker, 1.2, 0.0, a)
+    assert score_m == 0 and info_m["reason"] == "no_oi"
+    mild = [{"ts": i, "oiUsd": 1000 * (1 + 0.001 * i)} for i in range(30)]
+    quiet = [dict(c, vol=100) for c in candles]
+    score_b, dir_b, info_b = oi_pulse(quiet, mild, taker, 1.2, 0.0, a)
+    assert score_b == 0 and info_b["reason"] == "below_bar", (score_b, info_b)
+
+    span = 4 * 3600
+    now_ms = 1_000_000_000_000
+    opened = now_ms - span * 1000 - 30_000
+    assert close_age_sec(opened, span, now_ms) < 60
+    assert close_age_sec(now_ms - 10 * span * 1000, span, now_ms) > 2 * span
+    assert config.SWING_ENTRY_THRESHOLD == 0.65
+    assert config.MAX_SPREAD_BPS == 6 and config.SWING_MAX_SPREAD_BPS == 8
+    assert config.MIN_VOL_USDT_24H == 10_000_000 and config.SWING_MIN_VOL_USDT_24H == 8_000_000
+    assert config.MAX_MARK_INDEX_BPS == 50
+
+    _retry_and_gate_checks()
 
     # 状态往返不丢家族和冷却
     import tempfile

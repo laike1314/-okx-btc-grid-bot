@@ -236,11 +236,11 @@ class RiskGate:
         t = self.c.ticker(inst)
         mid = (t["bid"] + t["ask"]) / 2
         spread_bps = (t["ask"] - t["bid"]) / mid * 1e4 if mid else 1e9
-        if spread_bps > config.MAX_SPREAD_BPS:
-            return False, f"点差 {spread_bps:.2f}bps > {config.MAX_SPREAD_BPS}"
+        if spread_bps > config.SWING_MAX_SPREAD_BPS:
+            return False, f"点差 {spread_bps:.2f}bps > {config.SWING_MAX_SPREAD_BPS}"
         vol = float(t.get("vol_usdt_24h") or 0)
-        if config.MIN_VOL_USDT_24H > 0 and vol < config.MIN_VOL_USDT_24H:
-            return False, f"24h成交额 {vol:.0f}U < {config.MIN_VOL_USDT_24H:.0f}U"
+        if config.SWING_MIN_VOL_USDT_24H > 0 and vol < config.SWING_MIN_VOL_USDT_24H:
+            return False, f"24h成交额 {vol:.0f}U < {config.SWING_MIN_VOL_USDT_24H:.0f}U"
         try:
             mark = float(self.c.mark_price(inst))
             idx = float(self.c.index_price(inst))

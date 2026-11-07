@@ -221,6 +221,8 @@ python main.py --hours 6 --stop-after-flat  # 跑 6 小时，到时后等最后�
    **方向按这个顺序，用到第一个能定的：** 主动买卖失衡 ≥ 5% → 多空账户比偏离 1 超过 5%（账户偏多则做多，不反向）→ 残余价格漂移 → 资金费反向（正资金费做空）。
 4. **合成**。趋势市动量 0.7 / OI 0.3，震荡市动量 0.3 / OI 0.7。两条腿同向加 `SWING_AGREE_BONUS`（0.1），总分不超过 1。方向相反则本轮不做。入场要合成分 ≥ `SWING_ENTRY_THRESHOLD`（0.65）。哪条腿的加权贡献更大，出场就按哪个家族。
 
+OI 腿记 0 时日志会写原因，不把门槛放低来凑单：`not_flat`（回看窗口涨跌超过 1 倍这根 4H 的 ATR）、`oi_not_up`（持仓量没有增加）、`below_bar`（增幅或成交量没到原来的活跃度）、`no_direction`、`no_oi`、`oi_misaligned`（OI 末根和 K 线对不上）。第 4 轮里大约四分之三的 OI 腿是 0，主要是前两类；4H 收盘之间分数不变，是因为只用已收盘 K 线，不是把行情缓存住。读行情的 GET 若返回空 `code` 或 5xx，会有限次重试，并在错误里带上 HTTP 状态和响应片段。下单 POST 遇到这种空错误不重试。
+
 ### 出场和费用
 
 交易所止损、止盈在开仓时就挂上，作业之间也一直有效。最短持仓之内不做信号平仓，但止损止盈照常触发。
@@ -273,6 +275,8 @@ python main.py --hours 6 --stop-after-flat  # 跑 6 小时，到时后等最后�
 | `SWING_AGREE_BONUS` | 0.1 | 同向加分 |
 | `SWING_MIN_LEG` | 0.15 | 低于此不算有方向 |
 | `SWING_ENTRY_THRESHOLD` | 0.65 | 入场阈值（0～1） |
+| `SWING_MAX_SPREAD_BPS` | 8 | 波段开仓点差上限。剥头皮仍是 `MAX_SPREAD_BPS` 6 |
+| `SWING_MIN_VOL_USDT_24H` | 8000000 | 波段 24h 成交额下限。剥头皮仍是 1000 万 |
 | `SWING_EXIT_SCORE` | 0.35 | 最短持仓后，低于此视为信号消失 |
 | `SWING_MOM_TP_ATR` / `SWING_MOM_SL_ATR` / `SWING_MOM_TRAIL_ATR` | 1 / 1.5 / 1 | 动量出场 |
 | `SWING_MOM_MIN_HOLD_SEC` / `SWING_MOM_MAX_HOLD_SEC` | 43200 / 86400 | 12h / 24h |

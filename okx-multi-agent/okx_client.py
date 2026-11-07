@@ -45,6 +45,15 @@ def _f(v, default=0.0):
         return default
 
 
+def _preview(text, n=160):
+    return (text or "").replace("\n", " ").strip()[:n]
+
+
+def transient_read_code(code):
+    """只读 GET 可以重试的空响应 / 网关错误。业务错误码不在这里。"""
+    return str(code) in {"EMPTY", "429", "500", "502", "503", "504"} | RATE_LIMIT_CODES
+
+
 # =====================================================================
 # 真实客户端（模拟盘）
 # =====================================================================
@@ -111,34 +120,60 @@ class OkxClient:
                     "OK-ACCESS-TIMESTAMP": ts,
                     "OK-ACCESS-PASSPHRASE": self.passphrase,
                 })
+            preview = ""
+            status = 0
             try:
                 r = self.s.request(method, self.base + req_path, headers=headers,
                                    data=body_text or None, timeout=15)
-                if r.status_code == 429:
-                    raise OkxError("429", "HTTP 429 限流")
+                status = int(getattr(r, "status_code", 0) or 0)
+                preview = _preview(getattr(r, "text", "") or "")
+                if status == 429 or status >= 500:
+                    raise OkxError(str(status), f"HTTP {status} body={preview} path={path}")
                 data = r.json()
             except OkxError as e:
                 last = e
+                # 下单只在限流码上重试。空响应和 5xx 直接失败，避免重复下单。
+                if method != "GET" and str(e.code) not in RATE_LIMIT_CODES and str(e.code) != "429":
+                    raise
             except Exception as e:
-                # 网络异常：GET 可重试；POST 不重试，避免重复下单
+                # 网络异常或空正文：GET 可重试；POST 不重试，避免重复下单
                 if method != "GET":
                     raise OkxError("NET", f"网络错误(未重试以免重复下单): {e}")
-                last = e
+                last = OkxError("EMPTY", f"读行情失败 http={status} body={preview} path={path}: {e}")
             else:
-                code = str(data.get("code"))
-                if code == "0":
-                    return data.get("data", [])
-                rows = data.get("data") or []
-                scode = str(rows[0].get("sCode", "")) if rows and isinstance(rows[0], dict) else ""
-                eff = scode if scode and scode != "0" else code
-                smsg = rows[0].get("sMsg", "") if rows and isinstance(rows[0], dict) else ""
-                if eff in RATE_LIMIT_CODES or code in RATE_LIMIT_CODES:
-                    last = OkxError(eff, f"限流/繁忙: {data.get('msg')} {smsg}")
+                if not isinstance(data, dict):
+                    last = OkxError("EMPTY", f"读行情不是对象 http={status} body={preview} path={path}")
+                    if method != "GET":
+                        raise last
                 else:
-                    raise OkxError(eff, f"{data.get('msg')} {smsg}".strip(), data)
-            if attempt < retries:
+                    raw_code = data.get("code")
+                    code = "" if raw_code is None else str(raw_code).strip()
+                    if code in ("", "None"):
+                        last = OkxError("EMPTY", f"空响应 http={status} body={preview} path={path}")
+                        if method != "GET":
+                            raise last
+                    elif code == "0":
+                        payload = data.get("data")
+                        return [] if payload is None else payload
+                    else:
+                        rows = data.get("data") or []
+                        scode = str(rows[0].get("sCode", "")) if rows and isinstance(rows[0], dict) else ""
+                        eff = scode if scode and scode != "0" else code
+                        smsg = rows[0].get("sMsg", "") if rows and isinstance(rows[0], dict) else ""
+                        msg = f"{data.get('msg')} {smsg}".strip()
+                        if eff in RATE_LIMIT_CODES or code in RATE_LIMIT_CODES:
+                            last = OkxError(eff, f"限流/繁忙 http={status} {msg} path={path}")
+                        else:
+                            raise OkxError(eff, f"{msg} http={status} path={path}", data)
+            retryable = method == "GET" and transient_read_code(getattr(last, "code", ""))
+            if isinstance(last, OkxError) and str(last.code) in (RATE_LIMIT_CODES | {"429"}):
+                retryable = True
+            if retryable and attempt < retries:
                 time.sleep(min(2 ** attempt * 0.5, 8))
-        raise OkxError(getattr(last, "code", "RETRY"), f"重试 {retries} 次仍失败 {method} {path}: {last}")
+                continue
+            break
+        raise OkxError(getattr(last, "code", "RETRY"),
+                       f"重试 {retries} 次仍失败 {method} {path}: {last}")
 
     # ---------- 行情 ----------
     def instrument(self, inst_id):
