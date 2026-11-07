@@ -3,7 +3,31 @@
   "global_cooldown_until": 0,
   "symbol_cooldown": {},
   "daily": {},
-  "open_meta": {},
+  "open_meta": {
+    "LIT-USDT-SWAP": {
+      "direction": "long",
+      "qty": 179.0,
+      "entry": 3.5602,
+      "sl": 3.22,
+      "tp": 4.0562,
+      "opened_at": "2026-11-07T16:00:57+08:00",
+      "opened_ts": 1794038457.7820117,
+      "open_ms": 1794038457782,
+      "score": 0.778303065521471,
+      "family": "oi",
+      "regime": "range",
+      "mom_score": 0.6551724137931034,
+      "oi_score": 0.6882162019764857,
+      "combined": 0.778303065521471,
+      "atr": 0.2836194540794011,
+      "atr_pct": 0.07961024366457112,
+      "min_hold_sec": 86400,
+      "max_hold_sec": 172800,
+      "sl_pct": 0.09553229239748534,
+      "tp_pct": 0.13931792641299945,
+      "tag": "swoi"
+    }
+  },
   "day_start_equity": {},
   "pnl_events": [],
   "last_entry_bar": {},
@@ -11,5 +35,5 @@
   "swing_start_equity": 83466.29072858812,
   "swing_peak_equity": 84297.98659643573,
   "swing_halted": false,
-  "swing_last_reconcile": 1794006710.5589137
+  "swing_last_reconcile": 1794031737.416873
 }
