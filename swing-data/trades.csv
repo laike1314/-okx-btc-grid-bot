@@ -1,0 +1,2 @@
+time,instId,direction,qty,entry,exit,gross_pnl,fee,funding,net_pnl,est_net,reason,equity_after,family,regime,combined
+2026-11-08T00:30:00+08:00,LIT-USDT-SWAP,long,179.0,3.5602,2.9878361016949153,-3376.9469999999997,-11.7531023,-1.025125,-3389.7252,,交易所止盈/止损 [oi/range],80777.3559,oi,range,0.778303065521471
