@@ -2,29 +2,38 @@
   "consecutive_losses": 0,
   "global_cooldown_until": 0,
   "symbol_cooldown": {
-    "LIT-USDT-SWAP": 1794140083.3517504
+    "LIT-USDT-SWAP": 1794140083.3517504,
+    "ARB-USDT-SWAP": 1794191414.238932,
+    "BNB-USDT-SWAP": 1794203170.2690434
   },
   "daily": {
-    "2026-11-08": -7156.3569295
+    "2026-11-08": -7156.3569295,
+    "2026-11-09": -1312.885764758747
   },
   "open_meta": {},
   "day_start_equity": {},
   "pnl_events": [
     {
-      "ts": 1794069000.2865899,
-      "net": -3389.7252273
-    },
-    {
       "ts": 1794111283.3517396,
       "net": -3766.6317022000003
+    },
+    {
+      "ts": 1794162614.2389219,
+      "net": -1158.615112458747
+    },
+    {
+      "ts": 1794174370.2690341,
+      "net": -154.2706523
     }
   ],
   "last_entry_bar": {},
   "last_exit_trend_bar": {
-    "LIT-USDT-SWAP": 1794109500000
+    "LIT-USDT-SWAP": 1794109500000,
+    "ARB-USDT-SWAP": 1794161700000,
+    "BNB-USDT-SWAP": 1794173400000
   },
   "swing_start_equity": 83466.29072858812,
   "swing_peak_equity": 84297.98659643573,
   "swing_halted": false,
-  "swing_last_reconcile": 1794118481.0568192
+  "swing_last_reconcile": 1794156223.0649967
 }
