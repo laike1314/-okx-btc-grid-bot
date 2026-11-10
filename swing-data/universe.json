@@ -33,10 +33,10 @@
     "ICP-USDT-SWAP",
     "ARB-USDT-SWAP",
     "ETC-USDT-SWAP",
-    "ALGO-USDT-SWAP",
     "JUP-USDT-SWAP",
-    "INJ-USDT-SWAP",
-    "LIT-USDT-SWAP"
+    "ALGO-USDT-SWAP",
+    "LIT-USDT-SWAP",
+    "INJ-USDT-SWAP"
   ],
   "stocks": [],
   "symbols": [
@@ -66,10 +66,10 @@
     "ICP-USDT-SWAP",
     "ARB-USDT-SWAP",
     "ETC-USDT-SWAP",
-    "ALGO-USDT-SWAP",
     "JUP-USDT-SWAP",
-    "INJ-USDT-SWAP",
-    "LIT-USDT-SWAP"
+    "ALGO-USDT-SWAP",
+    "LIT-USDT-SWAP",
+    "INJ-USDT-SWAP"
   ],
   "instruments": 191,
   "rank_error": ""
