@@ -3,62 +3,34 @@
   "global_cooldown_until": 0,
   "symbol_cooldown": {
     "LIT-USDT-SWAP": 1794140083.3517504,
-    "ARB-USDT-SWAP": 1794191414.238932,
+    "ARB-USDT-SWAP": 1794286134.523534,
     "BNB-USDT-SWAP": 1794203170.2690434
   },
   "daily": {
     "2026-11-08": -7156.3569295,
-    "2026-11-09": -1312.885764758747
+    "2026-11-09": -1312.885764758747,
+    "2026-11-10": 1467.6323615694446
   },
-  "open_meta": {
-    "ARB-USDT-SWAP": {
-      "direction": "long",
-      "qty": 29.6,
-      "entry": 0.1721,
-      "sl": 0.1636,
-      "tp": 0.1833,
-      "opened_at": "2026-11-09T14:48:15+08:00",
-      "opened_ts": 1794206895.3825006,
-      "open_ms": 1794206895382,
-      "score": 0.8125072267644707,
-      "family": "momentum",
-      "regime": "trend",
-      "mom_score": 0.7931034482758621,
-      "oi_score": 0.5244493765712246,
-      "combined": 0.8125072267644707,
-      "atr": 0.010571072143113047,
-      "atr_pct": 0.0646153553980015,
-      "min_hold_sec": 43200,
-      "max_hold_sec": 86400,
-      "sl_pct": 0.09692303309700226,
-      "tp_pct": 0.0646153553980015,
-      "tag": "swmom",
-      "peak_px": 0.1742
-    }
-  },
+  "open_meta": {},
   "day_start_equity": {},
   "pnl_events": [
     {
-      "ts": 1794111283.3517396,
-      "net": -3766.6317022000003
-    },
-    {
-      "ts": 1794162614.2389219,
-      "net": -1158.615112458747
-    },
-    {
       "ts": 1794174370.2690341,
       "net": -154.2706523
+    },
+    {
+      "ts": 1794257334.5235229,
+      "net": 1467.6323615694446
     }
   ],
   "last_entry_bar": {},
   "last_exit_trend_bar": {
     "LIT-USDT-SWAP": 1794109500000,
-    "ARB-USDT-SWAP": 1794161700000,
+    "ARB-USDT-SWAP": 1794256200000,
     "BNB-USDT-SWAP": 1794173400000
   },
   "swing_start_equity": 83466.29072858812,
   "swing_peak_equity": 84297.98659643573,
   "swing_halted": false,
-  "swing_last_reconcile": 1794206846.0662334
+  "swing_last_reconcile": 1794257333.4066856
 }
