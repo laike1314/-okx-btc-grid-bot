@@ -213,5 +213,18 @@ SWING_MONITOR_INTERVAL_SEC = _env("SWING_MONITOR_INTERVAL_SEC", 60, int)
 SWING_CHASE_ATR = _env("SWING_CHASE_ATR", 1.0, float)       # 现价相对信号收盘已顺着方向跑超过这么多 ATR 就不追
 SWING_RUBIK_GAP_SEC = _env("SWING_RUBIK_GAP_SEC", 0.45, float)
 
+# ---------------- 可用保证金 / 51008 ----------------
+# 不改入场阈值、点差、成交额、标记价偏离、GET 重试。这里只决定「用哪一笔余额算张数」。
+# 51008 之后该合约冷却这么多秒再试。和 SWING_COOLDOWN_SEC（平仓后 8 小时）分开。
+MARGIN_COOLDOWN_SEC = _env("MARGIN_COOLDOWN_SEC", 1800, int)
+# 被 51008 拒绝后，下次张数 = 正常张数 × 这个比例，再乘下去，但不低于 MARGIN_SCALE_FLOOR。
+MARGIN_RETRY_FRACTION = _env("MARGIN_RETRY_FRACTION", 0.5, float)
+MARGIN_SCALE_FLOOR = _env("MARGIN_SCALE_FLOOR", 0.25, float)
+# 单笔初始保证金不超过可用保证金的这个比例，给手续费和标记价留余量。
+MARGIN_USE_FRAC = _env("MARGIN_USE_FRAC", 0.90, float)
+# 权益和「起始权益 + 本策略已实现盈亏 + 本策略浮盈」差过这条线，就当成说不清来源。
+EQUITY_UNEXPLAINED_USDT = _env("EQUITY_UNEXPLAINED_USDT", 50.0, float)
+EQUITY_UNEXPLAINED_PCT = _env("EQUITY_UNEXPLAINED_PCT", 0.005, float)
+
 # ---------------- 文件 ----------------
 DATA_DIR = _env("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))

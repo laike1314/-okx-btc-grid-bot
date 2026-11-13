@@ -119,10 +119,25 @@ def fee_allows(tp_pct, round_trip):
     return float(tp_pct) + 1e-12 >= float(round_trip) * mult
 
 
-def size_qty(equity, entry, ct_val, lot, min_sz):
-    """名义 ≈ 权益 × SWING_ALLOC_PCT / 最大同时持仓数。杠杆另行设置，这里只算张数。"""
+def size_qty(equity, entry, ct_val, lot, min_sz, available=None, fraction=1.0, lever=1):
+    """名义 ≈ 基准 × SWING_ALLOC_PCT / 最大同时持仓数 × fraction。
+
+    读到可用保证金时，基准是 min(总权益, 可用保证金)，不再按虚高的 eq 开满 1/N。
+    杠杆另行设置。单笔保证金再封顶到可用保证金的 MARGIN_USE_FRAC。
+    """
+    from agents.margin import sizing_base, use_frac
     slots = max(1, int(config.SWING_MAX_POSITIONS))
-    notional = float(equity) * float(config.SWING_ALLOC_PCT) / slots
+    base, _how = sizing_base(equity, available)
+    try:
+        frac = float(fraction if fraction is not None else 1.0)
+    except (TypeError, ValueError):
+        frac = 1.0
+    if frac <= 0 or base <= 0:
+        return None
+    notional = base * float(config.SWING_ALLOC_PCT) / slots * frac
+    if available is not None:
+        cap = max(0.0, float(available)) * use_frac() * max(1, int(lever or 1))
+        notional = min(notional, cap)
     per = float(entry) * float(ct_val)
     if per <= 0 or notional <= 0:
         return None
@@ -499,25 +514,26 @@ def _bracket_from_client(client, inst):
 
 def reconcile(client, state, journal, executor=None):
     """用交易所持仓和最近平仓记录补齐 state。没有标签、也不在账本里的仓不接管。"""
+    from agents.margin import mark_fresh_start, seed_basis, note_swing_equity
     now = state.now()
     try:
         eq = float(client.equity())
     except Exception as e:
         journal.log(AGENT, "reconcile_equity_err", f"读权益失败，起点/峰值本轮不更新: {e}")
         eq = None
+    reset_done = False
     if config.SWING_RESET_HALT and state.d.get("swing_halted") and eq is not None:
         state.d["swing_halted"] = False
         state.d["swing_start_equity"] = eq
         state.d["swing_peak_equity"] = eq
+        reset_done = True
         journal.log(AGENT, "halt_reset",
                     f"SWING_RESET_HALT=1，已解除账户停机，起点和峰值重置为 {eq:.2f}")
     elif eq is not None:
         if not state.d.get("swing_start_equity"):
             state.d["swing_start_equity"] = eq
+            mark_fresh_start(state)
             journal.log(AGENT, "seed_start", f"首次记录波段起始权益 {eq:.2f}")
-        peak = float(state.d.get("swing_peak_equity") or 0)
-        if eq > peak:
-            state.d["swing_peak_equity"] = eq
     try:
         positions = list(client.positions() or [])
     except Exception as e:
@@ -600,11 +616,28 @@ def reconcile(client, state, journal, executor=None):
             prev = float(state.d.setdefault("symbol_cooldown", {}).get(inst, 0) or 0)
             if until > prev:
                 state.d["symbol_cooldown"][inst] = until
+    our_upl = 0.0
+    for p in positions:
+        if p.get("instId") not in meta_map:
+            continue
+        try:
+            our_upl += float(p.get("upl") or 0)
+        except (TypeError, ValueError):
+            pass
+    state.d["swing_last_our_upl"] = our_upl
+    if eq is not None:
+        if reset_done:
+            seed_basis(state, eq, our_upl)
+        try:
+            note_swing_equity(state, journal, eq, our_upl)
+        except Exception as e:
+            journal.log(AGENT, "equity_mark_err", f"核对权益来源失败，峰值暂不更新: {e}")
     state.d["swing_last_reconcile"] = now
     state.save()
     ours = sum(1 for inst in meta_map if inst in live)
     journal.log(AGENT, "reconcile",
                 f"对账完成：本策略持仓 {ours}，交易所持仓 {len(positions)}，"
+                f"当前权益 {None if eq is None else round(eq, 2)} "
                 f"起始权益 {state.d.get('swing_start_equity')} 峰值 {state.d.get('swing_peak_equity')}"
                 f"{'，账户停机中' if state.d.get('swing_halted') else ''}")
 
@@ -620,16 +653,19 @@ def enforce_account_stop(agents):
     except Exception as e:
         journal.log(AGENT, "equity_error", f"检查账户止损失败: {e}")
         return
+    from agents.margin import mark_fresh_start, note_swing_equity, seed_basis
     start = float(state.d.get("swing_start_equity") or 0)
     if start <= 0:
         state.d["swing_start_equity"] = eq
         state.d["swing_peak_equity"] = max(float(state.d.get("swing_peak_equity") or 0), eq)
+        mark_fresh_start(state)
+        seed_basis(state, eq, float(state.d.get("swing_last_our_upl") or 0))
         state.save()
         return
-    peak = float(state.d.get("swing_peak_equity") or 0)
-    if eq > peak:
-        state.d["swing_peak_equity"] = eq
-        state.save()
+    try:
+        note_swing_equity(state, journal, eq, state.d.get("swing_last_our_upl") or 0)
+    except Exception as e:
+        journal.log(AGENT, "equity_mark_err", f"核对权益来源失败，峰值暂不更新: {e}")
     if eq <= start * (1 - float(config.SWING_ACCOUNT_STOP_PCT)):
         state.d["swing_halted"] = True
         state.save()
@@ -691,12 +727,18 @@ def run_cycle(agents, monitor, can_open):
         if not ok:
             continue
         try:
-            plan = agents["position"].plan(cand, equity)
+            from agents.margin import scale_for, on_margin_reject, on_margin_filled
+            scale = scale_for(state, cand["instId"])
+            plan = agents["position"].plan(cand, equity, size_scale=scale)
             fill = agents["executor"].open(plan) if plan else None
         except Exception as e:
             journal.log("executor", "error", f"{cand['instId']} 开仓流程失败: {e}", inst=cand["instId"])
             continue
+        if isinstance(fill, dict) and str(fill.get("rejected") or "") == "51008":
+            on_margin_reject(state, journal, cand["instId"])
+            continue
         if fill and agents["equity"].register_open(plan, fill):
+            on_margin_filled(state, cand["instId"])
             positions = client.positions()
             held = {p["instId"] for p in positions}
         if not can_open(agents, positions):
@@ -862,6 +904,8 @@ def _retry_and_gate_checks():
 
 def offline_self_check():
     """不联网。体制、截面排名、合成、费用、持仓时间、张数。"""
+    from agents.margin import offline_self_check as margin_check
+    margin_check()
     assert classify_regime(30, 0.2) == "trend"
     assert classify_regime(10, 2.0) == "trend"
     assert classify_regime(10, 0.4) == "range"

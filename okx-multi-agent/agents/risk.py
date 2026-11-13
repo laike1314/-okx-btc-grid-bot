@@ -99,8 +99,14 @@ class RiskGate:
         return None
 
     def _swing_global_block(self, equity):
-        """波段：账户停机、较峰值回撤。不使用剥头皮的 2% 滚动亏损闸门。"""
+        """波段：账户停机、较峰值回撤。不使用剥头皮的 2% 滚动亏损闸门。
+
+        峰值只在上涨能被本策略已实现盈亏和持仓浮盈解释时抬高。
+        说不清来源的跳涨不抬峰值。已经记下的峰值不自动下调。
+        账户止损仍按起始权益，较峰值回撤的比较式也不变。
+        """
         from .swing import AGENT as SWING
+        from .margin import note_swing_equity, mark_fresh_start, seed_basis
         if self.s.d.get("swing_halted"):
             return (f"波段账户停机中（较起始权益回撤达到 {config.SWING_ACCOUNT_STOP_PCT:.0%}）。"
                     f"确认要重新开始时设 SWING_RESET_HALT=1")
@@ -108,8 +114,14 @@ class RiskGate:
         if start <= 0:
             self.s.d["swing_start_equity"] = equity
             self.s.d["swing_peak_equity"] = equity
+            mark_fresh_start(self.s)
+            seed_basis(self.s, equity, float(self.s.d.get("swing_last_our_upl") or 0))
             self.s.save()
             return None
+        try:
+            note_swing_equity(self.s, self.j, equity, self.s.d.get("swing_last_our_upl") or 0)
+        except Exception as e:
+            self.j.log(SWING, "equity_mark_err", f"核对权益来源失败，峰值暂不更新: {e}")
         if equity <= start * (1 - float(config.SWING_ACCOUNT_STOP_PCT)):
             self.s.d["swing_halted"] = True
             self.s.save()
@@ -117,10 +129,6 @@ class RiskGate:
                        f"权益 {equity:.2f} 较起始 {start:.2f} 达到停机线")
             return "波段账户止损已触发"
         peak = float(self.s.d.get("swing_peak_equity") or 0)
-        if equity > peak:
-            peak = equity
-            self.s.d["swing_peak_equity"] = peak
-            self.s.save()
         if peak > 0 and (peak - equity) / peak >= float(config.SWING_PEAK_DD_PCT):
             dd = (peak - equity) / peak
             return f"权益较峰值 {peak:.2f} 回撤 {dd:.1%}，暂停开新仓（不平已有仓）"
@@ -138,6 +146,10 @@ class RiskGate:
         # 同一合约只留一个方向：已有多或空都不再开，避免同向加仓和反向对锁。
         if any(p["instId"] == inst for p in positions):
             return False, "该币已有持仓"
+        from .margin import margin_cooldown_block
+        blocked, why = margin_cooldown_block(self.s, inst)
+        if blocked:
+            return False, why
         if config.SYMBOL_COOLDOWN_SEC > 0:
             until = self.s.d["symbol_cooldown"].get(inst, 0)
             if self.s.now() < until:
@@ -222,6 +234,10 @@ class RiskGate:
             return False, g
         if any(p["instId"] == inst for p in positions):
             return False, "该合约已有持仓"
+        from .margin import margin_cooldown_block
+        blocked, why = margin_cooldown_block(self.s, inst)
+        if blocked:
+            return False, why
         ours = our_position_count(positions, self.s.d.get("open_meta") or {})
         if config.SWING_MAX_POSITIONS > 0 and ours >= config.SWING_MAX_POSITIONS:
             return False, f"波段持仓 {ours} 已达上限 {config.SWING_MAX_POSITIONS}"
