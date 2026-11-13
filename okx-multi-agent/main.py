@@ -189,12 +189,18 @@ def scan_and_trade(a):
             if not ok:
                 continue
             try:
-                plan = a["position"].plan(cand, equity)
+                from agents.margin import scale_for, on_margin_reject, on_margin_filled
+                scale = scale_for(a["state"], cand["instId"])
+                plan = a["position"].plan(cand, equity, size_scale=scale)
                 fill = a["executor"].open(plan) if plan else None
             except Exception as e:
                 j.log("executor", "error", f"{cand['instId']} 开仓流程失败: {e}", inst=cand["instId"])
                 continue
+            if isinstance(fill, dict) and str(fill.get("rejected") or "") == "51008":
+                on_margin_reject(a["state"], j, cand["instId"])
+                continue
             if fill and a["equity"].register_open(plan, fill):
+                on_margin_filled(a["state"], cand["instId"])
                 if fill.get("flattened"):
                     a["equity"].sync(c.positions())
                 positions = c.positions()
@@ -240,6 +246,11 @@ def run(args):
             sys.exit(3)
     a["fees"].refresh(force=True)
     a["executor"].init_mode()
+    try:
+        from agents.margin import log_account_snapshot
+        log_account_snapshot(j, c, "startup")
+    except Exception as e:
+        j.log("main", "margin_snapshot_err", f"启动时账户明细读取失败: {e}")
     if config.is_swing():
         from agents.swing import reconcile
         reconcile(c, a["state"], j, a["executor"])

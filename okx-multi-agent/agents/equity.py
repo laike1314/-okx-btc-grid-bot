@@ -93,6 +93,17 @@ class EquityTracker:
             except Exception as e:
                 self.j.log(AGENT, "adopt_error", f"{p.get('instId')} 接管失败，下轮重试: {e}",
                            inst=p.get("instId"))
+        if config.is_swing():
+            book = self.s.d.get("open_meta") or {}
+            upl = 0.0
+            for p in positions:
+                if p.get("instId") not in book:
+                    continue
+                try:
+                    upl += float(p.get("upl") or 0)
+                except (TypeError, ValueError):
+                    pass
+            self.s.d["swing_last_our_upl"] = upl
 
     def _adopt_if_needed(self, p):
         if p["instId"] in self.known:

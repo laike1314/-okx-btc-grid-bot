@@ -89,11 +89,19 @@ class Executor:
                                     "tpTriggerPx": str(plan["tp"]), "tpOrdPx": "-1", "tpTriggerPxType": "last"}]}
         if plan.get("tag"):
             body["tag"] = str(plan["tag"])[:16]
+        if not self._margin_allows(inst, plan):
+            return None
         try:
             r = self.c.place_order(body)
         except OkxError as e:
             if e.code == "51088":
                 self.j.log(AGENT, "order_51088", f"{inst} TP/SL 已存在，视为成功", inst=inst)
+            elif str(e.code) == "51008":
+                # 业务拒绝，不是网络空响应。这里不再 POST，交给调用方冷却并缩小下次张数。
+                self.j.log(AGENT, "margin_reject",
+                           f"{inst} 51008 保证金不足，本单 POST 不重试。{e}",
+                           inst=inst, code=e.code)
+                return {"rejected": "51008", "instId": inst}
             else:
                 self.j.log(AGENT, "order_fail", f"{inst} 下单失败: {e}", inst=inst, code=e.code)
                 return None
@@ -128,6 +136,31 @@ class Executor:
                    f"SL {sl} TP {tp}", inst=inst, ordId=ord_id, fill_px=fill_px, qty=filled,
                    sl=sl, tp=tp)
         return {"ordId": ord_id, "fill_px": fill_px, "qty": filled}
+
+    def _margin_allows(self, inst, plan):
+        """下单前记下全账户，保证金明显不够就不发 POST。"""
+        view = None
+        try:
+            from agents.margin import log_account_snapshot, use_frac
+            view = log_account_snapshot(self.j, self.c, "pre_order", inst=inst,
+                                        margin=plan.get("margin"), notional=plan.get("notional"))
+        except Exception as e:
+            self.j.log(AGENT, "margin_snapshot_err", f"{inst} 下单前账户明细失败: {e}", inst=inst)
+            return True
+        if not isinstance(view, dict) or view.get("available") is None or plan.get("margin") is None:
+            return True
+        try:
+            avail = float(view["available"])
+            need = float(plan["margin"])
+        except (TypeError, ValueError):
+            return True
+        limit = avail * use_frac()
+        if avail <= 0 or need > limit + 0.05:
+            self.j.log(AGENT, "margin_skip",
+                       f"{inst} 计划保证金 {need:.2f} 超过可用 {avail:.2f} 的 {use_frac():.0%}，不发 POST",
+                       inst=inst, margin=need, available=avail)
+            return False
+        return True
 
     def _mark(self, inst, fallback):
         try:

@@ -300,7 +300,20 @@ class OkxClient:
 
     # ---------- 账户 ----------
     def pos_mode(self):
-        return self.request("GET", "/api/v5/account/config", private=True)[0].get("posMode", "net_mode")
+        return self.account_config().get("posMode", "net_mode")
+
+    def account_config(self):
+        row = self.request("GET", "/api/v5/account/config", private=True)[0]
+        return {"acctLv": str(row.get("acctLv") or ""), "posMode": row.get("posMode") or "net_mode"}
+
+    def balance(self):
+        """全部币种。定仓和诊断用，不要只看 USDT eq。"""
+        rows = self.request("GET", "/api/v5/account/balance", private=True)
+        return rows[0] if rows else {}
+
+    def margin_view(self):
+        from agents.margin import assemble_margin_view
+        return assemble_margin_view(self.account_config(), self.balance(), config.TD_MODE)
 
     def equity(self):
         r = self.request("GET", "/api/v5/account/balance", {"ccy": "USDT"}, private=True)[0]
@@ -313,15 +326,54 @@ class OkxClient:
         rows = self.request("GET", "/api/v5/account/positions", {"instType": "SWAP"}, private=True)
         return [self._norm_pos(p) for p in rows if _f(p.get("pos")) != 0]
 
+    def positions_all(self):
+        """不传 instType，MARGIN / SWAP / FUTURES / OPTION 一起回来。"""
+        rows = self.request("GET", "/api/v5/account/positions", private=True)
+        return [self._norm_pos(p) for p in rows if _f(p.get("pos")) != 0]
+
     def _norm_pos(self, p):
         qty = _f(p.get("pos"))
         side = p.get("posSide")
         if side not in ("long", "short"):
             side = "long" if qty > 0 else "short"
-        return {"instId": p["instId"], "side": side, "posSide": p.get("posSide", "net"),
+        return {"instId": p["instId"], "instType": p.get("instType") or "",
+                "side": side, "posSide": p.get("posSide", "net"),
                 "qty": abs(qty), "avgPx": _f(p.get("avgPx")), "markPx": _f(p.get("markPx")),
                 "upl": _f(p.get("upl")), "notional": abs(_f(p.get("notionalUsd"))),
-                "lever": _f(p.get("lever")), "cTime": int(p.get("cTime") or 0)}
+                "lever": _f(p.get("lever")), "cTime": int(p.get("cTime") or 0),
+                "mgnMode": p.get("mgnMode") or "", "imr": _f(p.get("imr")),
+                "margin": _f(p.get("margin")), "ccy": p.get("ccy") or ""}
+
+    def pending_orders(self):
+        """未完成委托。按产品类型分别拉，避免只看到 SWAP。"""
+        out, seen, errors = [], set(), []
+        for inst_type in ("SPOT", "MARGIN", "SWAP", "FUTURES", "OPTION"):
+            try:
+                rows = self.request("GET", "/api/v5/trade/orders-pending",
+                                    {"instType": inst_type, "limit": "100"}, private=True) or []
+            except OkxError as e:
+                errors.append(f"orders {inst_type} {e.code}")
+                continue
+            for r in rows:
+                oid = str(r.get("ordId") or "")
+                if oid and oid in seen:
+                    continue
+                if oid:
+                    seen.add(oid)
+                item = self._norm_order(r)
+                if not item.get("instType"):
+                    item["instType"] = inst_type
+                out.append(item)
+        self.last_order_errors = errors
+        return out
+
+    @staticmethod
+    def _norm_order(r):
+        return {"instId": r.get("instId") or "", "instType": r.get("instType") or "",
+                "side": r.get("side") or "", "posSide": r.get("posSide") or "",
+                "ordType": r.get("ordType") or "", "sz": r.get("sz") or "",
+                "px": r.get("px") or "", "state": r.get("state") or "",
+                "reduceOnly": r.get("reduceOnly") or "", "ordId": r.get("ordId") or ""}
 
     def fee_rates(self):
         r = self.request("GET", "/api/v5/account/trade-fee", {"instType": "SWAP"}, private=True)[0]
@@ -538,6 +590,34 @@ class MockOkxClient:
     # ---------- 账户 ----------
     def pos_mode(self):
         return "net_mode"
+
+    def account_config(self):
+        return {"acctLv": "2", "posMode": "net_mode"}
+
+    def balance(self):
+        eq = self.equity()
+        upl = eq - self.cash
+        return {"totalEq": str(eq), "adjEq": "", "availEq": "", "imr": "", "mmr": "", "ordFroz": "",
+                "isoEq": "0", "upl": "",
+                "details": [{"ccy": "USDT", "eq": str(eq), "availEq": str(eq), "availBal": str(eq),
+                             "frozenBal": "0", "cashBal": str(self.cash), "ordFrozen": "0",
+                             "upl": str(upl), "stgyEq": "0", "isoEq": "0", "spotInUseAmt": ""}]}
+
+    def margin_view(self):
+        from agents.margin import assemble_margin_view
+        return assemble_margin_view(self.account_config(), self.balance(), config.TD_MODE)
+
+    def positions_all(self):
+        out = []
+        for p in self.positions():
+            row = dict(p)
+            row.setdefault("instType", "SWAP")
+            out.append(row)
+        return out
+
+    def pending_orders(self):
+        self.last_order_errors = []
+        return []
 
     def _upl(self, p):
         sign = 1 if p["side"] == "long" else -1

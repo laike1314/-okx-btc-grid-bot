@@ -58,9 +58,26 @@ class PositionManager:
     def __init__(self, client, journal, fees):
         self.c, self.j, self.fees = client, journal, fees
 
-    def plan(self, cand, equity):
+    def _available(self, available):
+        """调用方没传入时自己读。0 是真的没有保证金，None 才是没读到。"""
+        if available is not None:
+            return available, ""
+        fn = getattr(self.c, "margin_view", None)
+        if not fn:
+            return None, ""
+        try:
+            view = fn()
+        except Exception as e:
+            self.j.log(AGENT, "margin_view_err", f"读可用保证金失败，仓位按总权益: {e}")
+            return None, ""
+        if not isinstance(view, dict) or view.get("available") is None:
+            self.j.log(AGENT, "margin_view_empty", "没有可用保证金字段，仓位按总权益")
+            return None, ""
+        return view.get("available"), view.get("available_field") or ""
+
+    def plan(self, cand, equity, available=None, size_scale=1.0):
         if config.is_swing():
-            return self._plan_swing(cand, equity)
+            return self._plan_swing(cand, equity, available=available, size_scale=size_scale)
         inst = cand["instId"]
         spec = self.c.instrument(inst)
         lever = int(min(config.LEVERAGE, config.MAX_LEVERAGE, spec["maxLever"]))
@@ -77,10 +94,23 @@ class PositionManager:
         cost_pct = rt
         per_ct_notional = entry * spec["ctVal"]
         per_ct_loss = per_ct_notional * (sl_pct + cost_pct)
+        from agents.margin import sizing_base, use_frac
+        available, avail_field = self._available(available)
+        base, _how = sizing_base(equity, available)
         risk_usdt = equity * config.RISK_PER_TRADE_PCT
         qty_risk = risk_usdt / per_ct_loss
-        qty_margin = equity * config.MAX_MARGIN_PCT * lever / per_ct_notional
-        qty = min(qty_risk, qty_margin)
+        qty_margin = base * config.MAX_MARGIN_PCT * lever / per_ct_notional
+        if available is not None and per_ct_notional > 0:
+            cap = max(0.0, float(available)) * use_frac() * lever / per_ct_notional
+            qty_margin = min(qty_margin, cap)
+        try:
+            scale = float(size_scale if size_scale is not None else 1.0)
+        except (TypeError, ValueError):
+            scale = 1.0
+        if scale <= 0:
+            self.j.log(AGENT, "too_small", f"{inst} 保证金缩放比例 {size_scale} 无效，放弃", inst=inst)
+            return None
+        qty = min(qty_risk, qty_margin) * scale
         lot = float(spec["lotSz"])
         qty = math.floor(qty / lot) * lot
         if qty < spec["minSz"]:
@@ -97,14 +127,17 @@ class PositionManager:
                 "lever": lever, "entry_ref": entry, "sl": sl, "tp": tp, "sl_pct": sl_pct, "tp_pct": tp_pct,
                 "notional": notional, "margin": notional / lever,
                 "risk_usdt": qty * per_ct_loss, "score": cand["score"],
-                "signal_px": cand.get("price")}
+                "signal_px": cand.get("price"), "available": available,
+                "available_field": avail_field, "size_scale": scale}
+        base_txt = (f"按{avail_field or '可用保证金'} {float(available):.1f}"
+                    if available is not None else "按总权益（没有读到可用保证金）")
         self.j.log(AGENT, "plan", f"{inst} {cand['direction']} {plan['qty']}张 名义 {notional:.1f}U "
-                   f"保证金 {plan['margin']:.1f}U {lever}x 止损 {sl}({sl_pct:.2%}) 止盈 {tp}({tp_pct:.2%}) "
-                   f"最大亏损≈{plan['risk_usdt']:.2f}U", **plan)
+                   f"保证金 {plan['margin']:.1f}U {lever}x {base_txt} 止损 {sl}({sl_pct:.2%}) "
+                   f"止盈 {tp}({tp_pct:.2%}) 最大亏损≈{plan['risk_usdt']:.2f}U", **plan)
         return plan
 
-    def _plan_swing(self, cand, equity):
-        """每笔名义约等于分配权益的 1/N，止损止盈按入场家族的 ATR 倍数。"""
+    def _plan_swing(self, cand, equity, available=None, size_scale=1.0):
+        """每笔名义约等于分配额的 1/N。分配额是 min(总权益, 可用保证金)，不是虚高的 eq。"""
         from .swing import profile_for, size_qty, fee_allows
         inst = cand["instId"]
         spec = self.c.instrument(inst)
@@ -120,10 +153,18 @@ class PositionManager:
                        f"{inst} 止盈 {tp_pct:.3%} 不够来回成本 {rt:.3%}×{config.SWING_MIN_EDGE_FEE_MULT:g}，放弃",
                        inst=inst)
             return None
-        qty = size_qty(equity, entry, spec["ctVal"], spec["lotSz"], spec["minSz"])
+        available, avail_field = self._available(available)
+        try:
+            scale = float(size_scale if size_scale is not None else 1.0)
+        except (TypeError, ValueError):
+            scale = 1.0
+        qty = size_qty(equity, entry, spec["ctVal"], spec["lotSz"], spec["minSz"],
+                       available=available, fraction=scale, lever=lever)
         if not qty:
-            self.j.log(AGENT, "too_small", f"{inst} 按权益 1/{config.SWING_MAX_POSITIONS} 算不出最小张数，放弃",
-                       inst=inst)
+            shown = f"{float(available):.2f}" if available is not None else f"权益 {float(equity):.2f}"
+            self.j.log(AGENT, "too_small",
+                       f"{inst} 按 {shown} 的 1/{config.SWING_MAX_POSITIONS} × {scale:g} 算不出最小张数，放弃",
+                       inst=inst, available=available, size_scale=scale)
             return None
         sl, tp = bracket_from_fill(cand["direction"], entry, sl_pct, tp_pct, spec["tickSz"])
         per = entry * spec["ctVal"]
@@ -137,9 +178,12 @@ class PositionManager:
                 "regime": cand.get("regime"), "mom_score": cand.get("mom_score"),
                 "oi_score": cand.get("oi_score"), "combined": cand.get("combined"),
                 "min_hold_sec": prof["min_hold"], "max_hold_sec": prof["max_hold"],
-                "tag": cand.get("tag") or prof["tag"]}
+                "tag": cand.get("tag") or prof["tag"], "available": available,
+                "available_field": avail_field, "size_scale": scale}
+        base_txt = (f"按{avail_field or '可用保证金'} {float(available):.1f} × {scale:g}"
+                    if available is not None else f"按总权益 {float(equity):.1f}（没有读到可用保证金）")
         self.j.log(AGENT, "plan",
                    f"{inst} {cand['direction']} {plan['family']} {plan['qty']}张 名义 {notional:.1f}U "
-                   f"{lever}x 止损 {sl}({sl_pct:.2%}) 止盈 {tp}({tp_pct:.2%})", inst=inst, **{
+                   f"{lever}x {base_txt} 止损 {sl}({sl_pct:.2%}) 止盈 {tp}({tp_pct:.2%})", inst=inst, **{
                        k: plan[k] for k in ("qty", "lever", "sl", "tp", "family", "combined", "notional")})
         return plan

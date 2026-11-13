@@ -16,7 +16,9 @@ class SharedState:
         self.d = {"consecutive_losses": 0, "global_cooldown_until": 0, "symbol_cooldown": {},
                   "daily": {}, "open_meta": {}, "day_start_equity": {}, "pnl_events": [],
                   "last_entry_bar": {}, "last_exit_trend_bar": {},
-                  "swing_start_equity": None, "swing_peak_equity": None, "swing_halted": False}
+                  "swing_start_equity": None, "swing_peak_equity": None, "swing_halted": False,
+                  "margin_cooldown": {}, "margin_scale": {},
+                  "swing_equity_basis": None, "swing_basis_realized": None, "swing_basis_upl": None}
         if os.path.exists(self.path):
             try:
                 self.d.update(json.load(open(self.path, encoding="utf-8")))
