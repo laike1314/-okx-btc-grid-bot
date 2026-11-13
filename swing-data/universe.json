@@ -19,8 +19,8 @@
     "XLM-USDT-SWAP",
     "NEAR-USDT-SWAP",
     "LTC-USDT-SWAP",
-    "GRAM-USDT-SWAP",
     "SUI-USDT-SWAP",
+    "GRAM-USDT-SWAP",
     "HBAR-USDT-SWAP",
     "SHIB-USDT-SWAP",
     "CRO-USDT-SWAP",
@@ -34,9 +34,9 @@
     "ETC-USDT-SWAP",
     "ARB-USDT-SWAP",
     "JUP-USDT-SWAP",
+    "INJ-USDT-SWAP",
     "LIT-USDT-SWAP",
-    "ALGO-USDT-SWAP",
-    "ATOM-USDT-SWAP"
+    "ALGO-USDT-SWAP"
   ],
   "stocks": [],
   "symbols": [
@@ -52,8 +52,8 @@
     "XLM-USDT-SWAP",
     "NEAR-USDT-SWAP",
     "LTC-USDT-SWAP",
-    "GRAM-USDT-SWAP",
     "SUI-USDT-SWAP",
+    "GRAM-USDT-SWAP",
     "HBAR-USDT-SWAP",
     "SHIB-USDT-SWAP",
     "CRO-USDT-SWAP",
@@ -67,9 +67,9 @@
     "ETC-USDT-SWAP",
     "ARB-USDT-SWAP",
     "JUP-USDT-SWAP",
+    "INJ-USDT-SWAP",
     "LIT-USDT-SWAP",
-    "ALGO-USDT-SWAP",
-    "ATOM-USDT-SWAP"
+    "ALGO-USDT-SWAP"
   ],
   "instruments": 191,
   "rank_error": ""
