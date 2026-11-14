@@ -5,12 +5,37 @@
 
 另外：浮盈达到止损距离的一小段后，把止损抬到锁定大部分利润（必须在标记价正确一侧）。
 持仓超过 MAX_HOLD_SEC 就市价平，不再干等远处的 2R。
+
+波段每个监控周期还会看止盈：标记价或最新价已经穿过记录里的止盈，
+而交易所没有有效止盈单时，立刻市价平。这条不受最短持仓限制。
 """
 import time
 import config
 from .position import round_px, stop_is_valid
 
 AGENT = "net_tp"
+TP_CROSS_REASON = "止盈价已穿过且无止盈单，市价平仓"
+
+
+def crossed_tp(side, tp, mark=None, last=None):
+    """多：标记价或最新价 >= 止盈。空：任一价格 <= 止盈。返回穿过的那个价格。"""
+    try:
+        tp_v = float(tp)
+    except (TypeError, ValueError):
+        return None
+    if tp_v <= 0:
+        return None
+    short = side == "short"
+    for raw in (mark, last):
+        try:
+            px = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if px <= 0:
+            continue
+        if (short and px <= tp_v) or ((not short) and px >= tp_v):
+            return px
+    return None
 
 
 class NetTpMonitor:
@@ -78,6 +103,56 @@ class NetTpMonitor:
                            f"{p.get('instId')} 本轮监控失败，其余仓位继续，下轮重试该仓: "
                            f"{type(e).__name__}: {e}", inst=p.get("instId"))
 
+    def _has_live_tp(self, inst):
+        """查不到算法单时当作止盈还在，避免误市价平。"""
+        try:
+            algos = self.c.pending_algos(inst) or []
+        except Exception as e:
+            self.j.log(AGENT, "tp_check_err", f"{inst} 查询止盈单失败，本轮不市价抢平: {e}", inst=inst)
+            return True
+        from .executor import _algo_set
+        return any(_algo_set(a, "tpTriggerPx") for a in algos)
+
+    def _tp_crossed_close(self, p):
+        """止盈价已被穿过且没有有效止盈单：立刻 reduce-only 市价平。不看最短持仓。"""
+        inst = p.get("instId")
+        if not inst:
+            return False
+        meta = (self.s.d.get("open_meta") or {}).get(inst) or {}
+        tp = meta.get("tp")
+        if not tp:
+            return False
+        side = p.get("side") or meta.get("direction") or "long"
+        hit = crossed_tp(side, tp, p.get("markPx"), p.get("last"))
+        if hit is None and not p.get("last"):
+            try:
+                t = self.c.ticker(inst)
+                hit = crossed_tp(side, tp, None, (t or {}).get("last"))
+            except Exception:
+                hit = None
+        if hit is None:
+            return False
+        if self._has_live_tp(inst):
+            return False
+        reason = TP_CROSS_REASON
+        self.j.log(AGENT, "tp_cross_close",
+                   f"{inst} {side} 价格 {hit} 已穿过止盈 {tp}，交易所没有止盈单，"
+                   f"不受最短持仓限制，立刻市价平",
+                   inst=inst, side=side, tp=float(tp), px=float(hit))
+        closed = False
+        try:
+            closed = bool(self.ex.close(p, reason))
+        except Exception as e:
+            self.j.log(AGENT, "tp_cross_fail", f"{inst} 止盈价穿过后市价平失败: {e}", inst=inst)
+            return False
+        if not closed:
+            self.j.log(AGENT, "tp_cross_fail", f"{inst} 止盈价穿过后市价平未完成，下个监控周期再试", inst=inst)
+            return False
+        book = self.s.d.setdefault("open_meta", {}).setdefault(inst, {})
+        book["close_reason"] = reason
+        self.s.save()
+        return True
+
     def _audit_protection(self, p):
         if config.PROTECT_AUDIT_SEC <= 0:
             return False
@@ -95,6 +170,8 @@ class NetTpMonitor:
         return result == "closed"
 
     def _check_one(self, p):
+        if self._tp_crossed_close(p):
+            return
         if config.is_swing():
             return self._check_swing(p)
         inst = p["instId"]
@@ -361,5 +438,229 @@ def offline_self_check():
                            "markPx": 101.0, "upl": 1, "notional": 100, "qty": 1, "cTime": 0}, {"net": 1})
         assert amend.calls and amend.calls[0][0] == "ETH-USDT-SWAP"
         assert amend.calls[0][1] < 101.0
+        _tp_cross_close_checks()
     finally:
         j.close()
+
+
+def _tp_cross_close_checks():
+    """止盈价被穿过且没有止盈单时市价平。多空都测，最短持仓挡不住，并记入 trades / 已实现盈亏。"""
+    import tempfile
+    from agents.journal import Journal
+    from agents.state import SharedState
+    from agents.swing import signal_exit_reason
+
+    saved = config.STRATEGY
+    config.STRATEGY = "swing_combo"
+    d = tempfile.mkdtemp(prefix="ma-tp-")
+    j = Journal(d, echo=False)
+    try:
+        assert crossed_tp("short", 2.196, 2.127, 2.130) == 2.127
+        assert crossed_tp("short", 2.196, 2.20, 2.10) == 2.10
+        assert crossed_tp("short", 2.196, 2.25, 2.24) is None
+        assert crossed_tp("long", 2.20, 2.19, 2.21) == 2.21
+        assert crossed_tp("long", 2.20, 2.19, 2.195) is None
+
+        class Ex:
+            def __init__(self):
+                self.reasons = []
+                self.fail = False
+
+            def close(self, pos, reason):
+                if self.fail:
+                    return False
+                self.reasons.append((pos["instId"], pos["side"], reason))
+                return True
+
+            def audit_bracket(self, *a, **k):
+                return True
+
+            def amend_sl(self, *a, **k):
+                raise AssertionError("止盈穿过后的监控不该再改止损")
+
+        class C:
+            def __init__(self, positions, algos):
+                self.is_mock = True
+                self._positions = positions
+                self._algos = algos
+                self.ticker_calls = 0
+
+            def pending_algos(self, inst):
+                return list(self._algos)
+
+            def ticker(self, inst):
+                self.ticker_calls += 1
+                return {"last": 2.10, "bid": 2.099, "ask": 2.101}
+
+            def instrument(self, inst):
+                return {"ctVal": 0.01, "lotSz": "1", "minSz": 1, "tickSz": "0.001"}
+
+            def entry_fee(self, *a):
+                return 0.0
+
+            def funding_paid(self, *a):
+                return 0.0
+
+        st = SharedState(d, clock=lambda: 1_700_000_000.0)
+        now = st.now()
+        hold = {"family": "oi", "direction": "short", "opened_ts": now,
+                "min_hold_sec": 12 * 3600, "max_hold_sec": 24 * 3600,
+                "sl": 2.388, "tp": 2.196, "entry": 2.273}
+        st.d["open_meta"]["ICP-USDT-SWAP"] = dict(hold)
+        assert signal_exit_reason(hold, {"direction": "long", "combined": 0.1, "blocked": True}, now) is None
+
+        class Fees:
+            taker = 0.0005
+            maker = 0.0002
+
+        ex = Ex()
+        no_tp = [{"algoId": "sl1", "slTriggerPx": "2.388", "tpTriggerPx": ""}]
+        live_tp = [{"algoId": "oco1", "ordType": "oco", "slTriggerPx": "2.388", "tpTriggerPx": "2.196"}]
+        short_pos = {"instId": "ICP-USDT-SWAP", "side": "short", "posSide": "net",
+                     "qty": 10, "avgPx": 2.273, "markPx": 2.25, "last": 2.24,
+                     "upl": 1.0, "notional": 25, "cTime": int(now * 1000)}
+        mon = NetTpMonitor(C([short_pos], no_tp), j, Fees(), ex, st)
+        mon._check_one(dict(short_pos))
+        assert ex.reasons == []
+
+        hit = dict(short_pos, markPx=2.127, last=2.130)
+        mon.c = C([hit], live_tp)
+        mon._check_one(dict(hit))
+        assert ex.reasons == []
+
+        mon.c = C([hit], no_tp)
+        mon._check_one(dict(hit))
+        assert ex.reasons == [("ICP-USDT-SWAP", "short", TP_CROSS_REASON)]
+        assert st.d["open_meta"]["ICP-USDT-SWAP"]["close_reason"] == TP_CROSS_REASON
+
+        long_meta = dict(hold, direction="long", tp=2.20, sl=2.10, entry=2.15)
+        st.d["open_meta"]["ETH-USDT-SWAP"] = long_meta
+        long_pos = {"instId": "ETH-USDT-SWAP", "side": "long", "posSide": "net",
+                    "qty": 1, "avgPx": 2.15, "markPx": 2.19, "last": 2.21,
+                    "upl": 1.0, "notional": 20, "cTime": int(now * 1000)}
+        mon.c = C([long_pos], no_tp)
+        mon._check_one(dict(long_pos))
+        assert ex.reasons[-1] == ("ETH-USDT-SWAP", "long", TP_CROSS_REASON)
+        assert signal_exit_reason(long_meta, {"direction": "short", "combined": 0.9, "blocked": False}, now) is None
+
+        quiet = dict(long_pos, markPx=2.16, last=2.17)
+        before = len(ex.reasons)
+        mon._check_one(dict(quiet))
+        assert len(ex.reasons) == before
+
+        bare = dict(short_pos, markPx=2.20, last=None)
+        mon.c = C([bare], no_tp)
+        mon._check_one(dict(bare))
+        assert ex.reasons[-1][0] == "ICP-USDT-SWAP" and ex.reasons[-1][1] == "short"
+        assert mon.c.ticker_calls == 1
+
+        ex.fail = True
+        st.d["open_meta"]["ICP-USDT-SWAP"].pop("close_reason", None)
+        mon._check_one(dict(hit))
+        assert st.d["open_meta"]["ICP-USDT-SWAP"].get("close_reason") in (None, "")
+        _book_tp_cross_trade()
+    finally:
+        config.STRATEGY = saved
+        j.close()
+
+
+def _book_tp_cross_trade():
+    """走和监控循环一样的 equity.sync，把这笔市价止盈记进 trades.csv 和 daily。"""
+    import tempfile
+    from agents.journal import Journal
+
+    data_dir = tempfile.mkdtemp(prefix="ma-tp-book-")
+    journal = Journal(data_dir, echo=False)
+    try:
+        _book_tp_cross_trade_in(data_dir, journal)
+    finally:
+        journal.close()
+
+
+def _book_tp_cross_trade_in(data_dir, journal):
+    import csv
+    from agents.equity import EquityTracker
+    from agents.margin import configured_capital, virtual_equity
+    from agents.state import SharedState
+
+    st = SharedState(data_dir, clock=lambda: 1_700_000_100.0)
+    now = st.now()
+    inst = "ICP-USDT-SWAP"
+    st.d["swing_realized_basis"] = 0.0
+    st.d["swing_capital_usdt"] = configured_capital()
+    st.d["swing_capital_since"] = now
+    st.d["open_meta"][inst] = {
+        "direction": "short", "qty": 109986.8, "entry": 2.273,
+        "sl": 2.388, "tp": 2.196, "opened_ts": now, "open_ms": int(now * 1000),
+        "min_hold_sec": 12 * 3600, "max_hold_sec": 24 * 3600,
+        "family": "momentum", "regime": "trend"}
+    pos = {"instId": inst, "side": "short", "posSide": "net", "qty": 109986.8,
+           "avgPx": 2.273, "markPx": 2.127, "last": 2.127, "upl": 160.0,
+           "notional": 2500, "cTime": int(now * 1000)}
+
+    class C:
+        is_mock = True
+
+        def __init__(self):
+            self.open = True
+
+        def positions(self):
+            return [] if not self.open else [dict(pos)]
+
+        def pending_algos(self, inst_id):
+            return [{"algoId": "sl1", "slTriggerPx": "2.388", "tpTriggerPx": ""}]
+
+        def ticker(self, inst_id):
+            return {"last": 2.127, "bid": 2.126, "ask": 2.128}
+
+        def instrument(self, inst_id):
+            return {"ctVal": 0.01, "tickSz": "0.001"}
+
+        def last_closed(self, inst_id):
+            return {"realizedPnl": 146.5, "pnl": 160.0, "fee": -13.5, "fundingFee": 0.0,
+                    "closeAvgPx": 2.127, "openAvgPx": 2.273, "uTime": int(now * 1000) + 1000}
+
+        def equity(self):
+            return 10146.5
+
+        def entry_fee(self, *a):
+            return 0.0
+
+        def funding_paid(self, *a):
+            return 0.0
+
+    class Ex:
+        def __init__(self, client):
+            self.c = client
+
+        def close(self, position, reason):
+            self.c.open = False
+            self.reason = reason
+            return True
+
+        def audit_bracket(self, *a, **k):
+            return True
+
+        def amend_sl(self, *a, **k):
+            return False
+
+    class Risk:
+        def on_trade_closed(self, inst_id, net):
+            st.add_daily_pnl(net)
+
+    c = C()
+    ex = Ex(c)
+    eq = EquityTracker(c, journal, st, Risk(), data_dir)
+    eq.known.add(inst)
+    mon = NetTpMonitor(c, journal, None, ex, st)
+    live = c.positions()
+    eq.sync(live)
+    mon.check(live)
+    assert ex.reason == TP_CROSS_REASON
+    eq.sync(c.positions())
+    rows = list(csv.DictReader(open(eq.trades_csv, encoding="utf-8")))
+    assert len(rows) == 1, rows
+    assert rows[0]["instId"] == inst and rows[0]["direction"] == "short"
+    assert TP_CROSS_REASON in rows[0]["reason"]
+    assert abs(float(rows[0]["net_pnl"]) - 146.5) < 1e-6
+    assert abs(virtual_equity(st, 0) - (configured_capital() + 146.5)) < 1e-6
