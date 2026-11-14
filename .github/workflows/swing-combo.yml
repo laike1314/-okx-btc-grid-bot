@@ -14,6 +14,9 @@ name: OKX Swing Combo
 # 停止：Actions → OKX Swing Combo → Disable workflow，并取消正在跑的那一轮。
 #       停掉之后交易所上的仓不会被自动平掉，止损止盈还挂着。
 # 不要和剥头皮工作流同时打同一个模拟盘账户：剥头皮会按 15 分钟规则管理它看得到的仓。
+#
+# 波段定仓和回撤只用 SWING_CAPITAL_USDT（默认 10000）的虚拟权益，
+# 不看模拟盘总权益。账户快照只在启动时记一次，另加每次开仓 POST 之前。
 
 on:
   schedule:
@@ -31,7 +34,7 @@ on:
         default: false
         type: boolean
       reset_halt:
-        description: "清除账户 -20% 停机，并把起点权益重置为当前权益。默认 false。"
+        description: "清除账户 -20% 停机，并把起点和峰值重置为当前虚拟权益。默认 false。"
         required: false
         default: false
         type: boolean
@@ -51,6 +54,7 @@ jobs:
     env:
       ENABLE_US_STOCKS: "0"
       STRATEGY: swing_combo
+      SWING_CAPITAL_USDT: "10000"
 
     steps:
       - name: Checkout

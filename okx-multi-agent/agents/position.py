@@ -137,7 +137,7 @@ class PositionManager:
         return plan
 
     def _plan_swing(self, cand, equity, available=None, size_scale=1.0):
-        """每笔名义约等于分配额的 1/N。分配额是 min(总权益, 可用保证金)，不是虚高的 eq。"""
+        """每笔名义 ≈ 虚拟权益 × 分配比例 / 持仓槽，再封顶到可用保证金 × MARGIN_USE_FRAC。"""
         from .swing import profile_for, size_qty, fee_allows
         inst = cand["instId"]
         spec = self.c.instrument(inst)
@@ -161,7 +161,9 @@ class PositionManager:
         qty = size_qty(equity, entry, spec["ctVal"], spec["lotSz"], spec["minSz"],
                        available=available, fraction=scale, lever=lever)
         if not qty:
-            shown = f"{float(available):.2f}" if available is not None else f"权益 {float(equity):.2f}"
+            shown = f"虚拟权益 {float(equity):.2f}"
+            if available is not None:
+                shown += f"、可用保证金 {float(available):.2f}"
             self.j.log(AGENT, "too_small",
                        f"{inst} 按 {shown} 的 1/{config.SWING_MAX_POSITIONS} × {scale:g} 算不出最小张数，放弃",
                        inst=inst, available=available, size_scale=scale)
@@ -180,8 +182,13 @@ class PositionManager:
                 "min_hold_sec": prof["min_hold"], "max_hold_sec": prof["max_hold"],
                 "tag": cand.get("tag") or prof["tag"], "available": available,
                 "available_field": avail_field, "size_scale": scale}
-        base_txt = (f"按{avail_field or '可用保证金'} {float(available):.1f} × {scale:g}"
-                    if available is not None else f"按总权益 {float(equity):.1f}（没有读到可用保证金）")
+        cap_txt = ""
+        if available is not None:
+            cap_txt = f"，名义不超过{avail_field or '可用保证金'} {float(available):.1f}×{config.MARGIN_USE_FRAC:.0%}"
+        else:
+            cap_txt = "（没有读到可用保证金，不按 availEq 封顶）"
+        base_txt = (f"按虚拟权益 {float(equity):.1f} × {float(config.SWING_ALLOC_PCT):g}"
+                    f"/{config.SWING_MAX_POSITIONS} × {scale:g}{cap_txt}")
         self.j.log(AGENT, "plan",
                    f"{inst} {cand['direction']} {plan['family']} {plan['qty']}张 名义 {notional:.1f}U "
                    f"{lever}x {base_txt} 止损 {sl}({sl_pct:.2%}) 止盈 {tp}({tp_pct:.2%})", inst=inst, **{

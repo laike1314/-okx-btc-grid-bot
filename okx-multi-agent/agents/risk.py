@@ -101,37 +101,33 @@ class RiskGate:
     def _swing_global_block(self, equity):
         """波段：账户停机、较峰值回撤。不使用剥头皮的 2% 滚动亏损闸门。
 
-        峰值只在上涨能被本策略已实现盈亏和持仓浮盈解释时抬高。
-        说不清来源的跳涨不抬峰值。已经记下的峰值不自动下调。
-        账户止损仍按起始权益，较峰值回撤的比较式也不变。
+        比较的是虚拟权益（固定本金 + 切换后已实现盈亏 + 本策略浮盈）。
+        传入的 equity 是调用方手里的数字，不参与判断，避免交易所总权益把回撤带偏。
         """
+        del equity
         from .swing import AGENT as SWING
-        from .margin import note_swing_equity, mark_fresh_start, seed_basis
+        from .margin import swing_equity_status
         if self.s.d.get("swing_halted"):
             return (f"波段账户停机中（较起始权益回撤达到 {config.SWING_ACCOUNT_STOP_PCT:.0%}）。"
                     f"确认要重新开始时设 SWING_RESET_HALT=1")
-        start = float(self.s.d.get("swing_start_equity") or 0)
-        if start <= 0:
-            self.s.d["swing_start_equity"] = equity
-            self.s.d["swing_peak_equity"] = equity
-            mark_fresh_start(self.s)
-            seed_basis(self.s, equity, float(self.s.d.get("swing_last_our_upl") or 0))
-            self.s.save()
-            return None
         try:
-            note_swing_equity(self.s, self.j, equity, self.s.d.get("swing_last_our_upl") or 0)
+            status = swing_equity_status(self.s, self.j)
         except Exception as e:
-            self.j.log(SWING, "equity_mark_err", f"核对权益来源失败，峰值暂不更新: {e}")
-        if equity <= start * (1 - float(config.SWING_ACCOUNT_STOP_PCT)):
+            self.j.log(SWING, "equity_mark_err", f"核对虚拟权益失败，峰值暂不更新: {e}")
+            return None
+        veq, start = status["equity"], status["start"]
+        if start <= 0:
+            return None
+        if veq <= start * (1 - float(config.SWING_ACCOUNT_STOP_PCT)):
             self.s.d["swing_halted"] = True
             self.s.save()
             self.j.log(SWING, "account_stop",
-                       f"权益 {equity:.2f} 较起始 {start:.2f} 达到停机线")
+                       f"虚拟权益 {veq:.2f} 较起始 {start:.2f} 达到停机线")
             return "波段账户止损已触发"
-        peak = float(self.s.d.get("swing_peak_equity") or 0)
-        if peak > 0 and (peak - equity) / peak >= float(config.SWING_PEAK_DD_PCT):
-            dd = (peak - equity) / peak
-            return f"权益较峰值 {peak:.2f} 回撤 {dd:.1%}，暂停开新仓（不平已有仓）"
+        peak = status["peak"]
+        if peak > 0 and (peak - veq) / peak >= float(config.SWING_PEAK_DD_PCT):
+            dd = (peak - veq) / peak
+            return f"虚拟权益 {veq:.2f} 较峰值 {peak:.2f} 回撤 {dd:.1%}，暂停开新仓（不平已有仓）"
         return None
 
     def check(self, cand, positions, equity):

@@ -18,7 +18,8 @@ class SharedState:
                   "last_entry_bar": {}, "last_exit_trend_bar": {},
                   "swing_start_equity": None, "swing_peak_equity": None, "swing_halted": False,
                   "margin_cooldown": {}, "margin_scale": {},
-                  "swing_equity_basis": None, "swing_basis_realized": None, "swing_basis_upl": None}
+                  "swing_equity_basis": None, "swing_basis_realized": None, "swing_basis_upl": None,
+                  "swing_capital_usdt": None, "swing_capital_since": None, "swing_realized_basis": None}
         if os.path.exists(self.path):
             try:
                 self.d.update(json.load(open(self.path, encoding="utf-8")))

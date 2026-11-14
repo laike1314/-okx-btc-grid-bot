@@ -120,14 +120,16 @@ def fee_allows(tp_pct, round_trip):
 
 
 def size_qty(equity, entry, ct_val, lot, min_sz, available=None, fraction=1.0, lever=1):
-    """名义 ≈ 基准 × SWING_ALLOC_PCT / 最大同时持仓数 × fraction。
+    """名义 ≈ 虚拟权益 × SWING_ALLOC_PCT / 最大同时持仓数 × fraction。
 
-    读到可用保证金时，基准是 min(总权益, 可用保证金)，不再按虚高的 eq 开满 1/N。
-    杠杆另行设置。单笔保证金再封顶到可用保证金的 MARGIN_USE_FRAC。
+    equity 是虚拟权益（SWING_CAPITAL_USDT + 切换后已实现盈亏 + 本策略浮盈），
+    不是交易所总权益，也不再先收成 min(权益, 可用保证金)。
+    名义再封顶到可用保证金 × MARGIN_USE_FRAC，因此不会超过真实 availEq。
+    杠杆另行设置，不把这个名义上限放大。fraction 是 51008 之后的缩小比例。
     """
-    from agents.margin import sizing_base, use_frac
+    from agents.margin import use_frac
     slots = max(1, int(config.SWING_MAX_POSITIONS))
-    base, _how = sizing_base(equity, available)
+    base = float(equity or 0)
     try:
         frac = float(fraction if fraction is not None else 1.0)
     except (TypeError, ValueError):
@@ -136,7 +138,8 @@ def size_qty(equity, entry, ct_val, lot, min_sz, available=None, fraction=1.0, l
         return None
     notional = base * float(config.SWING_ALLOC_PCT) / slots * frac
     if available is not None:
-        cap = max(0.0, float(available)) * use_frac() * max(1, int(lever or 1))
+        # 名义本身不超过可用保证金 × MARGIN_USE_FRAC，杠杆不把上限放大。
+        cap = max(0.0, float(available)) * use_frac()
         notional = min(notional, cap)
     per = float(entry) * float(ct_val)
     if per <= 0 or notional <= 0:
@@ -513,27 +516,11 @@ def _bracket_from_client(client, inst):
 
 
 def reconcile(client, state, journal, executor=None):
-    """用交易所持仓和最近平仓记录补齐 state。没有标签、也不在账本里的仓不接管。"""
-    from agents.margin import mark_fresh_start, seed_basis, note_swing_equity
+    """用交易所持仓和最近平仓记录补齐 state。没有标签、也不在账本里的仓不接管。
+
+    起点、峰值和停机看虚拟权益，不看交易所总权益。
+    """
     now = state.now()
-    try:
-        eq = float(client.equity())
-    except Exception as e:
-        journal.log(AGENT, "reconcile_equity_err", f"读权益失败，起点/峰值本轮不更新: {e}")
-        eq = None
-    reset_done = False
-    if config.SWING_RESET_HALT and state.d.get("swing_halted") and eq is not None:
-        state.d["swing_halted"] = False
-        state.d["swing_start_equity"] = eq
-        state.d["swing_peak_equity"] = eq
-        reset_done = True
-        journal.log(AGENT, "halt_reset",
-                    f"SWING_RESET_HALT=1，已解除账户停机，起点和峰值重置为 {eq:.2f}")
-    elif eq is not None:
-        if not state.d.get("swing_start_equity"):
-            state.d["swing_start_equity"] = eq
-            mark_fresh_start(state)
-            journal.log(AGENT, "seed_start", f"首次记录波段起始权益 {eq:.2f}")
     try:
         positions = list(client.positions() or [])
     except Exception as e:
@@ -625,52 +612,59 @@ def reconcile(client, state, journal, executor=None):
         except (TypeError, ValueError):
             pass
     state.d["swing_last_our_upl"] = our_upl
-    if eq is not None:
-        if reset_done:
-            seed_basis(state, eq, our_upl)
-        try:
-            note_swing_equity(state, journal, eq, our_upl)
-        except Exception as e:
-            journal.log(AGENT, "equity_mark_err", f"核对权益来源失败，峰值暂不更新: {e}")
+    from agents.margin import swing_equity_status, virtual_equity
+    try:
+        status = swing_equity_status(state, journal, our_upl)
+    except Exception as e:
+        journal.log(AGENT, "equity_mark_err", f"虚拟权益更新失败，峰值暂不更新: {e}")
+        status = None
+    if config.SWING_RESET_HALT and state.d.get("swing_halted"):
+        veq = virtual_equity(state, our_upl) if status is None else status["equity"]
+        state.d["swing_halted"] = False
+        state.d["swing_start_equity"] = veq
+        state.d["swing_peak_equity"] = veq
+        journal.log(AGENT, "halt_reset",
+                    f"SWING_RESET_HALT=1，已解除账户停机，起点和峰值重置为当前虚拟权益 {veq:.2f}")
+        status = {"equity": veq, "start": veq, "peak": veq}
+    exch = None
+    try:
+        exch = float(client.equity())
+    except Exception as e:
+        journal.log(AGENT, "reconcile_equity_err",
+                    f"读交易所权益失败（不影响虚拟本金和定仓）: {e}")
     state.d["swing_last_reconcile"] = now
     state.save()
     ours = sum(1 for inst in meta_map if inst in live)
+    veq_s = None if not status else round(status["equity"], 2)
+    exch_s = None if exch is None else round(exch, 2)
     journal.log(AGENT, "reconcile",
                 f"对账完成：本策略持仓 {ours}，交易所持仓 {len(positions)}，"
-                f"当前权益 {None if eq is None else round(eq, 2)} "
-                f"起始权益 {state.d.get('swing_start_equity')} 峰值 {state.d.get('swing_peak_equity')}"
+                f"虚拟权益 {veq_s} 起始 {state.d.get('swing_start_equity')} "
+                f"峰值 {state.d.get('swing_peak_equity')} "
+                f"交易所USDT权益 {exch_s}（只作对照）"
                 f"{'，账户停机中' if state.d.get('swing_halted') else ''}")
 
 
 def enforce_account_stop(agents):
-    """较起始权益回撤达到停机线：记下停机，并平掉本策略自己的仓。不平陌生仓。"""
+    """较虚拟权益的起始值回撤达到停机线：记下停机，并平掉本策略自己的仓。不平陌生仓。"""
     client, state, journal, ex = agents["client"], agents["state"], agents["journal"], agents["executor"]
     if state.d.get("swing_halted"):
         _flatten_ours(client, state, journal, ex, "账户停机，平掉本策略剩余仓位")
         return
+    from agents.margin import swing_equity_status
     try:
-        eq = float(client.equity())
+        status = swing_equity_status(state, journal)
     except Exception as e:
-        journal.log(AGENT, "equity_error", f"检查账户止损失败: {e}")
+        journal.log(AGENT, "equity_error", f"检查虚拟权益止损失败: {e}")
         return
-    from agents.margin import mark_fresh_start, note_swing_equity, seed_basis
-    start = float(state.d.get("swing_start_equity") or 0)
+    veq, start = status["equity"], status["start"]
     if start <= 0:
-        state.d["swing_start_equity"] = eq
-        state.d["swing_peak_equity"] = max(float(state.d.get("swing_peak_equity") or 0), eq)
-        mark_fresh_start(state)
-        seed_basis(state, eq, float(state.d.get("swing_last_our_upl") or 0))
-        state.save()
         return
-    try:
-        note_swing_equity(state, journal, eq, state.d.get("swing_last_our_upl") or 0)
-    except Exception as e:
-        journal.log(AGENT, "equity_mark_err", f"核对权益来源失败，峰值暂不更新: {e}")
-    if eq <= start * (1 - float(config.SWING_ACCOUNT_STOP_PCT)):
+    if veq <= start * (1 - float(config.SWING_ACCOUNT_STOP_PCT)):
         state.d["swing_halted"] = True
         state.save()
         journal.log(AGENT, "account_stop",
-                    f"权益 {eq:.2f} 较起始 {start:.2f} 回撤达到 {config.SWING_ACCOUNT_STOP_PCT:.0%}，停机并平本策略仓")
+                    f"虚拟权益 {veq:.2f} 较起始 {start:.2f} 回撤达到 {config.SWING_ACCOUNT_STOP_PCT:.0%}，停机并平本策略仓")
         _flatten_ours(client, state, journal, ex, "账户回撤止损")
 
 
@@ -717,7 +711,8 @@ def run_cycle(agents, monitor, can_open):
         if cand["instId"] in held:
             continue
         try:
-            equity = client.equity()
+            from agents.margin import swing_equity_status
+            equity = swing_equity_status(state, journal)["equity"]
             ok, why = agents["risk"].check(cand, positions, equity)
         except Exception as e:
             journal.log("risk", "error", f"{cand['instId']} 风控检查失败: {e}", inst=cand["instId"])
@@ -1062,11 +1057,16 @@ def offline_self_check():
                 "combined": 0.91, "score": 0.91, "mom_score": 0.9, "oi_score": 0.4,
                 "price": ask, "atr": feat["atr"], "atr_pct": feat["atr_pct"], "adx": feat["adx"],
                 "tag": "swmom"}
-        ok, why = risk.check(cand, [], client.equity())
+        from agents.margin import swing_equity_status
+        book = swing_equity_status(st, j, 0)
+        assert abs(book["equity"] - float(config.SWING_CAPITAL_USDT)) < 1e-6, book
+        assert abs(float(st.d["swing_start_equity"]) - float(config.SWING_CAPITAL_USDT)) < 1e-6
+        # 传入交易所总权益也不改变虚拟账本上的通过/拒绝。
+        ok, why = risk.check(cand, [], 102000)
         assert ok, why
-        plan = planner.plan(cand, client.equity())
+        plan = planner.plan(cand, book["equity"])
         assert plan and plan["lever"] == 1 and plan["tag"] == "swmom", plan
-        target = client.equity() * config.SWING_ALLOC_PCT / config.SWING_MAX_POSITIONS
+        target = book["equity"] * config.SWING_ALLOC_PCT / config.SWING_MAX_POSITIONS
         assert abs(plan["notional"] - target) / target < 0.05, (plan["notional"], target)
         assert plan["sl"] < plan["entry_ref"] < plan["tp"]
         fill = ex.open(plan)

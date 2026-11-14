@@ -238,13 +238,21 @@ OI 腿记 0 时日志会写原因，不把门槛放低来凑单：`not_flat`（�
 
 ### 风控
 
-同时最多 `SWING_MAX_POSITIONS`（4）个本策略仓，同一家族最多 `SWING_MAX_PER_FAMILY`（3）。杠杆 `SWING_LEVERAGE`（1）。每笔名义 ≈ 权益 × `SWING_ALLOC_PCT` / 4，默认大约四分之一。任何平仓后该合约冷却 `SWING_COOLDOWN_SEC`（8 小时）。权益较**起始权益**回撤 `SWING_ACCOUNT_STOP_PCT`（20%）就停机并平掉本策略的仓，记下 `swing_halted`，下次还在，直到 `SWING_RESET_HALT=1`。较**峰值**回撤 `SWING_PEAK_DD_PCT`（10%）只停止开新仓，不平已有仓。点差、24h 成交额、标记价偏离、极端资金费这些微观闸门仍然有效。剥头皮的 2% 滚动亏损、15 分钟冷却、同向加密上限，在这个模式里不生效。
+同时最多 `SWING_MAX_POSITIONS`（4）个本策略仓，同一家族最多 `SWING_MAX_PER_FAMILY`（3）。杠杆 `SWING_LEVERAGE`（1）。每笔名义 ≈ **虚拟权益** × `SWING_ALLOC_PCT` / 4，默认大约四分之一，再封顶到真实可用保证金 × `MARGIN_USE_FRAC`（0.90），所以不会超过账户里真正能用的 availEq。51008 之后的冷却和缩小比例照旧。任何平仓后该合约冷却 `SWING_COOLDOWN_SEC`（8 小时）。**虚拟权益**较**起始权益**回撤 `SWING_ACCOUNT_STOP_PCT`（20%）就停机并平掉本策略的仓，记下 `swing_halted`，下次还在，直到 `SWING_RESET_HALT=1`（起点和峰值改成当时的虚拟权益，不是交易所总权益）。较**峰值**回撤 `SWING_PEAK_DD_PCT`（10%）只停止开新仓，不平已有仓。点差、24h 成交额、标记价偏离、极端资金费这些微观闸门仍然有效，阈值不改。剥头皮的 2% 滚动亏损、15 分钟冷却、同向加密上限，在这个模式里不生效。
+
+虚拟权益不看交易所 USDT 总权益。模拟盘账户里还有别的策略、交易机器人占用（stgyEq）和说不清的入金，总权益不能拿来定仓，也不再因此打 `equity_unexplained`。交易所账户明细仍会记一条 `account/startup`（每个进程最多一次），每笔开仓 POST 之前再记一条 `account/pre_order`，只作对照。
+
+```
+虚拟权益 = SWING_CAPITAL_USDT + 切换之后的已实现盈亏 + 本策略持仓浮盈
+```
+
+`SWING_CAPITAL_USDT` 默认 10000。第一次用某个本金跑（或本金数额变了）会迁移 state：起点写成这个本金，峰值写成 max(本金, 当时虚拟权益)。`trades.csv` 和 `state.json` 里的 `daily` 历史**都保留、不删**。切换当时的 `daily` 合计记在 `swing_realized_basis`，之后只把新记入的已实现盈亏加进虚拟权益。不重放切换前的成交，否则旧账会把 10000 的本金重新抬回或打穿。`pnl_events` 会被滚动窗口剪掉，所以这份累计用 `daily`，不用它。已有的 `swing_halted` 不会在迁移时自动解开；若停机是按旧的交易所总权益触发的，用 `SWING_RESET_HALT=1` 按当前虚拟权益重新开始。切换时本策略仓上已经有的浮盈或浮亏，会立刻算进虚拟权益。
 
 没有 `swmom` / `swoi` 订单标签、也不在 `state.json` 里的持仓不会被接管，避免误伤同一账户上别的仓。
 
 ### 状态怎么跨过 6 小时的 Actions 限制
 
-持仓在 OKX 上，止损止盈挂在交易所，作业结束不平仓。策略账本（家族、开仓时间、跟踪峰值、冷却、起始权益、峰值权益、是否停机）写在 `state.json`。启动时对账：交易所持仓 + 成交标签 + 最近平仓历史；对不上标签的仓不接管。
+持仓在 OKX 上，止损止盈挂在交易所，作业结束不平仓。策略账本（家族、开仓时间、跟踪峰值、冷却、虚拟本金、起始权益、峰值权益、是否停机）写在 `state.json`。启动时对账：交易所持仓 + 成交标签 + 最近平仓历史；对不上标签的仓不接管。对账日志里的交易所 USDT 权益只作对照。
 
 持续运行用工作流 **OKX Swing Combo**（`.github/workflows/swing-combo.yml`）：
 
@@ -255,7 +263,7 @@ OI 腿记 0 时日志会写原因，不把门槛放低来凑单：`not_flat`（�
 
 **开始：** 把本改动合并进默认分支（schedule 只认默认分支上的工作流文件）。Actions → **OKX Swing Combo** → **Run workflow**。不必干等第一次 cron。
 
-**停止：** Actions → **OKX Swing Combo** → **Disable workflow**，需要的话再取消正在跑的那一轮。停掉之后，模拟盘上的仓**不会**被自动平掉，交易所止损止盈还在。要平掉得在 OKX 上手动处理，或重新打开工作流让它接着管。账户停机之后，用 Run workflow 并把 `reset_halt` 设为 true，才会清除停机并按当前权益重设起点。
+**停止：** Actions → **OKX Swing Combo** → **Disable workflow**，需要的话再取消正在跑的那一轮。停掉之后，模拟盘上的仓**不会**被自动平掉，交易所止损止盈还在。要平掉得在 OKX 上手动处理，或重新打开工作流让它接着管。账户停机之后，用 Run workflow 并把 `reset_halt` 设为 true，才会清除停机并按**当前虚拟权益**重设起点和峰值。
 
 不要和 **OKX Multi-Agent Demo** 同时打同一个模拟盘。两条工作流不会互相取消，但剥头皮会按 15 分钟规则处理它看见的持仓。
 
@@ -286,10 +294,11 @@ OI 腿记 0 时日志会写原因，不把门槛放低来凑单：`not_flat`（�
 | `SWING_MAX_POSITIONS` | 4 | 同时持仓 |
 | `SWING_MAX_PER_FAMILY` | 3 | 同一家族上限 |
 | `SWING_LEVERAGE` | 1 | 杠杆 |
-| `SWING_ALLOC_PCT` | 1 | 参与分配的权益比例，每笔再除以最大持仓数 |
+| `SWING_CAPITAL_USDT` | 10000 | 波段虚拟本金。定仓、起始权益、峰值和 20% 停机都从这里起算，不加交易所总权益 |
+| `SWING_ALLOC_PCT` | 1 | 参与分配的虚拟权益比例，每笔再除以最大持仓数 |
 | `SWING_COOLDOWN_SEC` | 28800 | 平仓后冷却，8h |
-| `SWING_ACCOUNT_STOP_PCT` | 0.20 | 较起始权益停机 |
-| `SWING_PEAK_DD_PCT` | 0.10 | 较峰值停止开新仓 |
+| `SWING_ACCOUNT_STOP_PCT` | 0.20 | 虚拟权益较起始权益停机 |
+| `SWING_PEAK_DD_PCT` | 0.10 | 虚拟权益较峰值停止开新仓 |
 | `SWING_RESET_HALT` | 0 | 1 = 本轮清除停机并重设起点 |
 | `SWING_SCAN_INTERVAL_SEC` | 900 | 扫描间隔 |
 | `SWING_MONITOR_INTERVAL_SEC` | 60 | 持仓监控间隔 |
@@ -298,7 +307,8 @@ OI 腿记 0 时日志会写原因，不把门槛放低来凑单：`not_flat`（�
 ### 局限
 
 - 两次作业之间，跟踪止损和账户止损不会更新；这段时间只靠交易所上已经挂着的止损和止盈。cron 若延迟，空档可能到数小时。
-- 状态文件丢了以后，开仓家族还能从订单标签恢复，开仓时间用持仓的 `cTime`，跟踪用的价格高点会从当前价重新计，起始权益和峰值会按当前权益重播种（停机状态也会丢，除非 `swing_halted` 还在）。
+- 状态文件丢了以后，开仓家族还能从订单标签恢复，开仓时间用持仓的 `cTime`，跟踪用的价格高点会从当前价重新计。起始权益和峰值按 `SWING_CAPITAL_USDT` 重新播种（再加上当时本策略持仓浮盈），不会按交易所总权益播种。停机状态也会丢，除非 `swing_halted` 还在。
+- `equity.csv` 仍是交易所账户权益的时间序列，给对照用。波段的 20% 停机和峰值回撤以 state 里的虚拟权益为准，不读这张表。
 - OI 接口失败的合约，这一轮 OI 腿记 0，通常达不到 0.65，等于不做。
 - `decisions.jsonl` 会随运行变大。权益和成交看 `equity.csv` / `trades.csv` 即可。
 - 公开接口需要能访问 `www.okx.com`。本仓库没有可用的演示密钥时，只能做离线冒烟，不能对模拟盘下单。
