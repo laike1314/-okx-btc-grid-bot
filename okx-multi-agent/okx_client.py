@@ -23,10 +23,11 @@ RATE_LIMIT_CODES = {"50011", "50061", "50013", "50026"}   # 限流 / 系统繁�
 
 
 class OkxError(RuntimeError):
-    def __init__(self, code, msg, data=None):
+    def __init__(self, code, msg, data=None, smsg=""):
         super().__init__(f"[{code}] {msg}")
         self.code = str(code)
         self.data = data
+        self.smsg = str(smsg or "")
 
 
 def fmt_num(x, step=None):
@@ -47,6 +48,34 @@ def _f(v, default=0.0):
 
 def _preview(text, n=160):
     return (text or "").replace("\n", " ").strip()[:n]
+
+
+def _trigger_px(px):
+    """止盈止损触发价。空、0、负数都当成没填。"""
+    if px in (None, "", 0, "0"):
+        return None
+    try:
+        if float(px) <= 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return str(px)
+
+
+def protective_algo_body(inst_id, close_side, pos_side, sl, tp, td_mode):
+    """全平保护单的请求体。
+
+    OKX 文档原文：单向持仓下 ordType=conditional 同时带止盈和止损时，
+    只执行止损，止盈逻辑被忽略，接口仍返回成功。双边保护必须用 oco。
+    closeFraction=1 对 conditional 和 oco 都有效；posSide=net 时必须 reduceOnly。
+    """
+    tp_txt = _trigger_px(tp)
+    body = {"instId": inst_id, "tdMode": td_mode, "side": close_side, "posSide": pos_side,
+            "ordType": "oco" if tp_txt else "conditional", "closeFraction": "1", "reduceOnly": True,
+            "slTriggerPx": _trigger_px(sl) or str(sl), "slOrdPx": "-1", "slTriggerPxType": "mark"}
+    if tp_txt:
+        body.update({"tpTriggerPx": tp_txt, "tpOrdPx": "-1", "tpTriggerPxType": "last"})
+    return body
 
 
 def transient_read_code(code):
@@ -160,11 +189,12 @@ class OkxClient:
                         scode = str(rows[0].get("sCode", "")) if rows and isinstance(rows[0], dict) else ""
                         eff = scode if scode and scode != "0" else code
                         smsg = rows[0].get("sMsg", "") if rows and isinstance(rows[0], dict) else ""
+                        smsg = "" if smsg is None else str(smsg)
                         msg = f"{data.get('msg')} {smsg}".strip()
                         if eff in RATE_LIMIT_CODES or code in RATE_LIMIT_CODES:
-                            last = OkxError(eff, f"限流/繁忙 http={status} {msg} path={path}")
+                            last = OkxError(eff, f"限流/繁忙 http={status} {msg} path={path}", data, smsg=smsg)
                         else:
-                            raise OkxError(eff, f"{msg} http={status} path={path}", data)
+                            raise OkxError(eff, f"{msg} http={status} path={path}", data, smsg=smsg)
             retryable = method == "GET" and transient_read_code(getattr(last, "code", ""))
             if isinstance(last, OkxError) and str(last.code) in (RATE_LIMIT_CODES | {"429"}):
                 retryable = True
@@ -339,6 +369,7 @@ class OkxClient:
         return {"instId": p["instId"], "instType": p.get("instType") or "",
                 "side": side, "posSide": p.get("posSide", "net"),
                 "qty": abs(qty), "avgPx": _f(p.get("avgPx")), "markPx": _f(p.get("markPx")),
+                "last": _f(p.get("last")),
                 "upl": _f(p.get("upl")), "notional": abs(_f(p.get("notionalUsd"))),
                 "lever": _f(p.get("lever")), "cTime": int(p.get("cTime") or 0),
                 "mgnMode": p.get("mgnMode") or "", "imr": _f(p.get("imr")),
@@ -441,12 +472,11 @@ class OkxClient:
                             body=[{"instId": inst_id, "algoId": a} for a in algo_ids], private=True)
 
     def place_sl_algo(self, inst_id, close_side, pos_side, sl, tp=None):
-        """单独挂交易所止损，可选同时带止盈。closeFraction=1 全平。"""
-        body = {"instId": inst_id, "tdMode": config.TD_MODE, "side": close_side, "posSide": pos_side,
-                "ordType": "conditional", "closeFraction": "1", "reduceOnly": True,
-                "slTriggerPx": str(sl), "slOrdPx": "-1", "slTriggerPxType": "mark"}
-        if tp:
-            body.update({"tpTriggerPx": str(tp), "tpOrdPx": "-1", "tpTriggerPxType": "last"})
+        """单独挂交易所止损，可选同时带止盈。closeFraction=1 全平。
+
+        两边都有时用 oco。单向持仓的 conditional 会把止盈丢掉，还返回成功。
+        """
+        body = protective_algo_body(inst_id, close_side, pos_side, sl, tp, config.TD_MODE)
         return self.request("POST", "/api/v5/trade/order-algo", body=body, private=True)[0]
 
     def amend_sl(self, inst_id, algo_id, new_sl):
@@ -631,6 +661,7 @@ class MockOkxClient:
         for p in self.pos.values():
             q = dict(p)
             q["markPx"] = self._last(p["instId"])
+            q["last"] = q["markPx"]
             q["upl"] = self._upl(p)
             q["notional"] = p["qty"] * p["ctVal"] * q["markPx"]
             out.append(q)
