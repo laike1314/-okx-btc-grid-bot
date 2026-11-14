@@ -122,15 +122,10 @@ def _can_open(a, positions):
 
 
 def _can_open_swing(a, positions):
-    """只数本策略账本里的仓。剥头皮那套 2% 日亏和无限持仓个数在这里不生效。"""
+    """只数本策略账本里的仓。回撤看虚拟权益，不看交易所总权益。"""
     from agents.swing import our_position_count
     j = a["journal"]
-    try:
-        equity = a["client"].equity()
-    except Exception as e:
-        j.log("risk", "equity_error", f"读取权益失败，本轮不开仓: {e}")
-        return False
-    block = a["risk"].global_block(equity)
+    block = a["risk"].global_block(None)
     if block:
         j.log("risk", "blocked", f"暂停开仓：{block}")
         return False
@@ -221,7 +216,8 @@ def _start_line():
     if config.is_swing():
         return (f"多代理系统 {config.VERSION} 启动，策略 swing_combo，{pool}，"
                 f"杠杆 {config.SWING_LEVERAGE}x，同时持仓 {config.SWING_MAX_POSITIONS}，"
-                f"每笔约权益 {config.SWING_ALLOC_PCT:.0%}/{config.SWING_MAX_POSITIONS}")
+                f"虚拟本金 {float(config.SWING_CAPITAL_USDT):.0f} USDT，"
+                f"每笔约虚拟权益 {config.SWING_ALLOC_PCT:.0%}/{config.SWING_MAX_POSITIONS}")
     return (f"多代理系统 {config.VERSION} 启动，策略 scalp，{pool}，"
             f"杠杆 {config.LEVERAGE}x，同时持仓 {cap}，单笔风险 {config.RISK_PER_TRADE_PCT:.2%}")
 
@@ -240,7 +236,12 @@ def run(args):
     if not c.is_mock:
         try:
             eq = c.equity()
-            j.log("main", "auth_ok", f"已连上 OKX 模拟盘，USDT 权益 {eq:.2f}")
+            if config.is_swing():
+                j.log("main", "auth_ok",
+                      f"已连上 OKX 模拟盘，交易所 USDT 权益 {eq:.2f}（只作对照）。"
+                      f"波段定仓与回撤用固定本金 {float(config.SWING_CAPITAL_USDT):.2f} 的虚拟权益")
+            else:
+                j.log("main", "auth_ok", f"已连上 OKX 模拟盘，USDT 权益 {eq:.2f}")
         except Exception as e:
             j.log("main", "auth_fail", f"无法读取模拟盘账户（密钥错误/不是模拟盘密钥/IP 白名单？）: {e}")
             sys.exit(3)
@@ -301,9 +302,21 @@ def run(args):
 
     a["equity"].sync(c.positions())
     stats = a["equity"]._write_stats(c.equity())
+    tail = f"权益 {stats['equity']:.2f}"
+    if config.is_swing():
+        try:
+            from agents.margin import virtual_equity
+            veq = virtual_equity(a["state"])
+            peak = float(a["state"].d.get("swing_peak_equity") or veq)
+            start = float(a["state"].d.get("swing_start_equity") or veq)
+            dd = (peak - veq) / peak * 100 if peak else 0.0
+            tail = (f"波段虚拟权益 {veq:.2f}（起始 {start:.2f}，峰值 {peak:.2f}，较峰值 {dd:.2f}%），"
+                    f"交易所权益 {stats['equity']:.2f}")
+        except Exception:
+            tail = f"交易所权益 {stats['equity']:.2f}"
     j.log("main", "summary", f"结束：{stats['trades']} 笔，胜 {stats['wins']} 负 {stats['losses']}，"
           f"胜率 {stats['win_rate']}，净盈亏 {stats['net_pnl']:+.2f}，PF {stats['profit_factor']}，"
-          f"最大回撤 {stats['max_drawdown_pct']}%，权益 {stats['equity']:.2f}", **stats)
+          f"最大回撤 {stats['max_drawdown_pct']}%，{tail}", **stats)
 
 
 def main():

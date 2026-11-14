@@ -1,24 +1,37 @@
-"""可用保证金、51008 冷却，以及说不清来源的权益跳动。
+"""可用保证金、51008 冷却，以及波段虚拟本金。
 
 下单看的是「还能拿来开仓的保证金」，不是 USDT 总权益 eq。
 eq 里可以含着别的策略浮盈、交易机器人占用（stgyEq）、冻结（frozenBal）
 或者其他币种折进来的数，所以按 eq/4 下单会被 OKX 以 51008 整批拒绝。
 
+波段（swing_combo）的定仓、起始权益、峰值和 20% 停机都用虚拟权益：
+
+    SWING_CAPITAL_USDT + 切换到该本金之后的已实现盈亏 + 本策略自己的持仓浮盈
+
+交易所总权益只在启动时记一页账户快照（每个进程一次），以及每笔开仓 POST 之前再记一页。
+不再因为总权益和账本对不上而写 equity_unexplained。
+
+切换时的取舍：trades.csv 和 state.daily 里的历史成交全部保留，不删除。
+虚拟权益不重放这些历史。切换当时的 daily 合计记入 swing_realized_basis，
+之后只把新增的已实现盈亏加到 SWING_CAPITAL_USDT 上。这样模拟盘里别人的入金、
+别的策略占用，都不会改变波段仓位和回撤。pnl_events 会被滚动窗口剪掉，
+所以累计不用它，用不会被剪的 daily。
+
 日志事件（bot.log / decisions.jsonl）：
   account/startup、account/pre_order
       USDT 的 availBal、availEq、frozenBal、eq，以及账户档、其他币种、
-      全部类型的持仓和挂单（不只有 SWAP）。
+      全部类型的持仓和挂单（不只有 SWAP）。startup 每个进程最多一条。
   executor/margin_reject
       交易所回了 51008。这一次 POST 不会再发。
   executor/margin_cooldown
       该合约冷却 MARGIN_COOLDOWN_SEC（默认 30 分钟），下次张数按更小的比例。
   executor/margin_skip
       计划保证金已经大于刚读到的可用保证金，POST 根本不发。
-  equity/equity_unexplained
-      权益和本策略账本对不上。峰值不因此抬高；已有峰值也不自动下调。
-      账户止损仍按起始权益，较峰值回撤的算法也不变。
+  equity/capital_migrate
+      第一次启用某个 SWING_CAPITAL_USDT（或本金改了）。起点改成这个本金，
+      峰值改成 max(本金, 当时虚拟权益)。已有 swing_halted 不会自动解开。
   equity/peak_update
-      这笔上涨对得上已实现盈亏和本策略持仓浮盈，峰值才抬高。
+      虚拟权益创了新高，峰值才抬高。
 """
 import config
 
@@ -175,8 +188,8 @@ def on_margin_reject(state, journal, inst):
         state.d.setdefault("margin_cooldown", {})[inst] = until
     state.save()
     journal.log("executor", "margin_cooldown",
-                f"{inst} 51008 已拒绝，POST 不重试。冷却 {cool}s，下次名义 = 可用保证金基准 × "
-                f"分配比例 / 持仓槽 × {nxt:.2f}",
+                f"{inst} 51008 已拒绝，POST 不重试。冷却 {cool}s，下次名义 = 虚拟权益 × "
+                f"分配比例 / 持仓槽 × {nxt:.2f}，且不超过可用保证金 × {use_frac():.0%}",
                 inst=inst, scale=nxt, until=until, prev_scale=prev)
     return nxt
 
@@ -213,6 +226,127 @@ def seed_basis(state, eq, our_upl):
     state.d["swing_basis_upl"] = float(our_upl or 0)
 
 
+def _fnum(v, default=0.0):
+    try:
+        if v in (None, ""):
+            return float(default)
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def configured_capital():
+    """波段虚拟本金。没设或设成 <=0 时用 10000，避免退回被污染的交易所总权益。"""
+    cap = _fnum(getattr(config, "SWING_CAPITAL_USDT", None), 0.0)
+    if cap <= 0:
+        return 10000.0
+    return cap
+
+
+def realized_since_switch(state):
+    """切换点之后新记入 daily 的已实现盈亏。
+
+    不重放 trades.csv。切换前的成交留在账本里，swing_realized_basis
+    把切换当时的 daily 合计扣掉，那些历史盈亏就不进虚拟权益。
+    """
+    if state.d.get("swing_realized_basis") in (None, ""):
+        return 0.0
+    return book_realized(state) - _fnum(state.d.get("swing_realized_basis"))
+
+
+def virtual_equity(state, our_upl=None):
+    """SWING_CAPITAL_USDT + 切换后已实现盈亏 + 本策略持仓浮盈。"""
+    if our_upl is None:
+        our_upl = state.d.get("swing_last_our_upl")
+    return configured_capital() + realized_since_switch(state) + _fnum(our_upl)
+
+
+def capital_is_current(state):
+    """已经按当前 SWING_CAPITAL_USDT 迁移过，就不要每轮把起点和峰值打回本金。"""
+    if state.d.get("swing_capital_since") in (None, ""):
+        return False
+    if state.d.get("swing_realized_basis") in (None, ""):
+        return False
+    return abs(_fnum(state.d.get("swing_capital_usdt"), -1.0) - configured_capital()) < 1e-6
+
+
+def migrate_swing_capital(state, journal, our_upl=None):
+    """第一次启用某个固定本金，或本金数额变了：起点和峰值改到虚拟账本上。
+
+    选择（记在日志 equity/capital_migrate 里）：
+      - 保留 trades.csv 和 state.daily 的全部历史，不删、不改写旧数字。
+      - 虚拟权益从 SWING_CAPITAL_USDT 起算，只加切换之后新发生的已实现盈亏，
+        再加上本策略当前持仓的浮盈。切换前已经落袋的盈亏停在基线外面。
+      - 起点写成这个本金（10000），不是当时的交易所总权益。
+      - 峰值写成 max(本金, 当时虚拟权益)。已有浮盈可以成为峰值；
+        已有浮亏立刻算进相对起点的回撤。
+      - 不自动清除 swing_halted。若停机是旧的交易所总权益触发的，
+        用 SWING_RESET_HALT=1 按当前虚拟权益重设起点。
+    """
+    if capital_is_current(state):
+        return False
+    cap = configured_capital()
+    prev_start = state.d.get("swing_start_equity")
+    prev_peak = state.d.get("swing_peak_equity")
+    prev_capital = state.d.get("swing_capital_usdt")
+    basis = book_realized(state)
+    upl = _fnum(state.d.get("swing_last_our_upl") if our_upl is None else our_upl)
+    veq = cap + upl
+    state.d["swing_capital_usdt"] = cap
+    state.d["swing_capital_since"] = float(state.now())
+    state.d["swing_realized_basis"] = basis
+    state.d["swing_start_equity"] = cap
+    state.d["swing_peak_equity"] = max(cap, veq)
+    seed_basis(state, veq, upl)
+    state.save()
+    if journal is not None:
+        journal.log(
+            "equity", "capital_migrate",
+            f"波段改用固定本金 {cap:.2f} USDT。"
+            f"虚拟权益 = 本金 + 切换之后的已实现盈亏 + 本策略浮盈"
+            f"（此刻 {veq:.2f}，浮盈 {upl:+.2f}）。"
+            f"切换前 daily 合计 {basis:.2f} 记为基线，不计入虚拟权益；"
+            f"trades.csv 和 daily 历史都保留。"
+            f"起点 {prev_start} → {cap:.2f}，峰值 {prev_peak} → {state.d['swing_peak_equity']:.2f}。"
+            f"此前本金设置 {prev_capital}。已有停机标记不自动解开。",
+            capital=cap, virtual=round(veq, 4), upl=round(upl, 4),
+            realized_basis=round(basis, 4), prev_start=prev_start, prev_peak=prev_peak,
+            prev_capital=prev_capital, start=cap, peak=state.d["swing_peak_equity"])
+    return True
+
+
+def swing_equity_status(state, journal, our_upl=None):
+    """迁移（每个本金只做一次）并按虚拟权益抬峰值。
+
+    不读交易所总权益。入金、别的策略和 stgyEq 不会抬峰值，
+    也不会因此写 equity_unexplained。
+    """
+    if our_upl is not None:
+        state.d["swing_last_our_upl"] = _fnum(our_upl)
+    migrated = migrate_swing_capital(state, journal, state.d.get("swing_last_our_upl"))
+    veq = virtual_equity(state, state.d.get("swing_last_our_upl"))
+    peak = _fnum(state.d.get("swing_peak_equity"))
+    lifted = False
+    if veq > peak:
+        state.d["swing_peak_equity"] = veq
+        lifted = True
+        if journal is not None:
+            journal.log(
+                "equity", "peak_update",
+                f"虚拟权益峰值抬到 {veq:.2f}（本金 {configured_capital():.2f} +"
+                f" 切换后已实现 {realized_since_switch(state):+.2f} +"
+                f" 本策略浮盈 {_fnum(state.d.get('swing_last_our_upl')):+.2f}）",
+                equity=veq, expected=round(veq, 4), gap=0.0, peak=veq, virtual=round(veq, 4))
+        state.save()
+    return {
+        "equity": veq,
+        "peak": _fnum(state.d.get("swing_peak_equity")),
+        "start": _fnum(state.d.get("swing_start_equity")),
+        "lifted": lifted,
+        "migrated": migrated,
+    }
+
+
 def mark_fresh_start(state):
     """这一进程里才第一次写下起始权益，不能拿历史 daily 去倒减。"""
     state._start_seeded_now = True
@@ -243,11 +377,10 @@ def _tolerance(expected):
 
 
 def note_swing_equity(state, journal, eq, our_upl=0.0):
-    """峰值只在上涨能被本策略账本解释时抬高。
+    """旧的「交易所总权益 vs 账本」核对。波段实盘路径不再调用。
 
-    说不清来源的跳涨不抬峰值，避免之后回落被当成回撤。
-    已经记下的峰值不在这里下调（那会悄悄放宽闸门）。
-    下跌照常留给账户止损和较峰值回撤，这里不改那两个比较。
+    定仓和回撤走 swing_equity_status / virtual_equity。
+    这里留下，是为了说明：若仍拿交易所总权益来比，对不上就不抬峰值。
     """
     eq = float(eq)
     our_upl = float(our_upl or 0)
@@ -443,7 +576,13 @@ def load_orders(client):
 
 
 def log_account_snapshot(journal, client, event, inst=None, margin=None, notional=None):
-    """启动时和每笔 POST 之前记一页账户。读失败也要留下错误，不能把下单流程带崩。"""
+    """启动时记一页交易所账户（每个进程最多一次），每笔开仓 POST 之前再记一页。
+
+    只作对照。不参与定仓，也不据此写 equity_unexplained。
+    读失败也要留下错误，不能把下单流程带崩。
+    """
+    if event == "startup" and getattr(journal, "_startup_account_logged", False):
+        return getattr(journal, "_startup_account_view", None)
     errors = []
     view = None
     fn = getattr(client, "margin_view", None)
@@ -467,11 +606,173 @@ def log_account_snapshot(journal, client, event, inst=None, margin=None, notiona
     view["errors"] = list(view.get("errors") or []) + errors
     msg = format_snapshot(view, positions, orders, inst=inst, margin=margin, notional=notional)
     journal.log("account", event, msg, **snapshot_fields(view, positions, orders))
+    if event == "startup":
+        journal._startup_account_logged = True
+        journal._startup_account_view = view
     return view
 
 
+def _virtual_capital_checks(j):
+    """固定本金：历史成交保留但不计入，回撤不看交易所总权益，启动快照不重复报警。"""
+    import json
+    import tempfile
+    from agents.journal import Journal
+    from agents.risk import RiskGate
+    from agents.state import SharedState
+    from agents.swing import reconcile
+
+    del j
+    assert abs(configured_capital() - 10000.0) < 1e-6, configured_capital()
+    jv = Journal(tempfile.mkdtemp(), echo=False)
+    try:
+        class _Rec:
+            def equity(self):
+                return 102000.68
+
+            def positions(self):
+                return [{"instId": "BTC-USDT-SWAP", "side": "long", "qty": 1, "avgPx": 100,
+                         "upl": 250.0, "cTime": "1700000000000"}]
+
+            def pending_algos(self, inst):
+                return []
+
+            def recent_closed(self, limit=100):
+                return []
+
+        st = SharedState(tempfile.mkdtemp(), clock=lambda: 1_700_000_000.0)
+        st.d["swing_start_equity"] = 83466.29
+        st.d["swing_peak_equity"] = 102134.58
+        st.d["daily"] = {"2026-11-08": -7156.36, "2026-11-10": 1467.63}
+        st.d["open_meta"] = {
+            "BTC-USDT-SWAP": {"family": "momentum", "direction": "long", "opened_ts": 10}}
+        reconcile(_Rec(), st, jv, None)
+        assert st.d["daily"]["2026-11-08"] == -7156.36
+        assert abs(st.d["swing_realized_basis"] - (-7156.36 + 1467.63)) < 1e-6
+        # 浮盈 250 算进虚拟权益，起点仍是本金，不是交易所的 102000。
+        assert abs(st.d["swing_start_equity"] - 10000) < 1e-6, st.d["swing_start_equity"]
+        assert abs(st.d["swing_peak_equity"] - 10250) < 1e-6, st.d["swing_peak_equity"]
+        st.d["daily"]["2026-11-14"] = 250.0
+        reconcile(_Rec(), st, jv, None)
+        assert abs(st.d["swing_start_equity"] - 10000) < 1e-6
+        assert abs(virtual_equity(st) - 10500) < 1e-6, virtual_equity(st)
+        assert abs(st.d["swing_peak_equity"] - 10500) < 1e-6
+
+        st_h = SharedState(tempfile.mkdtemp(), clock=lambda: 1_700_000_100.0)
+        st_h.d["swing_halted"] = True
+        st_h.d["swing_start_equity"] = 83466.29
+        st_h.d["swing_peak_equity"] = 102134.58
+        st_h.d["daily"] = {"2026-11-08": -100.0}
+        st_h.d["open_meta"] = {
+            "BTC-USDT-SWAP": {"family": "oi", "direction": "long", "opened_ts": 10, "sl": 1, "tp": 2}}
+        old_reset = config.SWING_RESET_HALT
+        config.SWING_RESET_HALT = True
+        try:
+            reconcile(_Rec(), st_h, jv, None)
+        finally:
+            config.SWING_RESET_HALT = old_reset
+        assert st_h.d.get("swing_halted") is False
+        assert abs(st_h.d["swing_start_equity"] - 10250) < 1e-6, st_h.d["swing_start_equity"]
+        assert abs(st_h.d["swing_peak_equity"] - 10250) < 1e-6
+        assert abs(st_h.d["swing_realized_basis"] - (-100.0)) < 1e-6
+        assert st_h.d["daily"]["2026-11-08"] == -100.0
+
+        stv = SharedState(tempfile.mkdtemp(), clock=lambda: 1_800_000_000.0)
+        stv.d["swing_start_equity"] = 83466.29
+        stv.d["swing_peak_equity"] = 102134.58
+        stv.d["daily"] = {"2026-11-08": -7156.36, "2026-11-10": 1467.63}
+        info = swing_equity_status(stv, jv, 0)
+        assert info["migrated"] is True
+        assert abs(info["equity"] - 10000) < 1e-6
+        assert abs(stv.d["swing_peak_equity"] - 10000) < 1e-6
+        stv.d["swing_peak_equity"] = 10400
+        info = swing_equity_status(stv, jv, 0)
+        assert info["migrated"] is False
+        assert stv.d["swing_peak_equity"] == 10400
+        stv.d["daily"]["2026-11-14"] = 250.0
+        info = swing_equity_status(stv, jv, 100)
+        assert abs(info["equity"] - 10350) < 1e-6 and info["lifted"] is False
+        info = swing_equity_status(stv, jv, 500)
+        assert abs(info["equity"] - 10750) < 1e-6 and info["lifted"] is True
+        assert stv.d["daily"]["2026-11-08"] == -7156.36
+
+        stv.d["swing_last_our_upl"] = -1350  # 10000 + 250 - 1350 = 8900
+        gate = RiskGate(None, jv, stv, None)
+        why = gate.global_block(100494.68)
+        assert why and "回撤" in why, why
+        assert stv.d.get("swing_halted") is not True
+        stv.d["swing_last_our_upl"] = -3250  # 7000，低于起始 10000 的 80%
+        why = gate.global_block(1)
+        assert stv.d.get("swing_halted") is True
+        assert why and "止损" in why, why
+
+        st_ok = SharedState(tempfile.mkdtemp(), clock=lambda: 50.0)
+        st_ok.d["daily"] = {"old": -50000.0}
+        st_ok.d["swing_start_equity"] = 90000
+        st_ok.d["swing_peak_equity"] = 102000
+        swing_equity_status(st_ok, jv, 0)
+        assert abs(st_ok.d["swing_start_equity"] - 10000) < 1e-6
+        assert st_ok.d["daily"]["old"] == -50000.0
+        assert abs(st_ok.d["swing_realized_basis"] + 50000) < 1e-6
+        assert RiskGate(None, jv, st_ok, None).global_block(1) is None
+
+        old_cap = config.SWING_CAPITAL_USDT
+        config.SWING_CAPITAL_USDT = 20000
+        try:
+            info = swing_equity_status(st_ok, jv, 80)
+            assert info["migrated"] is True
+            assert abs(st_ok.d["swing_start_equity"] - 20000) < 1e-6
+            assert abs(info["equity"] - 20080) < 1e-6, info
+            assert abs(st_ok.d["swing_realized_basis"] - book_realized(st_ok)) < 1e-6
+        finally:
+            config.SWING_CAPITAL_USDT = old_cap
+
+        blob = open(jv.jsonl.name, encoding="utf-8").read()
+        assert "equity_unexplained" not in blob
+        assert "capital_migrate" in blob
+        rows = [json.loads(line) for line in blob.splitlines() if line.strip()]
+        assert any(r.get("event") == "capital_migrate" and r.get("capital") == 10000 for r in rows)
+    finally:
+        jv.close()
+
+
+def _snapshot_once_checks():
+    """交易所账户快照：启动每个进程一条，开仓 POST 之前另记。不写 equity_unexplained。"""
+    import json
+    import tempfile
+    from agents.journal import Journal
+
+    js = Journal(tempfile.mkdtemp(), echo=False)
+    try:
+        class _Snap:
+            def margin_view(self):
+                return {"available": 800.0, "available_field": "availEq", "eq": 102000.0,
+                        "acctLv": "2", "posMode": "net_mode", "tdMode": "cross",
+                        "usdt": {"availBal": 1200.0, "availEq": 800.0, "frozenBal": 90000.0,
+                                 "eq": 102000.0, "stgyEq": 10992.0},
+                        "account": {"totalEq": 102000.0}, "other_ccy": [], "errors": []}
+
+            def positions_all(self):
+                return []
+
+            def pending_orders(self):
+                return []
+
+        log_account_snapshot(js, _Snap(), "startup")
+        log_account_snapshot(js, _Snap(), "startup")
+        log_account_snapshot(js, _Snap(), "pre_order", inst="BTC-USDT-SWAP", margin=10, notional=10)
+        events = [json.loads(line)["event"]
+                  for line in open(js.jsonl.name, encoding="utf-8") if line.strip()]
+        assert events.count("startup") == 1, events
+        assert events.count("pre_order") == 1, events
+        blob = open(js.jsonl.name, encoding="utf-8").read()
+        assert "equity_unexplained" not in blob
+        assert "stgyEq=10992.00" in blob
+    finally:
+        js.close()
+
+
 def offline_self_check():
-    """不联网。可用保证金字段、按可用保证金定仓、51008 不重试、峰值不被虚高抬起。"""
+    """不联网。可用保证金字段、虚拟本金定仓、51008 不重试、回撤不看交易所总权益。"""
     import tempfile
     from okx_client import OkxError
 
@@ -525,12 +826,16 @@ def offline_self_check():
         assert token in text, token
 
     from agents.swing import size_qty
+    # 名义 = 虚拟权益 / 4。不读交易所总权益。
     assert size_qty(10_000, 100, 0.1, 1, 1) == 250
-    # 可用 4000、权益 100000：名义按 4000/4，而不是 100000/4。
-    assert size_qty(100_000, 100, 0.1, 1, 1, available=4000) == 100, size_qty(100_000, 100, 0.1, 1, 1, available=4000)
-    assert size_qty(100_000, 100, 0.1, 1, 1, available=4000, fraction=0.5) == 50
+    # 可用 4000 大于 2500，不把仓位收成 4000/4，也不按更大的数字放大。
+    assert size_qty(10_000, 100, 0.1, 1, 1, available=4000) == 250
+    assert size_qty(10_000, 100, 0.1, 1, 1, available=4000, fraction=0.5) == 125
     assert size_qty(1000, 100, 0.1, 1, 1, available=4000) == 25
-    assert size_qty(100_000, 100, 0.1, 1, 1, available=0) is None
+    assert size_qty(10_000, 100, 0.1, 1, 1, available=0) is None
+    # 800×0.90=720，名义封在这里。杠杆不把上限放大，所以不会超过真实 availEq。
+    assert size_qty(10_000, 100, 0.1, 1, 1, available=800) == 72
+    assert size_qty(10_000, 100, 0.1, 1, 1, available=800, lever=5) == 72
 
     from agents.journal import Journal
     from agents.state import SharedState
@@ -567,14 +872,7 @@ def offline_self_check():
         assert abs(st2.d["swing_peak_equity"] - 10400) < 1e-6
 
         config.STRATEGY = "swing_combo"
-        gate = RiskGate(None, j, st2, None)
-        # 10400 的峰值，8900 大约回撤 14%，但还没到起始权益的 -20%。
-        why = gate.global_block(8900)
-        assert why and "回撤" in why, why
-        assert st2.d.get("swing_halted") is not True
-        why = gate.global_block(7000)
-        assert st2.d.get("swing_halted") is True
-        assert why and "止损" in why, why
+        _virtual_capital_checks(j)
 
         # 51008：一次 POST，冷却，缩小比例，风控在冷却内拒绝。
         from agents.executor import Executor
@@ -637,7 +935,7 @@ def offline_self_check():
         assert "SOL-USDT-SWAP" not in (st3.d.get("margin_scale") or {})
         assert "SOL-USDT-SWAP" not in (st3.d.get("margin_cooldown") or {})
 
-        # 计划张数走客户端读到的可用保证金，不走传入的总权益。
+        # 名义按传入的虚拟权益。客户端 eq=100000 不参与，可用保证金只做上限。
         from agents.position import PositionManager
 
         class _Avail:
@@ -655,10 +953,24 @@ def offline_self_check():
         planner = PositionManager(_Avail(), j, _Fees())
         cand = {"instId": "BTC-USDT-SWAP", "direction": "long", "family": "momentum",
                 "regime": "trend", "combined": 0.8, "atr": 1.0, "atr_pct": 0.02,
-                "price": 100.0, "bid": 99.9, "ask": 100.1, "spread_bps": 2}
-        planned = planner.plan(cand, 100_000, size_scale=0.5)
-        assert planned and abs(planned["notional"] - 500) < 1.0, planned
+                "price": 100.0, "bid": 100.0, "ask": 100.0, "spread_bps": 2}
+        planned = planner.plan(cand, 10_000, size_scale=0.5)
+        # 10000/4×0.5=1250，低于 4000×0.90。
+        assert planned and abs(planned["notional"] - 1250) < 1.0, planned
         assert planned["lever"] == 1
+        assert "虚拟权益" in open(j.human.name, encoding="utf-8").read()
+
+        class _Tight(_Avail):
+            def margin_view(self):
+                view = dict(super().margin_view())
+                view["available"] = 500.0
+                return view
+
+        tight = PositionManager(_Tight(), j, _Fees()).plan(cand, 10_000, size_scale=1.0)
+        # 名义想要 2500，封顶 500×0.90=450。
+        assert tight and abs(tight["notional"] - 450) < 1.0, tight
+
+        _snapshot_once_checks()
 
         # 挂单按类型分别拉，持仓不按 instType 过滤。POST 51008 只打一次。
         _http_coverage()

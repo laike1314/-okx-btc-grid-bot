@@ -198,7 +198,11 @@ SWING_OI_MIN_HOLD_SEC = _env("SWING_OI_MIN_HOLD_SEC", 24 * 3600, int)
 SWING_OI_MAX_HOLD_SEC = _env("SWING_OI_MAX_HOLD_SEC", 48 * 3600, int)
 # 预期止盈距离至少是来回成本的这么多倍，否则不做。
 SWING_MIN_EDGE_FEE_MULT = _env("SWING_MIN_EDGE_FEE_MULT", 3.0, float)
-# 共享风控。每笔名义 ≈ 权益 × ALLOC / MAX_POSITIONS（默认约 1/4）。
+# 共享风控。定仓和回撤都用虚拟权益，不用交易所总权益
+# （模拟盘账户里还有别的策略、stgyEq 和入金）。
+# 虚拟权益 = SWING_CAPITAL_USDT + 切换到这个本金之后的已实现盈亏 + 本策略持仓浮盈。
+# 每笔名义 ≈ 虚拟权益 × ALLOC / MAX_POSITIONS，再封顶到可用保证金 × MARGIN_USE_FRAC。
+SWING_CAPITAL_USDT = _env("SWING_CAPITAL_USDT", 10000.0, float)
 SWING_MAX_POSITIONS = _env("SWING_MAX_POSITIONS", 4, int)
 SWING_MAX_PER_FAMILY = _env("SWING_MAX_PER_FAMILY", 3, int)
 SWING_LEVERAGE = _env("SWING_LEVERAGE", 1, int)
@@ -222,7 +226,8 @@ MARGIN_RETRY_FRACTION = _env("MARGIN_RETRY_FRACTION", 0.5, float)
 MARGIN_SCALE_FLOOR = _env("MARGIN_SCALE_FLOOR", 0.25, float)
 # 单笔初始保证金不超过可用保证金的这个比例，给手续费和标记价留余量。
 MARGIN_USE_FRAC = _env("MARGIN_USE_FRAC", 0.90, float)
-# 权益和「起始权益 + 本策略已实现盈亏 + 本策略浮盈」差过这条线，就当成说不清来源。
+# 旧的「交易所总权益 vs 账本」容差。波段实盘路径不再拿总权益做这个比较，
+# 定仓和回撤走 SWING_CAPITAL_USDT 的虚拟权益。
 EQUITY_UNEXPLAINED_USDT = _env("EQUITY_UNEXPLAINED_USDT", 50.0, float)
 EQUITY_UNEXPLAINED_PCT = _env("EQUITY_UNEXPLAINED_PCT", 0.005, float)
 

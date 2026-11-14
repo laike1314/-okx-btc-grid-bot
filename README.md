@@ -10,7 +10,7 @@
 
 `okx-multi-agent/` 里的多代理系统默认仍是快进快出（`STRATEGY=scalp`）。另有可选模式 `STRATEGY=swing_combo`：4H 判断趋势或震荡，截面动量和 OI 脉冲合成后做多最强、做空最弱，持仓 12～48 小时。环境变量、打分和出场见 `okx-multi-agent/README.md`。
 
-持续收集数据用工作流 **OKX Swing Combo**（`.github/workflows/swing-combo.yml`）：大约每 5 小时接上一轮，每轮跑 5.5 小时后退出，仓位留在模拟盘。账本提交到分支 `swing-data`（不含密钥）。合并到默认分支后，在 Actions 里手动 Run workflow 即可开始；停止则 Disable 该工作流。不要和剥头皮工作流同时打同一个模拟盘账户。
+持续收集数据用工作流 **OKX Swing Combo**（`.github/workflows/swing-combo.yml`）：大约每 5 小时接上一轮，每轮跑 5.5 小时后退出，仓位留在模拟盘。定仓和 20% 回撤用固定本金 `SWING_CAPITAL_USDT`（默认 10000 USDT）的虚拟权益，不看模拟盘账户总权益（同一账户上还有别的策略和入金）。账本提交到分支 `swing-data`（不含密钥）。合并到默认分支后，在 Actions 里手动 Run workflow 即可开始；停止则 Disable 该工作流。不要和剥头皮工作流同时打同一个模拟盘账户。
 
 ---
 
