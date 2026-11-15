@@ -4,55 +4,29 @@
   "symbol_cooldown": {
     "LIT-USDT-SWAP": 1794140083.3517504,
     "ARB-USDT-SWAP": 1794286134.523534,
-    "BNB-USDT-SWAP": 1794203170.2690434
+    "BNB-USDT-SWAP": 1794203170.2690434,
+    "ICP-USDT-SWAP": 1794729485.211645
   },
   "daily": {
     "2026-11-08": -7156.3569295,
     "2026-11-09": -1312.885764758747,
-    "2026-11-10": 1467.6323615694446
+    "2026-11-10": 1467.6323615694446,
+    "2026-11-15": 110.85157393823339
   },
-  "open_meta": {
-    "ICP-USDT-SWAP": {
-      "direction": "short",
-      "qty": 109986.8,
-      "entry": 2.273,
-      "sl": 2.206,
-      "tp": 2.196,
-      "opened_at": "2026-11-15T01:10:44+08:00",
-      "opened_ts": 1794676244.3580968,
-      "open_ms": 1794676244358,
-      "score": 0.6517241379310345,
-      "family": "momentum",
-      "regime": "trend",
-      "mom_score": 0.9310344827586207,
-      "oi_score": 0,
-      "combined": 0.6517241379310345,
-      "atr": 0.07850947596324073,
-      "atr_pct": 0.033637307610642986,
-      "min_hold_sec": 43200,
-      "max_hold_sec": 86400,
-      "sl_pct": 0.05045596141596448,
-      "tp_pct": 0.033637307610642986,
-      "tag": "swmom",
-      "peak_px": 2.127
-    }
-  },
+  "open_meta": {},
   "day_start_equity": {},
   "pnl_events": [
     {
-      "ts": 1794174370.2690341,
-      "net": -154.2706523
-    },
-    {
-      "ts": 1794257334.5235229,
-      "net": 1467.6323615694446
+      "ts": 1794700685.2116349,
+      "net": 110.85157393823339
     }
   ],
   "last_entry_bar": {},
   "last_exit_trend_bar": {
     "LIT-USDT-SWAP": 1794109500000,
     "ARB-USDT-SWAP": 1794256200000,
-    "BNB-USDT-SWAP": 1794173400000
+    "BNB-USDT-SWAP": 1794173400000,
+    "ICP-USDT-SWAP": 1794699000000
   },
   "swing_start_equity": 10000.0,
   "swing_peak_equity": 10153.98152,
@@ -65,6 +39,6 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1794674284.6370602,
-  "swing_last_our_upl": 135.28376400000025
+  "swing_last_reconcile": 1794700680.5984812,
+  "swing_last_our_upl": 0.0
 }
