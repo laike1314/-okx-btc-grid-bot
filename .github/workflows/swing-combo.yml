@@ -55,6 +55,10 @@ jobs:
       ENABLE_US_STOCKS: "0"
       STRATEGY: swing_combo
       SWING_CAPITAL_USDT: "10000"
+      # 只放宽波段开仓这三项。本作业里的剥头皮冒烟不读它们，仍用各自的 MAX_* 默认。
+      SWING_MAX_SPREAD_BPS: "20"
+      SWING_MIN_VOL_USDT_24H: "2000000"
+      SWING_MAX_MARK_INDEX_BPS: "100"
 
     steps:
       - name: Checkout

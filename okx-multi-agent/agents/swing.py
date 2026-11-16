@@ -771,7 +771,7 @@ def _apply_signal_exits(agents, positions, by_inst):
 
 
 def _retry_and_gate_checks():
-    """空行情可重试；下单 POST 遇到空响应不重试。波段点差 8bps、成交额 800 万，剥头皮阈值不动。"""
+    """空行情可重试；下单 POST 遇到空响应不重试。波段点差 20bps、成交额 200 万，剥头皮阈值不动。"""
     import okx_client
     from okx_client import OkxClient, OkxError
 
@@ -864,11 +864,11 @@ def _retry_and_gate_checks():
 
     class _Wide(_C):
         def ticker(self, inst):
-            return {"bid": 100.0, "ask": 100.09, "last": 100.0, "vol_usdt_24h": 9_000_000.0}
+            return {"bid": 100.0, "ask": 100.25, "last": 100.0, "vol_usdt_24h": 9_000_000.0}
 
     class _Thin(_C):
         def ticker(self, inst):
-            return {"bid": 100.0, "ask": 100.01, "last": 100.0, "vol_usdt_24h": 7_000_000.0}
+            return {"bid": 100.0, "ask": 100.01, "last": 100.0, "vol_usdt_24h": 1_000_000.0}
 
     class _Gap(_C):
         def mark_price(self, inst):
@@ -890,7 +890,7 @@ def _retry_and_gate_checks():
             ok, why = RiskGate(_Thin(), j, st, fees).check(dict(cand), [], 10_000)
             assert ok is False and "成交额" in why, why
             ok, why = RiskGate(_Gap(), j, st, fees).check(dict(cand), [], 10_000)
-            assert ok is False and "标记价" in why and "50" in why, why
+            assert ok is False and "标记价" in why and "> 100" in why, why
         finally:
             config.STRATEGY = saved
     finally:
@@ -1008,9 +1008,11 @@ def offline_self_check():
     assert close_age_sec(opened, span, now_ms) < 60
     assert close_age_sec(now_ms - 10 * span * 1000, span, now_ms) > 2 * span
     assert config.SWING_ENTRY_THRESHOLD == 0.65
-    assert config.MAX_SPREAD_BPS == 6 and config.SWING_MAX_SPREAD_BPS == 8
-    assert config.MIN_VOL_USDT_24H == 10_000_000 and config.SWING_MIN_VOL_USDT_24H == 8_000_000
-    assert config.MAX_MARK_INDEX_BPS == 50
+    assert config.MAX_SPREAD_BPS == 6 and config.SWING_MAX_SPREAD_BPS == 20
+    assert config.MIN_VOL_USDT_24H == 10_000_000 and config.SWING_MIN_VOL_USDT_24H == 2_000_000
+    assert config.MAX_MARK_INDEX_BPS == 50 and config.SWING_MAX_MARK_INDEX_BPS == 100
+    from agents.risk import check_liquidity_split
+    check_liquidity_split()
 
     _retry_and_gate_checks()
 
