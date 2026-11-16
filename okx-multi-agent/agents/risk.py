@@ -261,8 +261,8 @@ class RiskGate:
         if mark <= 0 or idx <= 0:
             return False, "标记或指数价为空"
         gap_bps = abs(mark - idx) / idx * 1e4
-        if gap_bps > config.MAX_MARK_INDEX_BPS:
-            return False, f"标记价偏离指数 {gap_bps:.1f}bps > {config.MAX_MARK_INDEX_BPS:.0f}"
+        if gap_bps > config.SWING_MAX_MARK_INDEX_BPS:
+            return False, f"标记价偏离指数 {gap_bps:.1f}bps > {config.SWING_MAX_MARK_INDEX_BPS:.0f}"
         fr = self.c.funding_rate(inst)
         if abs(fr) > config.MAX_ABS_FUNDING_RATE:
             return False, f"资金费率极端 {fr:.4%}"
@@ -314,8 +314,146 @@ class RiskGate:
         self.s.save()
 
 
+def _quote(spread_bps, bid=100.0):
+    """构造买卖价，使 (ask-bid)/mid 恰好等于给定点差。"""
+    ratio = float(spread_bps) / 1e4
+    ask = float(bid) * (2.0 + ratio) / (2.0 - ratio)
+    mid = (float(bid) + ask) / 2.0
+    got = (ask - float(bid)) / mid * 1e4 if mid else 1e9
+    return float(bid), ask, got
+
+
+def _gap_px(gap_bps, idx=10_000.0):
+    mark = float(idx) * (1.0 + float(gap_bps) / 1e4)
+    got = abs(mark - float(idx)) / float(idx) * 1e4
+    return mark, float(idx), got
+
+
+class _LiquidityBook:
+    """离线盘口。只提供风控闸门会读的公开行情，不下单。"""
+
+    def __init__(self, spread_bps, vol, gap_bps):
+        self.bid, self.ask, self.spread_bps = _quote(spread_bps)
+        self.mark, self.idx, self.gap_bps = _gap_px(gap_bps)
+        self.vol = float(vol)
+
+    def ticker(self, inst):
+        return {"bid": self.bid, "ask": self.ask, "last": self.bid, "vol_usdt_24h": self.vol}
+
+    def mark_price(self, inst):
+        return self.mark
+
+    def index_price(self, inst):
+        return self.idx
+
+    def funding_rate(self, inst):
+        return 0.0
+
+
+def check_liquidity_split():
+    """波段三项边界，以及和剥头皮闸门互不影响。不联网、不下单。
+
+    比较都是严格大于/小于：等于上限或下限要通过。剥头皮继续读
+    MAX_SPREAD_BPS / MIN_VOL_USDT_24H / MAX_MARK_INDEX_BPS。
+    """
+    import tempfile
+
+    from agents.journal import Journal
+    from agents.state import SharedState
+
+    class _Fees:
+        maker = 0.0002
+        taker = 0.0005
+
+    def cand_for(book):
+        return {"instId": "ARB-USDT-SWAP", "direction": "long", "family": "momentum",
+                "regime": "trend", "combined": 0.8, "atr": 2.0, "atr_pct": 0.02,
+                "price": book.ask}
+
+    def run(strategy, book):
+        saved = config.STRATEGY
+        config.STRATEGY = strategy
+        j = Journal(tempfile.mkdtemp(), echo=False)
+        try:
+            st = SharedState(tempfile.mkdtemp(), clock=lambda: 1_000_000.0)
+            return RiskGate(book, j, st, _Fees()).check(cand_for(book), [], 10_000)
+        finally:
+            config.STRATEGY = saved
+            j.close()
+
+    assert config.MAX_SPREAD_BPS == 6
+    assert config.MIN_VOL_USDT_24H == 10_000_000
+    assert config.MAX_MARK_INDEX_BPS == 50
+    assert config.SWING_MAX_SPREAD_BPS == 20
+    assert config.SWING_MIN_VOL_USDT_24H == 2_000_000
+    assert config.SWING_MAX_MARK_INDEX_BPS == 100
+    assert config.SWING_ENTRY_THRESHOLD == 0.65
+    assert config.SWING_CAPITAL_USDT == 10000
+
+    at_spread = _LiquidityBook(20, 50_000_000, 0)
+    over_spread = _LiquidityBook(20.05, 50_000_000, 0)
+    assert at_spread.spread_bps <= 20 and over_spread.spread_bps > 20, (
+        at_spread.spread_bps, over_spread.spread_bps)
+    at_vol = _LiquidityBook(1, 2_000_000, 0)
+    under_vol = _LiquidityBook(1, 1_999_999, 0)
+    at_gap = _LiquidityBook(1, 50_000_000, 100)
+    over_gap = _LiquidityBook(1, 50_000_000, 100.05)
+    assert abs(at_gap.gap_bps - 100) < 1e-6 and over_gap.gap_bps > 100, (
+        at_gap.gap_bps, over_gap.gap_bps)
+
+    ok, why = run("swing_combo", at_spread)
+    assert ok, why
+    ok, why = run("swing_combo", over_spread)
+    assert ok is False and "点差" in why and "> 20" in why, why
+    ok, why = run("swing_combo", at_vol)
+    assert ok, why
+    ok, why = run("swing_combo", under_vol)
+    assert ok is False and "成交额" in why and "2000000" in why, why
+    ok, why = run("swing_combo", at_gap)
+    assert ok, why
+    ok, why = run("swing_combo", over_gap)
+    assert ok is False and "标记价" in why and "> 100" in why, why
+
+    # 落在新旧阈值之间：剥头皮拒绝，波段通过。
+    between_spread = _LiquidityBook(10, 50_000_000, 0)
+    assert 6 < between_spread.spread_bps <= 20
+    ok, why = run("scalp", between_spread)
+    assert ok is False and "点差" in why and "> 6" in why, why
+    ok, why = run("swing_combo", between_spread)
+    assert ok, why
+    between_vol = _LiquidityBook(1, 5_000_000, 0)
+    ok, why = run("scalp", between_vol)
+    assert ok is False and "成交额" in why and "10000000" in why, why
+    ok, why = run("swing_combo", between_vol)
+    assert ok, why
+    between_gap = _LiquidityBook(1, 50_000_000, 80)
+    assert 50 < between_gap.gap_bps <= 100
+    ok, why = run("scalp", between_gap)
+    assert ok is False and "标记价" in why and "> 50" in why, why
+    ok, why = run("swing_combo", between_gap)
+    assert ok, why
+
+    # 改共享上限不能收紧波段；改波段上限不能放宽剥头皮。
+    old_shared = config.MAX_MARK_INDEX_BPS
+    old_swing_gap = config.SWING_MAX_MARK_INDEX_BPS
+    try:
+        config.MAX_MARK_INDEX_BPS = 1
+        ok, why = run("swing_combo", between_gap)
+        assert ok, why
+        config.MAX_MARK_INDEX_BPS = old_shared
+        config.SWING_MAX_MARK_INDEX_BPS = 1000
+        ok, why = run("scalp", between_gap)
+        assert ok is False and "> 50" in why, why
+        ok, why = run("swing_combo", over_gap)
+        assert ok, why
+    finally:
+        config.MAX_MARK_INDEX_BPS = old_shared
+        config.SWING_MAX_MARK_INDEX_BPS = old_swing_gap
+
+
 def offline_self_check():
     """不联网。仓位上限，以及冷却秒数 <=0 时不因落盘的到期时间拒绝开仓。"""
+    check_liquidity_split()
     old_cap = config.MAX_POSITIONS
     old_loss = config.LOSS_COOLDOWN_SEC
     old_sym = config.SYMBOL_COOLDOWN_SEC

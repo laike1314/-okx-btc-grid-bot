@@ -238,7 +238,7 @@ OI 腿记 0 时日志会写原因，不把门槛放低来凑单：`not_flat`（�
 
 ### 风控
 
-同时最多 `SWING_MAX_POSITIONS`（4）个本策略仓，同一家族最多 `SWING_MAX_PER_FAMILY`（3）。杠杆 `SWING_LEVERAGE`（1）。每笔名义 ≈ **虚拟权益** × `SWING_ALLOC_PCT` / 4，默认大约四分之一，再封顶到真实可用保证金 × `MARGIN_USE_FRAC`（0.90），所以不会超过账户里真正能用的 availEq。51008 之后的冷却和缩小比例照旧。任何平仓后该合约冷却 `SWING_COOLDOWN_SEC`（8 小时）。**虚拟权益**较**起始权益**回撤 `SWING_ACCOUNT_STOP_PCT`（20%）就停机并平掉本策略的仓，记下 `swing_halted`，下次还在，直到 `SWING_RESET_HALT=1`（起点和峰值改成当时的虚拟权益，不是交易所总权益）。较**峰值**回撤 `SWING_PEAK_DD_PCT`（10%）只停止开新仓，不平已有仓。点差、24h 成交额、标记价偏离、极端资金费这些微观闸门仍然有效，阈值不改。剥头皮的 2% 滚动亏损、15 分钟冷却、同向加密上限，在这个模式里不生效。
+同时最多 `SWING_MAX_POSITIONS`（4）个本策略仓，同一家族最多 `SWING_MAX_PER_FAMILY`（3）。杠杆 `SWING_LEVERAGE`（1）。每笔名义 ≈ **虚拟权益** × `SWING_ALLOC_PCT` / 4，默认大约四分之一，再封顶到真实可用保证金 × `MARGIN_USE_FRAC`（0.90），所以不会超过账户里真正能用的 availEq。51008 之后的冷却和缩小比例照旧。任何平仓后该合约冷却 `SWING_COOLDOWN_SEC`（8 小时）。**虚拟权益**较**起始权益**回撤 `SWING_ACCOUNT_STOP_PCT`（20%）就停机并平掉本策略的仓，记下 `swing_halted`，下次还在，直到 `SWING_RESET_HALT=1`（起点和峰值改成当时的虚拟权益，不是交易所总权益）。较**峰值**回撤 `SWING_PEAK_DD_PCT`（10%）只停止开新仓，不平已有仓。点差上限 20 bps（`SWING_MAX_SPREAD_BPS`）、24h 成交额下限 200 万 USDT（`SWING_MIN_VOL_USDT_24H`）、标记价偏离上限 100 bps（`SWING_MAX_MARK_INDEX_BPS`）只在波段开仓生效。剥头皮仍是点差 6 bps、成交额 1000 万、标记价偏离 50 bps（`MAX_MARK_INDEX_BPS`）。极端资金费闸门仍然有效，阈值不改。剥头皮的 2% 滚动亏损、15 分钟冷却、同向加密上限，在这个模式里不生效。
 
 虚拟权益不看交易所 USDT 总权益。模拟盘账户里还有别的策略、交易机器人占用（stgyEq）和说不清的入金，总权益不能拿来定仓，也不再因此打 `equity_unexplained`。交易所账户明细仍会记一条 `account/startup`（每个进程最多一次），每笔开仓 POST 之前再记一条 `account/pre_order`，只作对照。
 
@@ -283,8 +283,9 @@ OI 腿记 0 时日志会写原因，不把门槛放低来凑单：`not_flat`（�
 | `SWING_AGREE_BONUS` | 0.1 | 同向加分 |
 | `SWING_MIN_LEG` | 0.15 | 低于此不算有方向 |
 | `SWING_ENTRY_THRESHOLD` | 0.65 | 入场阈值（0～1） |
-| `SWING_MAX_SPREAD_BPS` | 8 | 波段开仓点差上限。剥头皮仍是 `MAX_SPREAD_BPS` 6 |
-| `SWING_MIN_VOL_USDT_24H` | 8000000 | 波段 24h 成交额下限。剥头皮仍是 1000 万 |
+| `SWING_MAX_SPREAD_BPS` | 20 | 波段开仓点差上限。剥头皮仍是 `MAX_SPREAD_BPS` 6 |
+| `SWING_MIN_VOL_USDT_24H` | 2000000 | 波段 24h 成交额下限。剥头皮仍是 1000 万 |
+| `SWING_MAX_MARK_INDEX_BPS` | 100 | 波段标记价相对指数偏离上限。剥头皮和其他策略仍用 `MAX_MARK_INDEX_BPS` 50 |
 | `SWING_EXIT_SCORE` | 0.35 | 最短持仓后，低于此视为信号消失 |
 | `SWING_MOM_TP_ATR` / `SWING_MOM_SL_ATR` / `SWING_MOM_TRAIL_ATR` | 1 / 1.5 / 1 | 动量出场 |
 | `SWING_MOM_MIN_HOLD_SEC` / `SWING_MOM_MAX_HOLD_SEC` | 43200 / 86400 | 12h / 24h |
