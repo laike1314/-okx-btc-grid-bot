@@ -5,20 +5,46 @@
     "LIT-USDT-SWAP": 1794140083.3517504,
     "ARB-USDT-SWAP": 1794286134.523534,
     "BNB-USDT-SWAP": 1794203170.2690434,
-    "ICP-USDT-SWAP": 1794729485.211645
+    "ICP-USDT-SWAP": 1794900102.6981492
   },
   "daily": {
     "2026-11-08": -7156.3569295,
     "2026-11-09": -1312.885764758747,
     "2026-11-10": 1467.6323615694446,
-    "2026-11-15": 110.85157393823339
+    "2026-11-15": 110.85157393823339,
+    "2026-11-17": -54.8628836085
   },
-  "open_meta": {},
+  "open_meta": {
+    "LIT-USDT-SWAP": {
+      "direction": "long",
+      "qty": 83.0,
+      "entry": 3.0155,
+      "sl": 2.8046,
+      "tp": 3.2468,
+      "opened_at": "2026-11-17T08:31:08+08:00",
+      "opened_ts": 1794875468.9979072,
+      "open_ms": 1794875468997,
+      "score": 0.8834482758620689,
+      "family": "momentum",
+      "regime": "trend",
+      "mom_score": 0.8620689655172413,
+      "oi_score": 0.6,
+      "combined": 0.8834482758620689,
+      "atr": 0.22819678969105328,
+      "atr_pct": 0.07667129983236007,
+      "min_hold_sec": 43200,
+      "max_hold_sec": 86400,
+      "sl_pct": 0.1150069497485401,
+      "tp_pct": 0.07667129983236007,
+      "tag": "swmom",
+      "peak_px": 3.0328
+    }
+  },
   "day_start_equity": {},
   "pnl_events": [
     {
-      "ts": 1794700685.2116349,
-      "net": 110.85157393823339
+      "ts": 1794871302.6981392,
+      "net": -54.8628836085
     }
   ],
   "last_entry_bar": {},
@@ -26,7 +52,7 @@
     "LIT-USDT-SWAP": 1794109500000,
     "ARB-USDT-SWAP": 1794256200000,
     "BNB-USDT-SWAP": 1794173400000,
-    "ICP-USDT-SWAP": 1794699000000
+    "ICP-USDT-SWAP": 1794870000000
   },
   "swing_start_equity": 10000.0,
   "swing_peak_equity": 10153.98152,
@@ -39,6 +65,6 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1794811395.212121,
-  "swing_last_our_upl": 0.0
+  "swing_last_reconcile": 1794861177.7601082,
+  "swing_last_our_upl": -42.080999999999975
 }
