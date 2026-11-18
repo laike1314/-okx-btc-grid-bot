@@ -14,7 +14,32 @@
     "2026-11-15": 110.85157393823339,
     "2026-11-17": -62.8800860085
   },
-  "open_meta": {},
+  "open_meta": {
+    "HBAR-USDT-SWAP": {
+      "direction": "short",
+      "qty": 439.9,
+      "entry": 0.0571,
+      "sl": 0.0592,
+      "tp": 0.0549,
+      "opened_at": "2026-11-18T13:19:11+08:00",
+      "opened_ts": 1794979151.6542015,
+      "open_ms": 1794979151654,
+      "score": 0.7,
+      "family": "momentum",
+      "regime": "trend",
+      "mom_score": 1.0,
+      "oi_score": 0,
+      "combined": 0.7,
+      "atr": 0.002194570409433387,
+      "atr_pct": 0.03816644190318933,
+      "min_hold_sec": 43200,
+      "max_hold_sec": 86400,
+      "sl_pct": 0.057249662854784,
+      "tp_pct": 0.03816644190318933,
+      "tag": "swmom",
+      "peak_px": 0.057
+    }
+  },
   "day_start_equity": {},
   "pnl_events": [
     {
@@ -44,6 +69,6 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1794942819.6637475,
-  "swing_last_our_upl": 0.0
+  "swing_last_reconcile": 1794968895.1716912,
+  "swing_last_our_upl": -17.5960000000002
 }
