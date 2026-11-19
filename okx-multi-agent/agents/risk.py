@@ -288,7 +288,8 @@ class RiskGate:
 
     # ---- 平仓后由 equity 代理回调 ----
     def on_trade_closed(self, inst, net):
-        self.s.add_daily_pnl(net)
+        if net is not None:
+            self.s.add_daily_pnl(net)
         if config.is_swing():
             if config.SWING_COOLDOWN_SEC > 0:
                 self.s.d.setdefault("symbol_cooldown", {})[inst] = self.s.now() + config.SWING_COOLDOWN_SEC

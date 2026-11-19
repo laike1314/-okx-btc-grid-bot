@@ -21,6 +21,74 @@ def trigger_set(algo, key):
     return val is not None and val > 0
 
 
+# 撤单时这些 sCode 表示委托已经不在，可以清掉残单记录。
+_GONE_CODES = {"51400", "51401", "51402", "51603"}
+
+
+def ack_error(payload):
+    """业务 sCode。顶层 code=0 时，单条 sCode 仍可能是失败。空和 0 算成功。"""
+    rows = payload if isinstance(payload, list) else [payload]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("sCode") or "")
+        if code and code != "0":
+            msg = str(row.get("sMsg") or "")
+            return code, msg
+    return None
+
+
+def ack_is_gone(payload):
+    got = ack_error(payload)
+    if not got:
+        return False
+    code, msg = got
+    text = msg.lower()
+    return code in _GONE_CODES or "does not exist" in text or "already" in text
+
+
+def algo_active(algo):
+    """未触发的保护只认 live。没带回 state 的旧响应仍视为有效，避免误判缺失。
+
+    pause 不算正在保护。failCode 非 0 表示这张单已经失败。
+    """
+    state = str((algo or {}).get("state") or "")
+    if state and state != "live":
+        return False
+    fail = str((algo or {}).get("failCode") or "")
+    if fail and fail != "0":
+        return False
+    return True
+
+
+def side_matches(algo, direction, pos_side):
+    """平多必须卖，平空必须买。双向持仓的 posSide 必须是要平的那一侧。"""
+    side = str((algo or {}).get("side") or "").lower()
+    ps = str((algo or {}).get("posSide") or "").lower()
+    if direction in ("long", "short") and side:
+        expect = "sell" if direction == "long" else "buy"
+        if side != expect:
+            return False
+    if ps in ("long", "short"):
+        if direction in ("long", "short") and ps != direction:
+            return False
+        if pos_side and str(pos_side).lower() not in (ps, "net"):
+            return False
+    return True
+
+
+def tighter_sl(direction, *prices):
+    """多单止损越高越紧，空单止损越低越紧。不返回更差的价格。"""
+    vals = []
+    for raw in prices:
+        val = _num(raw)
+        if val is not None and val > 0:
+            vals.append(val)
+    if not vals:
+        return None
+    return max(vals) if direction == "long" else min(vals)
+
+
 def close_fraction(algo):
     """closeFraction>=1 表示交易所全平，覆盖当时的全部持仓，不看 sz。"""
     return _num((algo or {}).get("closeFraction"))
@@ -74,7 +142,11 @@ def coverage_problem(algo, pos_qty):
     return None
 
 
-def is_full_protection(algo, pos_qty, need_tp):
+def is_full_protection(algo, pos_qty, need_tp, direction=None, pos_side=None):
+    if not algo_active(algo):
+        return False
+    if not side_matches(algo, direction, pos_side):
+        return False
     if leg_problem(algo, need_tp):
         return False
     problem = coverage_problem(algo, pos_qty)

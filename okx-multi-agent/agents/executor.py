@@ -13,7 +13,8 @@ import config
 from okx_client import OkxError, fmt_num
 from .position import bracket_from_fill, round_px, stop_is_valid
 from .protection import (
-    coverage_problem, describe_algo, describe_order, is_full_protection, leg_problem, trigger_set,
+    ack_error, ack_is_gone, coverage_problem, describe_algo, describe_order,
+    is_full_protection, leg_problem, tighter_sl, trigger_set,
 )
 from .risk import chase_blocked
 
@@ -62,6 +63,8 @@ class Executor:
         self._protect_wait = {}
         self._last_protect_err = {}
         self._unknown_sig = {}
+        self.residual_ord_id = None
+        self.last_protect_sl = None
 
     def init_mode(self):
         try:
@@ -112,6 +115,25 @@ class Executor:
             body["tag"] = str(plan["tag"])[:16]
         if not self._margin_allows(inst, plan):
             return None
+        if config.is_swing():
+            self.residual_ord_id = None
+            try:
+                resting = list(self.c.open_orders(inst) or [])
+            except Exception as e:
+                self.j.log(AGENT, "orders_read_fail",
+                           f"{inst} 开仓前回读普通挂单失败，本轮不下新单: {_err_text(e)}",
+                           inst=inst)
+                return {"rejected": "orders_unread"}
+            for order in resting:
+                if str(order.get("reduceOnly") or "").lower() in ("true", "1", "yes"):
+                    continue
+                if str(order.get("state") or "live") not in ("live", "partially_filled", ""):
+                    continue
+                self.residual_ord_id = order.get("ordId")
+                self.j.log(AGENT, "residual_live",
+                           f"{inst} 已有开仓残单 {self.residual_ord_id}，不再开新仓",
+                           inst=inst, ordId=self.residual_ord_id)
+                return None
         try:
             r = self.c.place_order(body)
         except OkxError as e:
@@ -219,6 +241,7 @@ class Executor:
         """
         if not ord_id:
             return None, 0.0
+        self.residual_ord_id = None
         deadline = time.time() + max(0.0, float(config.MAKER_ENTRY_TIMEOUT_SEC))
         last_px, last_sz, last_state = None, 0.0, ""
         while True:
@@ -244,28 +267,42 @@ class Executor:
                            f"{inst} post-only 未在 {config.MAKER_ENTRY_TIMEOUT_SEC:g}s 内成交，撤单",
                            inst=inst)
                 cancel_ok = True
+                read_failed = False
                 try:
-                    self.c.cancel_order(inst, ord_id)
+                    ack = self.c.cancel_order(inst, ord_id)
+                    bad = ack_error(ack)
+                    if bad and not ack_is_gone(ack):
+                        cancel_ok = False
+                        self.j.log(AGENT, "cancel_warn",
+                                   f"{inst} 撤挂单未成功 sCode={bad[0]} sMsg={bad[1]}",
+                                   inst=inst, code=bad[0], sMsg=bad[1])
                 except Exception as e:
                     cancel_ok = False
                     self.j.log(AGENT, "cancel_warn", f"{inst} 撤挂单失败: {_err_text(e)}",
                                inst=inst, code=getattr(e, "code", ""), sMsg=getattr(e, "smsg", ""))
                 try:
                     px, sz, state = self._read_order(inst, ord_id)
-                except OkxError:
+                except OkxError as e:
+                    read_failed = True
                     px, sz, state = None, last_sz, last_state
+                    self.j.log(AGENT, "order_query",
+                               f"{inst} 撤单后回读失败，不能当成已经撤掉: {_err_text(e)}",
+                               inst=inst, code=e.code, sMsg=e.smsg)
                 if sz and sz > 0:
                     last_sz = sz
                     if px:
                         last_px = px
                 if state:
                     last_state = state
-                if (config.is_swing() and not cancel_ok
-                        and last_state not in ("canceled", "cancelled", "mmp_canceled", "filled")):
+                terminal = last_state in ("canceled", "cancelled", "mmp_canceled", "filled")
+                if config.is_swing() and (not cancel_ok or read_failed or not terminal):
+                    self.residual_ord_id = ord_id
                     self.j.log(AGENT, "residual_live",
-                               f"{inst} 开仓残单 {ord_id} 撤销失败，状态 {last_state or '未知'}。"
-                               f"不另下反向单，之后按交易所持仓数量改账本",
-                               inst=inst, ordId=ord_id, qty=last_sz, state=last_state)
+                               f"{inst} 开仓残单 {ord_id} 仍可能留在场上"
+                               f"（撤单={'成功' if cancel_ok else '失败'}，"
+                               f"回读={'失败' if read_failed else (last_state or '未知')}）。"
+                               f"不另下新仓，下一轮继续撤并按持仓改账本",
+                               inst=inst, ordId=ord_id, qty=last_sz, state=last_state or "")
                 break
             time.sleep(config.ORDER_FILL_WAIT_SEC)
         if last_sz > 0 and last_px:
@@ -660,13 +697,22 @@ class Executor:
         if not ids:
             return True
         try:
-            self.c.cancel_algos(inst, ids)
-            return True
+            ack = self.c.cancel_algos(inst, ids)
         except OkxError as e:
             self.j.log(AGENT, "protect_cancel_fail",
-                       f"{inst} 撤销旧算法单失败 {_err_text(e)}。合格保护还在，不把仓位撤成裸仓",
+                       f"{inst} 撤销旧算法单失败 {_err_text(e)}。合格保护还在，本轮不补第三张，下轮只重试撤销",
                        inst=inst, code=e.code, sMsg=e.smsg, algoIds=",".join(str(i) for i in ids))
             return False
+        if ack_is_gone(ack):
+            return True
+        bad = ack_error(ack)
+        if bad:
+            self.j.log(AGENT, "protect_cancel_fail",
+                       f"{inst} 撤销旧算法单未成功 sCode={bad[0]} sMsg={bad[1]}。"
+                       f"两张全平条件单可能先后触发，下轮只重试撤销、不再补挂",
+                       inst=inst, code=bad[0], sMsg=bad[1], algoIds=",".join(str(i) for i in ids))
+            return False
+        return True
 
     def _place_protection(self, inst, direction, sl, tp, pos_side):
         try:
@@ -685,6 +731,12 @@ class Executor:
                        f"{inst} 合格保护 algoId={keep_id} 已在，重复条件单没撤干净，不再补挂",
                        inst=inst, algoId=keep_id)
         self._clear_backoff(inst)
+        live_sl = trigger_set(keeper, "slTriggerPx") and keeper.get("slTriggerPx")
+        if live_sl:
+            try:
+                self.last_protect_sl = float(live_sl)
+            except (TypeError, ValueError):
+                self.last_protect_sl = None
         self.j.log(AGENT, "protect_ok",
                    f"{inst} {describe_algo(keeper, inst, pos_side)} 止盈腿、止损腿和覆盖已确认。原因={reason}",
                    inst=inst, reason=reason, algoId=keep_id,
@@ -720,28 +772,55 @@ class Executor:
             self._log_protection_book(inst, pos_side, algos, orders, algo_err, order_err, reason)
         if algo_err:
             return "unconfirmed"
-        goods = [a for a in algos if is_full_protection(a, pos_qty, need_tp)]
+        goods = [a for a in algos
+                 if is_full_protection(a, pos_qty, need_tp, direction, pos_side)]
         if goods:
+            kept = tighter_sl(direction, sl, goods[0].get("slTriggerPx"))
+            if kept and sl and abs(float(kept) - float(sl)) > max(1e-8, abs(float(kept)) * 1e-8):
+                self.j.log(AGENT, "sl_keep_tighter",
+                           f"{inst} 交易所止损 {goods[0].get('slTriggerPx')} 比账本 {sl} 更紧，"
+                           f"重启不把止损放回更差的价格",
+                           inst=inst, sl=kept, book_sl=sl)
             return self._finish_good(inst, pos_side, algos, goods, [], reason)
         problems = []
         for algo in algos:
-            problems.append(leg_problem(algo, need_tp) or coverage_problem(algo, pos_qty) or "other")
+            if not is_full_protection(algo, pos_qty, need_tp, direction, pos_side):
+                problems.append(leg_problem(algo, need_tp) or coverage_problem(algo, pos_qty) or "inactive")
         unknown_only = bool(algos) and all(p in ("unknown", "qty_unknown") for p in problems)
-        if unknown_only and reason not in ("open", "startup", "qty_sync"):
-            sig = tuple(sorted(str(a.get("algoId") or "") for a in algos))
-            if self._unknown_sig.get(inst) != sig:
-                self._unknown_sig[inst] = sig
-                self._log_protection_book(inst, pos_side, algos, orders, None, order_err, reason)
-                self.j.log(AGENT, "protect_coverage_unknown",
-                           f"{inst} 止盈和止损触发价在，但没有 closeFraction 或 sz，"
-                           f"不能确认覆盖张数。不撤单、不补第二张条件单",
-                           inst=inst, reason=reason)
-            return "ok"
+        if unknown_only:
+            ocos = [a for a in algos if str(a.get("ordType") or "") == "oco" and not leg_problem(a, need_tp)]
+            # 单向 conditional 即使回读里带着止盈价，交易所也只执行止损。开仓/对账时换成 oco 一次。
+            # 已经有 oco 但覆盖字段读不到时，不再补第二张，只尝试撤掉旁边的旧单。
+            if ocos or reason not in ("open", "startup", "qty_sync"):
+                if ocos:
+                    keeper = ocos[0].get("algoId")
+                    extras = [a.get("algoId") for a in algos if a.get("algoId") and a.get("algoId") != keeper]
+                    self._cancel_algo_ids(inst, extras)
+                sig = tuple(sorted(str(a.get("algoId") or "") for a in algos))
+                if self._unknown_sig.get(inst) != sig:
+                    self._unknown_sig[inst] = sig
+                    self._log_protection_book(inst, pos_side, algos, orders, None, order_err, reason)
+                    self.j.log(AGENT, "protect_coverage_unknown",
+                               f"{inst} 止盈和止损触发价在，但没有 closeFraction 或 sz，"
+                               f"不能确认覆盖张数。不撤掉这张 oco，也不再补第二张",
+                               inst=inst, reason=reason)
+                if trigger_set((ocos or algos)[0], "slTriggerPx"):
+                    try:
+                        self.last_protect_sl = float((ocos or algos)[0].get("slTriggerPx"))
+                    except (TypeError, ValueError):
+                        pass
+                return "ok"
         if not repair:
             return "mismatch"
         if not sl:
             self.j.log(AGENT, "protect_missing", f"{inst} 没有可用止损价，无法补保护", inst=inst)
             return "mismatch"
+        better = tighter_sl(direction, sl, *[a.get("slTriggerPx") for a in algos])
+        if better and sl and abs(float(better) - float(sl)) > max(1e-8, abs(float(better)) * 1e-8):
+            self.j.log(AGENT, "sl_keep_tighter",
+                       f"{inst} 补保护使用更紧的止损 {better}，不用账本里更差的 {sl}",
+                       inst=inst, sl=better, book_sl=sl)
+            sl = better
         self.j.log(AGENT, "protect_missing",
                    f"{inst} 保护缺失或覆盖不够（{','.join(problems) or 'none'}），"
                    f"补 closeFraction=1 的{'双边 oco' if tp else '止损'}",
@@ -756,7 +835,8 @@ class Executor:
                            f"{_err_text(err2)}",
                            inst=inst, code=err2.code, sMsg=err2.smsg, reason=reason)
                 return "unconfirmed"
-            goods = [a for a in algos2 if is_full_protection(a, pos_qty, need_tp)]
+            goods = [a for a in algos2
+                     if is_full_protection(a, pos_qty, need_tp, direction, pos_side)]
             if goods:
                 return self._finish_good(inst, pos_side, algos2, goods, old_ids, reason)
             self.j.log(AGENT, "protect_blocked",
@@ -776,7 +856,8 @@ class Executor:
                        inst=inst, code=err2.code, sMsg=err2.smsg, reason=reason)
             return "unconfirmed"
         self._log_protection_book(inst, pos_side, algos2, None, None, None, reason)
-        goods = [a for a in algos2 if is_full_protection(a, pos_qty, need_tp)]
+        goods = [a for a in algos2
+                 if is_full_protection(a, pos_qty, need_tp, direction, pos_side)]
         if not goods:
             leg_ok = [a for a in algos2 if not leg_problem(a, need_tp)]
             unknown = [a for a in leg_ok if coverage_problem(a, pos_qty) in ("unknown", "qty_unknown")]

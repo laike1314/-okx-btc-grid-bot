@@ -24,41 +24,66 @@ def _close_sz(row):
     return qty if qty > 0 else None
 
 
-def choose_close_rows(rows, open_ms, qty):
-    """从平仓历史里选出能对上张数的记录。
+def _dedupe_rows(rows):
+    seen, out = set(), []
+    for row in rows or []:
+        key = (str(row.get("posId") or ""), str(row.get("uTime") or ""), str(row.get("pnl") or ""),
+               str(row.get("closeTotalPos") or ""), str(row.get("type") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
 
-    对得上整笔就只用那一笔；几笔张数加起来等于持仓才相加。
-    张数缺失或对不上时只用最新一条，并标明 unverified，避免把同一笔盈亏加两次。
-    返回 (rows_or_None, how)。how 为 none/single/matched/summed/latest_unverified。
+
+def choose_close_rows(rows, open_ms, qty, pos_id=None):
+    """从平仓历史里选出能对上这一笔持仓的记录。
+
+    同一 posId 的全平记录优先，部分平仓只在没有全平、且张数相加等于持仓时才合并。
+    不同 posId 是另一段持仓，不能加进这一笔。对不上时返回 latest_unverified，
+    调用方不得把这条盈亏当成最终准确值。
     """
     window = []
-    for row in rows or []:
+    for row in _dedupe_rows(rows):
         try:
             ut = int(float(row.get("uTime") or 0))
         except (TypeError, ValueError):
             ut = 0
         if open_ms and ut and ut < int(open_ms) - 30000:
             continue
+        rid = str(row.get("posId") or "")
+        if pos_id and rid and rid != str(pos_id):
+            continue
         window.append(row)
     if not window:
         return None, "none"
+    ids = {str(r.get("posId")) for r in window if r.get("posId")}
+    if not pos_id and len(ids) > 1:
+        latest = max(window, key=lambda r: int(float(r.get("uTime") or 0)))
+        return [latest], "latest_unverified"
     try:
         qty_f = float(qty or 0)
     except (TypeError, ValueError):
         qty_f = 0.0
     sized = [(sz, row) for row in window if (sz := _close_sz(row))]
-    if qty_f > 0 and sized:
-        tol = max(qty_f * 1e-4, 1e-6)
-        matched = [row for sz, row in sized if abs(sz - qty_f) <= tol]
+    tol = max(qty_f * 1e-4, 1e-6) if qty_f > 0 else 1e-6
+
+    def _matches(sz):
+        return qty_f > 0 and abs(sz - qty_f) <= tol
+
+    full = [row for sz, row in sized if str(row.get("type") or "") in ("2", "3", "6") and _matches(sz)]
+    if full:
+        full.sort(key=lambda r: int(float(r.get("uTime") or 0)))
+        return [full[-1]], "matched"
+    if qty_f > 0 and sized and not any(str(r.get("type") or "") in ("2", "3", "6") for _sz, r in sized):
+        matched = [row for sz, row in sized if _matches(sz)]
         if matched:
             matched.sort(key=lambda r: int(float(r.get("uTime") or 0)))
             return [matched[-1]], "matched"
         total = sum(sz for sz, _row in sized)
         if abs(total - qty_f) <= max(qty_f * 0.02, 1e-6):
             return [row for _sz, row in sized], "summed"
-        latest = max(window, key=lambda r: int(float(r.get("uTime") or 0)))
-        return [latest], "latest_unverified"
-    if len(window) == 1:
+    if len(window) == 1 and (not qty_f or not sized or _matches(sized[0][0])):
         return window, "single"
     latest = max(window, key=lambda r: int(float(r.get("uTime") or 0)))
     return [latest], "latest_unverified"
@@ -98,6 +123,7 @@ def combine_close_rows(rows):
     return {"realizedPnl": realized, "pnl": pnl, "fee": fee, "fundingFee": funding,
             "openAvgPx": open_px, "closeAvgPx": exit_px, "closeQty": size,
             "uTime": max(int(float(r.get("uTime") or 0)) for r in rows),
+            "posId": rows[-1].get("posId") or "",
             "why": rows[-1].get("why") or ""}
 
 
@@ -233,6 +259,7 @@ class EquityTracker:
         note_exit_trend_bar(self.s, inst)
         res = None
         how = ""
+        read_failed = False
         open_ms = int(meta.get("open_ms") or 0)
         history_fn = getattr(self.c, "closed_history", None)
         for _ in range(1 if self.c.is_mock else 8):
@@ -240,22 +267,54 @@ class EquityTracker:
             if history_fn:
                 try:
                     rows = history_fn(inst) or []
-                except Exception:
+                    read_failed = False
+                except Exception as e:
+                    read_failed = True
                     rows = None
+                    self.j.log(AGENT, "pnl_read_fail",
+                               f"{inst} 平仓历史读取失败，不能把失败或其中一条当成完整盈亏: {e}",
+                               inst=inst)
+            if read_failed:
+                how = "read_failed"
+                res = None
+                break
             if rows:
-                chosen, how = choose_close_rows(rows, open_ms, meta.get("qty"))
+                chosen, how = choose_close_rows(
+                    rows, open_ms, meta.get("qty"), meta.get("pos_id"))
                 res = combine_close_rows(chosen) if chosen else None
+            elif history_fn:
+                how = "none"
+                res = None
             else:
                 how = "last_closed"
                 try:
                     res = self.c.last_closed(inst)
                 except Exception:
                     res = None
+            if how == "latest_unverified":
+                break
             if res and int(res.get("uTime") or 0) >= open_ms - 30000 and _pnl_row_trusted(res, meta):
                 break
             res = None
             if not self.c.is_mock:
                 time.sleep(1)
+        unverified = how in ("latest_unverified", "read_failed")
+        candidate = None
+        if unverified and res:
+            candidate = res.get("realizedPnl")
+            trace = {
+                "uTime": res.get("uTime"), "posId": (res.get("posId") if isinstance(res, dict) else ""),
+                "closeQty": res.get("closeQty"), "pnl_source": how,
+            }
+            self.j.log(AGENT, "pnl_unverified",
+                       f"{inst} 平仓历史不能唯一对上本次持仓（{how}）。"
+                       f"候选净盈亏 {candidate} 不计入虚拟权益，也不能当成最终准确值",
+                       inst=inst, pnl_unverified=True, candidate_net=candidate, **trace)
+            res = None
+        elif how == "latest_unverified":
+            self.j.log(AGENT, "pnl_unverified",
+                       f"{inst} 平仓历史不能唯一对上本次持仓，不计入虚拟权益",
+                       inst=inst, pnl_unverified=True, pnl_source=how, candidate_net=candidate)
         if how in ("matched", "summed") and res and float(res.get("closeQty") or 0) > 0:
             book_qty = float(meta.get("qty") or 0)
             exch_qty = float(res["closeQty"])
@@ -267,12 +326,11 @@ class EquityTracker:
             open_px = float(res.get("openAvgPx") or 0)
             if open_px > 0:
                 meta["entry"] = open_px
-        elif how == "latest_unverified":
-            self.j.log(AGENT, "pnl_rows_unverified",
-                       f"{inst} 平仓历史有多条但张数对不上持仓，只采用最新一条，避免盈亏加两次",
-                       inst=inst, pnl_source=how)
-        est = self._estimate_net(inst, meta)
-        if res and _pnl_row_trusted(res, meta):
+        est = None if unverified else self._estimate_net(inst, meta)
+        if unverified:
+            net = None
+            reason = "盈亏未验证，不计入虚拟权益"
+        elif res and _pnl_row_trusted(res, meta):
             net = float(res.get("realizedPnl") or 0)
             reason = meta.get("close_reason") or (res.get("why") if res and res.get("why") else "交易所止盈/止损")
         elif est is not None:
@@ -296,14 +354,17 @@ class EquityTracker:
                "direction": meta.get("direction"), "qty": meta.get("qty"), "entry": meta.get("entry"),
                "exit": res.get("closeAvgPx") if res else None, "gross_pnl": res.get("pnl") if res else None,
                "fee": res.get("fee") if res else None, "funding": res.get("fundingFee") if res else None,
-               "net_pnl": round(net, 4), "est_net": meta.get("est_net"), "reason": reason,
+               "net_pnl": "" if net is None else round(net, 4),
+               "est_net": meta.get("est_net"), "reason": reason,
                "equity_after": round(eq, 4) if eq is not None else None}
         if meta.get("family"):
             row.update(family=meta.get("family"), regime=meta.get("regime"),
                        combined=meta.get("combined"))
         self._append_trade(row)
-        self.j.log(AGENT, "trade_closed", f"{inst} 平仓（{reason}）净盈亏 {net:+.2f} USDT，权益 "
-                   f"{eq if eq is None else round(eq, 2)}", **row, pnl_source=how or "")
+        shown = "未验证" if net is None else f"{net:+.2f}"
+        self.j.log(AGENT, "trade_closed", f"{inst} 平仓（{reason}）净盈亏 {shown} USDT，权益 "
+                   f"{eq if eq is None else round(eq, 2)}", **row, pnl_source=how or "",
+                   pnl_unverified=bool(unverified), candidate_net=candidate)
         self.risk.on_trade_closed(inst, net)
         self.snapshot(eq)
 
