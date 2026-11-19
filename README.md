@@ -12,6 +12,8 @@
 
 持续收集数据用工作流 **OKX Swing Combo**（`.github/workflows/swing-combo.yml`）：大约每 5 小时接上一轮，每轮跑 5.5 小时后退出，仓位留在模拟盘。定仓和 20% 回撤用固定本金 `SWING_CAPITAL_USDT`（默认 10000 USDT）的虚拟权益，不看模拟盘账户总权益（同一账户上还有别的策略和入金）。账本提交到分支 `swing-data`（不含密钥）。合并到默认分支后，在 Actions 里手动 Run workflow 即可开始；停止则 Disable 该工作流。不要和剥头皮工作流同时打同一个模拟盘账户。
 
+波段部分成交和重启后，账本张数、开仓均价按交易所持仓改，不另开反向仓。开仓、对账和改止损之后回读算法单的止盈、止损和 `closeFraction` / 张数。细节和 #34–#36 里 AAVE 盈亏为何不能改历史账本，见 `okx-multi-agent/README.md`。
+
 ---
 
 ## 功能特点

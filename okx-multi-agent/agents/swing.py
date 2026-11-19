@@ -495,12 +495,122 @@ def entry_candidates(rows):
     return out
 
 
+def _reduce_only(order):
+    return str((order or {}).get("reduceOnly") or "").strip().lower() in ("true", "1", "yes")
+
+
+def settle_entry_residuals(client, state, journal, positions, scan_tags=False):
+    """撤掉本策略合约上还活着的开仓残单。撤完再读持仓，避免漏掉撤单瞬间的成交。
+
+    读不到普通挂单时不能当成没有残单。减仓单不动。失败也不另下一张反向单。
+    启动对账可以再扫一遍带 swmom/swoi 标签的委托，把重启前没写进账本的残单也撤掉。
+    """
+    positions = list(positions or [])
+    book = state.d.get("open_meta") or {}
+    insts = {p.get("instId") for p in positions if p.get("instId")}
+    insts.update(book.keys())
+    if scan_tags:
+        list_all = getattr(client, "pending_orders", None)
+        if list_all:
+            try:
+                for order in list_all() or []:
+                    if str(order.get("tag") or "") in ("swmom", "swoi") and order.get("instId"):
+                        insts.add(order["instId"])
+            except Exception as e:
+                journal.log(AGENT, "orders_read_fail",
+                            f"扫描带标签的普通挂单失败，不能当成没有残单: {e}")
+    fn = getattr(client, "open_orders", None)
+    if not fn or not insts:
+        return positions
+    cancelled = False
+    for inst in sorted(insts):
+        try:
+            orders = list(fn(inst) or [])
+        except Exception as e:
+            journal.log(AGENT, "orders_read_fail",
+                        f"{inst} 回读普通挂单失败，不能当成没有残单: {e}", inst=inst)
+            continue
+        for order in orders:
+            from .protection import describe_order
+            journal.log(AGENT, "open_order", f"{inst} {describe_order(order, inst)}",
+                        inst=inst, ordId=order.get("ordId"), ordType=order.get("ordType"))
+            if _reduce_only(order):
+                continue
+            oid = order.get("ordId")
+            if not oid:
+                continue
+            try:
+                client.cancel_order(inst, oid)
+                cancelled = True
+                journal.log(AGENT, "residual_cancel",
+                            f"{inst} 撤销开仓残单 {oid}，随后按交易所持仓改账本张数",
+                            inst=inst, ordId=oid)
+            except Exception as e:
+                journal.log(AGENT, "residual_live",
+                            f"{inst} 开仓残单 {oid} 撤销失败，不另下反向单: {e}",
+                            inst=inst, ordId=oid)
+    if not cancelled:
+        return positions
+    try:
+        return list(client.positions() or [])
+    except Exception as e:
+        journal.log(AGENT, "reconcile_pos_err", f"撤残单后读持仓失败: {e}")
+        return positions
+
+
+def apply_exchange_position(meta, position, journal):
+    """用交易所持仓改已有账本的张数和开仓均价。空字段只是补齐，不算一笔新成交。
+
+    返回 True 表示相对原账本发生了数量或成本变化。方向不一致时改成交易所方向，不下单。
+    """
+    from .protection import price_differs, qty_differs
+    inst = position.get("instId")
+    changed = False
+    side = position.get("side")
+    if side and meta.get("direction") and side != meta.get("direction"):
+        journal.log(AGENT, "side_drift",
+                    f"{inst} 账本方向 {meta.get('direction')} 与交易所 {side} 不一致，"
+                    f"按持仓改正，不另下反向开仓单",
+                    inst=inst, book_side=meta.get("direction"), exch_side=side)
+        meta["direction"] = side
+        changed = True
+    elif side and not meta.get("direction"):
+        meta["direction"] = side
+    new_qty, new_entry = position.get("qty"), position.get("avgPx")
+    old_qty, old_entry = meta.get("qty"), meta.get("entry")
+    qty_moved = qty_differs(old_qty, new_qty)
+    entry_moved = price_differs(old_entry, new_entry)
+    if old_qty in (None, "") and new_qty not in (None, ""):
+        meta["qty"] = new_qty
+    elif qty_moved or entry_moved:
+        journal.log(AGENT, "qty_sync",
+                    f"{inst} 账本 {old_qty}张 @ {old_entry} 与交易所 {new_qty}张 @ {new_entry} 不一致，"
+                    f"按持仓改账本。这不是新开仓，数量也不叠加",
+                    inst=inst, book_qty=old_qty, exch_qty=new_qty,
+                    book_entry=old_entry, exch_entry=new_entry)
+        meta["qty"] = new_qty
+        if new_entry not in (None, "", 0, "0"):
+            try:
+                if float(new_entry) > 0:
+                    meta["entry"] = float(new_entry)
+            except (TypeError, ValueError):
+                meta["entry"] = new_entry
+        changed = True
+    if old_entry in (None, "") and new_entry not in (None, "", 0, "0"):
+        try:
+            if float(new_entry) > 0:
+                meta["entry"] = float(new_entry)
+        except (TypeError, ValueError):
+            pass
+    return changed or qty_moved or entry_moved
+
+
 def _bracket_from_client(client, inst):
     sl = tp = None
     try:
         algos = client.pending_algos(inst)
-    except Exception:
-        return None, None
+    except Exception as e:
+        return None, None, e
     for algo in algos or []:
         try:
             if algo.get("slTriggerPx") not in (None, "", "0", 0):
@@ -512,7 +622,7 @@ def _bracket_from_client(client, inst):
                 tp = float(algo.get("tpTriggerPx"))
         except (TypeError, ValueError):
             pass
-    return sl, tp
+    return sl, tp, None
 
 
 def reconcile(client, state, journal, executor=None):
@@ -526,7 +636,9 @@ def reconcile(client, state, journal, executor=None):
     except Exception as e:
         journal.log(AGENT, "reconcile_pos_err", f"读持仓失败: {e}")
         positions = []
+    positions = settle_entry_residuals(client, state, journal, positions, scan_tags=True)
     meta_map = state.d.setdefault("open_meta", {})
+    qty_fixes = 0
     live = set()
     for p in positions:
         inst = p.get("instId")
@@ -552,6 +664,9 @@ def reconcile(client, state, journal, executor=None):
                 meta["family"] = fam
                 journal.log(AGENT, "tag_family", f"{inst} 由订单标签 {tag} 识别为 {fam}", inst=inst)
         meta.setdefault("direction", p.get("side"))
+        drifted = apply_exchange_position(meta, p, journal)
+        if drifted:
+            qty_fixes += 1
         meta.setdefault("qty", p.get("qty"))
         meta.setdefault("entry", p.get("avgPx"))
         if not meta.get("opened_ts"):
@@ -568,12 +683,18 @@ def reconcile(client, state, journal, executor=None):
             meta["family"] = "unknown"
             journal.log(AGENT, "family_unknown",
                         f"{inst} 认不出入场家族，按 OI 的更长持仓窗口管理，不跟踪止损", inst=inst)
-        sl, tp = _bracket_from_client(client, inst)
-        if sl and not meta.get("sl"):
-            meta["sl"] = sl
-        if tp and not meta.get("tp"):
-            meta["tp"] = tp
-        if executor is not None and (not meta.get("sl") or not meta.get("tp")):
+        sl, tp, read_err = _bracket_from_client(client, inst)
+        if read_err:
+            journal.log(AGENT, "protect_read_fail",
+                        f"{inst} 回读算法单失败，不能当成没有保护，本次不补挂: {read_err}", inst=inst)
+        else:
+            if sl and not meta.get("sl"):
+                meta["sl"] = sl
+            if tp and not meta.get("tp"):
+                meta["tp"] = tp
+        if read_err:
+            pass
+        elif executor is not None and (not meta.get("sl") or not meta.get("tp")):
             try:
                 got = executor.protect_adopted(p, meta)
             except Exception as e:
@@ -581,6 +702,14 @@ def reconcile(client, state, journal, executor=None):
                 got = None
             if isinstance(got, tuple) and len(got) == 2:
                 meta["sl"], meta["tp"] = got
+        elif executor is not None and meta.get("sl") and meta.get("tp"):
+            try:
+                executor.confirm_protection(
+                    inst, meta.get("direction") or p.get("side"),
+                    meta.get("sl"), meta.get("tp"), p.get("qty"), p.get("posSide"),
+                    reason="qty_sync" if drifted else "startup")
+            except Exception as e:
+                journal.log(AGENT, "protect_err", f"{inst} 回读保护单失败: {e}", inst=inst)
         prof = profile_for(meta.get("family") or "unknown")
         meta.setdefault("min_hold_sec", prof["min_hold"])
         meta.setdefault("max_hold_sec", prof["max_hold"])
@@ -639,6 +768,7 @@ def reconcile(client, state, journal, executor=None):
     exch_s = None if exch is None else round(exch, 2)
     journal.log(AGENT, "reconcile",
                 f"对账完成：本策略持仓 {ours}，交易所持仓 {len(positions)}，"
+                f"账本按持仓改写 {qty_fixes}，"
                 f"虚拟权益 {veq_s} 起始 {state.d.get('swing_start_equity')} "
                 f"峰值 {state.d.get('swing_peak_equity')} "
                 f"交易所USDT权益 {exch_s}（只作对照）"
@@ -1096,6 +1226,8 @@ def offline_self_check():
         config.STRATEGY = saved
         if j is not None:
             j.close()
+    from agents.fill_reconcile import offline_self_check as fill_check
+    fill_check()
 
 
 if __name__ == "__main__":

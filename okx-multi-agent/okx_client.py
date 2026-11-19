@@ -398,13 +398,21 @@ class OkxClient:
         self.last_order_errors = errors
         return out
 
+    def open_orders(self, inst_id):
+        """某合约未完成的普通委托。算法单不在这里，见 pending_algos。"""
+        rows = self.request("GET", "/api/v5/trade/orders-pending",
+                            {"instType": "SWAP", "instId": inst_id}, private=True) or []
+        return [self._norm_order(r) for r in rows]
+
     @staticmethod
     def _norm_order(r):
         return {"instId": r.get("instId") or "", "instType": r.get("instType") or "",
                 "side": r.get("side") or "", "posSide": r.get("posSide") or "",
                 "ordType": r.get("ordType") or "", "sz": r.get("sz") or "",
                 "px": r.get("px") or "", "state": r.get("state") or "",
-                "reduceOnly": r.get("reduceOnly") or "", "ordId": r.get("ordId") or ""}
+                "reduceOnly": r.get("reduceOnly") or "", "ordId": r.get("ordId") or "",
+                "accFillSz": r.get("accFillSz") or "", "avgPx": r.get("avgPx") or "",
+                "tag": r.get("tag") or ""}
 
     def fee_rates(self):
         r = self.request("GET", "/api/v5/account/trade-fee", {"instType": "SWAP"}, private=True)[0]
@@ -425,15 +433,25 @@ class OkxClient:
         return -sum(_f(r.get("balChg")) for r in rows
                     if r.get("instId") == inst_id and int(r.get("ts") or 0) >= since_ms)
 
-    def last_closed(self, inst_id):
-        rows = self.request("GET", "/api/v5/account/positions-history",
-                            {"instType": "SWAP", "instId": inst_id, "limit": "1"}, private=True)
-        if not rows:
-            return None
-        r = rows[0]
-        return {"realizedPnl": _f(r.get("realizedPnl")), "pnl": _f(r.get("pnl")), "fee": _f(r.get("fee")),
+    def _norm_closed(self, r):
+        return {"instId": r.get("instId") or "", "realizedPnl": _f(r.get("realizedPnl")),
+                "pnl": _f(r.get("pnl")), "fee": _f(r.get("fee")),
                 "fundingFee": _f(r.get("fundingFee")), "openAvgPx": _f(r.get("openAvgPx")),
-                "closeAvgPx": _f(r.get("closeAvgPx")), "uTime": int(r.get("uTime") or 0)}
+                "closeAvgPx": _f(r.get("closeAvgPx")), "uTime": int(float(r.get("uTime") or 0)),
+                "cTime": int(float(r.get("cTime") or 0)),
+                "closeTotalPos": r.get("closeTotalPos") or "",
+                "type": str(r.get("type") or ""), "posSide": r.get("posSide") or "",
+                "direction": r.get("direction") or r.get("posSide") or ""}
+
+    def closed_history(self, inst_id, limit=100):
+        """近期已平仓记录，最多 limit 条。平仓记账按张数挑选或相加，不把最新一条当成全部。"""
+        rows = self.request("GET", "/api/v5/account/positions-history",
+                            {"instType": "SWAP", "instId": inst_id, "limit": str(limit)}, private=True)
+        return [self._norm_closed(r) for r in rows or []]
+
+    def last_closed(self, inst_id):
+        rows = self.closed_history(inst_id, limit=1)
+        return rows[0] if rows else None
 
     # ---------- 交易 ----------
     def set_leverage(self, inst_id, lever, pos_side=None):
@@ -649,6 +667,9 @@ class MockOkxClient:
         self.last_order_errors = []
         return []
 
+    def open_orders(self, inst_id):
+        return [dict(o) for o in self.resting.get(inst_id, [])] if hasattr(self, "resting") else []
+
     def _upl(self, p):
         sign = 1 if p["side"] == "long" else -1
         return (self._last(p["instId"]) - p["avgPx"]) * p["qty"] * p["ctVal"] * sign
@@ -679,6 +700,10 @@ class MockOkxClient:
     def last_closed(self, inst_id):
         return self.history.get(inst_id)
 
+    def closed_history(self, inst_id, limit=100):
+        row = self.history.get(inst_id)
+        return [dict(row)] if row else []
+
     # ---------- 交易 ----------
     def set_leverage(self, inst_id, lever, pos_side=None):
         self.lever = lever
@@ -694,8 +719,10 @@ class MockOkxClient:
         self.cash += pnl - fee_out
         self.history[inst] = {"realizedPnl": pnl - fee_in - fee_out, "pnl": pnl, "fee": -(fee_in + fee_out),
                               "fundingFee": 0.0, "openAvgPx": p["avgPx"], "closeAvgPx": px,
-                              "uTime": self.now_ms, "why": why, "tag": p.get("tag") or "",
-                              "direction": p.get("side")}
+                              "uTime": self.now_ms, "cTime": p.get("cTime") or 0,
+                              "closeTotalPos": p["qty"], "type": "2", "why": why,
+                              "tag": p.get("tag") or "", "direction": p.get("side"),
+                              "posSide": p.get("posSide") or "net", "instId": inst}
 
     def place_order(self, body):
         inst = body["instId"]
@@ -728,8 +755,11 @@ class MockOkxClient:
         algo = None
         for a in body.get("attachAlgoOrds", []):
             algo = {"algoId": "algo-" + uuid.uuid4().hex[:8],
+                    "ordType": "conditional", "posSide": body.get("posSide") or "net",
+                    "side": "sell" if body.get("side") == "buy" else "buy",
                     "sl": float(a["slTriggerPx"]) if a.get("slTriggerPx") else None,
-                    "tp": float(a["tpTriggerPx"]) if a.get("tpTriggerPx") else None}
+                    "tp": float(a["tpTriggerPx"]) if a.get("tpTriggerPx") else None,
+                    "closeFraction": "", "sz": ""}
         if algo:
             self.algos[inst] = algo
         return {"ordId": "mock-" + uuid.uuid4().hex[:8], "sCode": "0"}
@@ -751,17 +781,28 @@ class MockOkxClient:
 
     def pending_algos(self, inst_id):
         a = self.algos.get(inst_id)
-        return [{"algoId": a["algoId"], "slTriggerPx": str(a["sl"] or ""), "tpTriggerPx": str(a["tp"] or "")}] if a else []
+        if not a:
+            return []
+        return [{"algoId": a["algoId"], "instId": inst_id, "ordType": a.get("ordType") or "",
+                 "posSide": a.get("posSide") or "net", "side": a.get("side") or "",
+                 "slTriggerPx": str(a["sl"] or ""), "tpTriggerPx": str(a["tp"] or ""),
+                 "closeFraction": a.get("closeFraction") or "", "sz": a.get("sz") or ""}]
 
     def cancel_algos(self, inst_id, algo_ids):
-        self.algos.pop(inst_id, None)
+        a = self.algos.get(inst_id)
+        wanted = {str(i) for i in (algo_ids or []) if i}
+        if a and str(a.get("algoId")) in wanted:
+            self.algos.pop(inst_id, None)
         return [{}]
 
     def place_sl_algo(self, inst_id, close_side, pos_side, sl, tp=None):
         if inst_id not in self.pos:
             raise OkxError("51023", "Position does not exist")
         self.algos[inst_id] = {"algoId": "algo-" + uuid.uuid4().hex[:8], "sl": float(sl),
-                               "tp": float(tp) if tp else None}
+                               "tp": float(tp) if tp else None,
+                               "ordType": "oco" if tp else "conditional",
+                               "posSide": pos_side or "net", "side": close_side,
+                               "closeFraction": "1", "sz": ""}
         return {"algoId": self.algos[inst_id]["algoId"], "sCode": "0"}
 
     def amend_sl(self, inst_id, algo_id, new_sl):

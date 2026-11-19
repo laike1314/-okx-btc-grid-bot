@@ -13,6 +13,94 @@ BJ = timezone(timedelta(hours=8))
 AGENT = "equity"
 
 
+def _close_sz(row):
+    raw = (row or {}).get("closeTotalPos")
+    if raw in (None, ""):
+        return None
+    try:
+        qty = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return qty if qty > 0 else None
+
+
+def choose_close_rows(rows, open_ms, qty):
+    """从平仓历史里选出能对上张数的记录。
+
+    对得上整笔就只用那一笔；几笔张数加起来等于持仓才相加。
+    张数缺失或对不上时只用最新一条，并标明 unverified，避免把同一笔盈亏加两次。
+    返回 (rows_or_None, how)。how 为 none/single/matched/summed/latest_unverified。
+    """
+    window = []
+    for row in rows or []:
+        try:
+            ut = int(float(row.get("uTime") or 0))
+        except (TypeError, ValueError):
+            ut = 0
+        if open_ms and ut and ut < int(open_ms) - 30000:
+            continue
+        window.append(row)
+    if not window:
+        return None, "none"
+    try:
+        qty_f = float(qty or 0)
+    except (TypeError, ValueError):
+        qty_f = 0.0
+    sized = [(sz, row) for row in window if (sz := _close_sz(row))]
+    if qty_f > 0 and sized:
+        tol = max(qty_f * 1e-4, 1e-6)
+        matched = [row for sz, row in sized if abs(sz - qty_f) <= tol]
+        if matched:
+            matched.sort(key=lambda r: int(float(r.get("uTime") or 0)))
+            return [matched[-1]], "matched"
+        total = sum(sz for sz, _row in sized)
+        if abs(total - qty_f) <= max(qty_f * 0.02, 1e-6):
+            return [row for _sz, row in sized], "summed"
+        latest = max(window, key=lambda r: int(float(r.get("uTime") or 0)))
+        return [latest], "latest_unverified"
+    if len(window) == 1:
+        return window, "single"
+    latest = max(window, key=lambda r: int(float(r.get("uTime") or 0)))
+    return [latest], "latest_unverified"
+
+
+def combine_close_rows(rows):
+    def num(row, key):
+        try:
+            return float(row.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    pnl = sum(num(r, "pnl") for r in rows)
+    fee = sum(num(r, "fee") for r in rows)
+    funding = sum(num(r, "fundingFee") for r in rows)
+    realized = sum(num(r, "realizedPnl") for r in rows)
+    if abs(realized) < 1e-12:
+        realized = pnl + fee + funding
+    weighted = 0.0
+    size = 0.0
+    for row in rows:
+        sz = _close_sz(row)
+        px = num(row, "closeAvgPx")
+        if sz and px > 0:
+            weighted += sz * px
+            size += sz
+    if size > 0:
+        exit_px = weighted / size
+    else:
+        exit_px = num(rows[-1], "closeAvgPx")
+    open_px = 0.0
+    for row in rows:
+        px = num(row, "openAvgPx")
+        if px > 0:
+            open_px = px
+            break
+    return {"realizedPnl": realized, "pnl": pnl, "fee": fee, "fundingFee": funding,
+            "openAvgPx": open_px, "closeAvgPx": exit_px, "closeQty": size,
+            "uTime": max(int(float(r.get("uTime") or 0)) for r in rows),
+            "why": rows[-1].get("why") or ""}
+
+
 def _pnl_row_trusted(res, meta):
     """成交价明显不同却回报 0 盈亏时，当成没读到，改走估算。"""
     if not res:
@@ -128,7 +216,7 @@ class EquityTracker:
                 protected = self.ex.protect_adopted(p)
             except Exception as e:
                 self.j.log(AGENT, "adopt_protect_err", f"{p['instId']} 补挂止盈止损失败: {e}", inst=p["instId"])
-        if protected:
+        if isinstance(protected, tuple) and len(protected) == 2:
             meta["sl"], meta["tp"] = protected
         self.j.log(AGENT, "adopt", f"发现已有仓位 {p['instId']} {p['side']} {p['qty']}张，纳入监控",
                    inst=p["instId"])
@@ -144,17 +232,45 @@ class EquityTracker:
         from .risk import note_exit_trend_bar
         note_exit_trend_bar(self.s, inst)
         res = None
+        how = ""
         open_ms = int(meta.get("open_ms") or 0)
+        history_fn = getattr(self.c, "closed_history", None)
         for _ in range(1 if self.c.is_mock else 8):
-            try:
-                res = self.c.last_closed(inst)
-            except Exception:
-                res = None
+            rows = None
+            if history_fn:
+                try:
+                    rows = history_fn(inst) or []
+                except Exception:
+                    rows = None
+            if rows:
+                chosen, how = choose_close_rows(rows, open_ms, meta.get("qty"))
+                res = combine_close_rows(chosen) if chosen else None
+            else:
+                how = "last_closed"
+                try:
+                    res = self.c.last_closed(inst)
+                except Exception:
+                    res = None
             if res and int(res.get("uTime") or 0) >= open_ms - 30000 and _pnl_row_trusted(res, meta):
                 break
             res = None
             if not self.c.is_mock:
                 time.sleep(1)
+        if how in ("matched", "summed") and res and float(res.get("closeQty") or 0) > 0:
+            book_qty = float(meta.get("qty") or 0)
+            exch_qty = float(res["closeQty"])
+            if book_qty <= 0 or abs(book_qty - exch_qty) > max(1e-6, exch_qty * 1e-4):
+                self.j.log(AGENT, "close_qty",
+                           f"{inst} 平仓张数以交易所 closeTotalPos {exch_qty} 为准，账本原为 {book_qty}",
+                           inst=inst, book_qty=book_qty, exch_qty=exch_qty, pnl_source=how)
+                meta["qty"] = exch_qty
+            open_px = float(res.get("openAvgPx") or 0)
+            if open_px > 0:
+                meta["entry"] = open_px
+        elif how == "latest_unverified":
+            self.j.log(AGENT, "pnl_rows_unverified",
+                       f"{inst} 平仓历史有多条但张数对不上持仓，只采用最新一条，避免盈亏加两次",
+                       inst=inst, pnl_source=how)
         est = self._estimate_net(inst, meta)
         if res and _pnl_row_trusted(res, meta):
             net = float(res.get("realizedPnl") or 0)
@@ -187,7 +303,7 @@ class EquityTracker:
                        combined=meta.get("combined"))
         self._append_trade(row)
         self.j.log(AGENT, "trade_closed", f"{inst} 平仓（{reason}）净盈亏 {net:+.2f} USDT，权益 "
-                   f"{eq if eq is None else round(eq, 2)}", **row)
+                   f"{eq if eq is None else round(eq, 2)}", **row, pnl_source=how or "")
         self.risk.on_trade_closed(inst, net)
         self.snapshot(eq)
 

@@ -92,6 +92,28 @@ def monitor_positions(a):
     避免用平仓前的列表把刚平掉的合约当成「已有持仓」。
     """
     positions = a["client"].positions()
+    if config.is_swing():
+        from agents.swing import apply_exchange_position, settle_entry_residuals
+        try:
+            positions = settle_entry_residuals(a["client"], a["state"], a["journal"], positions)
+            changed = False
+            book = a["state"].d.setdefault("open_meta", {})
+            for p in positions:
+                meta = book.get(p.get("instId"))
+                if not meta:
+                    continue
+                if apply_exchange_position(meta, p, a["journal"]):
+                    changed = True
+                    ex = a.get("executor")
+                    if ex is not None and meta.get("sl"):
+                        ex.confirm_protection(
+                            p["instId"], meta.get("direction") or p.get("side"),
+                            meta.get("sl"), meta.get("tp"), p.get("qty"), p.get("posSide"),
+                            reason="qty_sync")
+            if changed:
+                a["state"].save()
+        except Exception as e:
+            a["journal"].log("swing", "qty_sync_err", f"持仓数量对齐失败: {e}")
     a["equity"].sync(positions)
     before = {p["instId"] for p in positions}
     a["net_tp"].check(positions)
