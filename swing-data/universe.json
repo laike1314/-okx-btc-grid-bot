@@ -34,9 +34,9 @@
     "ETC-USDT-SWAP",
     "ARB-USDT-SWAP",
     "JUP-USDT-SWAP",
+    "ATOM-USDT-SWAP",
     "ALGO-USDT-SWAP",
-    "INJ-USDT-SWAP",
-    "ATOM-USDT-SWAP"
+    "INJ-USDT-SWAP"
   ],
   "stocks": [],
   "symbols": [
@@ -67,9 +67,9 @@
     "ETC-USDT-SWAP",
     "ARB-USDT-SWAP",
     "JUP-USDT-SWAP",
+    "ATOM-USDT-SWAP",
     "ALGO-USDT-SWAP",
-    "INJ-USDT-SWAP",
-    "ATOM-USDT-SWAP"
+    "INJ-USDT-SWAP"
   ],
   "instruments": 194,
   "rank_error": ""
