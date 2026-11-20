@@ -1,14 +1,14 @@
 {
-  "updated": "2026-11-19T21:06:15+08:00",
-  "equity": 102376.6528,
+  "updated": "2026-11-20T08:33:00+08:00",
+  "equity": 103047.6776,
   "start_equity": 83466.2907,
-  "trades": 12,
-  "wins": 5,
+  "trades": 13,
+  "wins": 6,
   "losses": 7,
-  "win_rate": 0.4167,
-  "net_pnl": -6774.7102,
+  "win_rate": 0.4615,
+  "net_pnl": -6768.2684,
   "profit_factor": 0.208,
-  "avg_win": 355.097,
+  "avg_win": 296.9878,
   "avg_loss": -1221.4565,
   "max_drawdown_pct": 9.277
 }

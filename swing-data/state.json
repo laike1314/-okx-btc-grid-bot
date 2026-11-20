@@ -9,7 +9,8 @@
     "HBAR-USDT-SWAP": 1795075794.0178273,
     "ALGO-USDT-SWAP": 1795080999.3499117,
     "AAVE-USDT-SWAP": 1795102591.332444,
-    "SUI-USDT-SWAP": 1795116210.602349
+    "SUI-USDT-SWAP": 1795116210.602349,
+    "XLM-USDT-SWAP": 1795143781.9186106
   },
   "daily": {
     "2026-11-08": -7156.3569295,
@@ -17,34 +18,10 @@
     "2026-11-10": 1467.6323615694446,
     "2026-11-15": 110.85157393823339,
     "2026-11-17": -62.8800860085,
-    "2026-11-19": 178.92871319349985
+    "2026-11-19": 178.92871319349985,
+    "2026-11-20": 6.441751278683742
   },
-  "open_meta": {
-    "XLM-USDT-SWAP": {
-      "direction": "short",
-      "qty": 185.65,
-      "entry": 0.13565,
-      "sl": 0.14126,
-      "tp": 0.12959,
-      "opened_at": "2026-11-19T09:41:52+08:00",
-      "opened_ts": 1795052512.6356668,
-      "open_ms": 1795052512635,
-      "score": 0.6517241379310345,
-      "family": "momentum",
-      "regime": "trend",
-      "mom_score": 0.9310344827586207,
-      "oi_score": 0,
-      "combined": 0.6517241379310345,
-      "atr": 0.006137876771678233,
-      "atr_pct": 0.044632611777764924,
-      "min_hold_sec": 43200,
-      "max_hold_sec": 86400,
-      "sl_pct": 0.06694891766664739,
-      "tp_pct": 0.044632611777764924,
-      "tag": "swmom",
-      "peak_px": 0.13512
-    }
-  },
+  "open_meta": {},
   "day_start_equity": {},
   "pnl_events": [
     {
@@ -62,6 +39,10 @@
     {
       "ts": 1795087410.6023364,
       "net": 178.68754199099985
+    },
+    {
+      "ts": 1795114981.918599,
+      "net": 6.441751278683742
     }
   ],
   "last_entry_bar": {},
@@ -73,10 +54,11 @@
     "HBAR-USDT-SWAP": 1795045500000,
     "ALGO-USDT-SWAP": 1795050900000,
     "AAVE-USDT-SWAP": 1795072500000,
-    "SUI-USDT-SWAP": 1795086000000
+    "SUI-USDT-SWAP": 1795086000000,
+    "XLM-USDT-SWAP": 1795113900000
   },
   "swing_start_equity": 10000.0,
-  "swing_peak_equity": 10191.872727929733,
+  "swing_peak_equity": 10233.341952401917,
   "swing_halted": false,
   "margin_cooldown": {},
   "margin_scale": {},
@@ -86,6 +68,6 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1795073734.1025124,
-  "swing_last_our_upl": -93.19629999999994
+  "swing_last_reconcile": 1795114925.4298255,
+  "swing_last_our_upl": 0.0
 }
