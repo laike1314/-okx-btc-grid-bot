@@ -4,13 +4,14 @@
   "symbol_cooldown": {
     "LIT-USDT-SWAP": 1794947700.787507,
     "ARB-USDT-SWAP": 1794286134.523534,
-    "BNB-USDT-SWAP": 1794203170.2690434,
+    "BNB-USDT-SWAP": 1795229277.9750981,
     "ICP-USDT-SWAP": 1794900102.6981492,
     "HBAR-USDT-SWAP": 1795075794.0178273,
     "ALGO-USDT-SWAP": 1795080999.3499117,
     "AAVE-USDT-SWAP": 1795102591.332444,
     "SUI-USDT-SWAP": 1795116210.602349,
-    "XLM-USDT-SWAP": 1795143781.9186106
+    "XLM-USDT-SWAP": 1795143781.9186106,
+    "ADA-USDT-SWAP": 1795216596.8619213
   },
   "daily": {
     "2026-11-08": -7156.3569295,
@@ -19,46 +20,64 @@
     "2026-11-15": 110.85157393823339,
     "2026-11-17": -62.8800860085,
     "2026-11-19": 178.92871319349985,
-    "2026-11-20": 6.441751278683742
+    "2026-11-20": 67.84818931868374,
+    "2026-11-21": 42.8474958
   },
-  "open_meta": {},
+  "open_meta": {
+    "TRX-USDT-SWAP": {
+      "direction": "long",
+      "qty": 6.33,
+      "entry": 0.304,
+      "sl": 0.2868,
+      "tp": 0.3155,
+      "opened_at": "2026-11-21T00:12:14+08:00",
+      "opened_ts": 1795191134.9617817,
+      "open_ms": 1795191134961,
+      "score": 0.9068965517241377,
+      "family": "momentum",
+      "regime": "trend",
+      "mom_score": 0.7241379310344827,
+      "oi_score": 1.0,
+      "combined": 0.9068965517241377,
+      "atr": 0.011386838838111738,
+      "atr_pct": 0.037617571318505905,
+      "min_hold_sec": 43200,
+      "max_hold_sec": 86400,
+      "sl_pct": 0.05642635697775886,
+      "tp_pct": 0.037617571318505905,
+      "tag": "swmom"
+    }
+  },
   "day_start_equity": {},
   "pnl_events": [
     {
-      "ts": 1795046994.01782,
-      "net": 18.2956956625
-    },
-    {
-      "ts": 1795052199.3499017,
-      "net": -18.0724518
-    },
-    {
-      "ts": 1795073791.332435,
-      "net": 0.01792734
-    },
-    {
-      "ts": 1795087410.6023364,
-      "net": 178.68754199099985
-    },
-    {
       "ts": 1795114981.918599,
       "net": 6.441751278683742
+    },
+    {
+      "ts": 1795187796.8619092,
+      "net": 61.40643804
+    },
+    {
+      "ts": 1795200477.975088,
+      "net": 42.8474958
     }
   ],
   "last_entry_bar": {},
   "last_exit_trend_bar": {
     "LIT-USDT-SWAP": 1794917700000,
     "ARB-USDT-SWAP": 1794256200000,
-    "BNB-USDT-SWAP": 1794173400000,
+    "BNB-USDT-SWAP": 1795199400000,
     "ICP-USDT-SWAP": 1794870000000,
     "HBAR-USDT-SWAP": 1795045500000,
     "ALGO-USDT-SWAP": 1795050900000,
     "AAVE-USDT-SWAP": 1795072500000,
     "SUI-USDT-SWAP": 1795086000000,
-    "XLM-USDT-SWAP": 1795113900000
+    "XLM-USDT-SWAP": 1795113900000,
+    "ADA-USDT-SWAP": 1795186800000
   },
   "swing_start_equity": 10000.0,
-  "swing_peak_equity": 10233.341952401917,
+  "swing_peak_equity": 10317.302390441917,
   "swing_halted": false,
   "margin_cooldown": {},
   "margin_scale": {},
@@ -68,6 +87,6 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1795139269.9030423,
-  "swing_last_our_upl": 0.0
+  "swing_last_reconcile": 1795183601.9261186,
+  "swing_last_our_upl": -26.22599999999993
 }
