@@ -34,8 +34,8 @@
     "ETC-USDT-SWAP",
     "ARB-USDT-SWAP",
     "JUP-USDT-SWAP",
-    "ATOM-USDT-SWAP",
     "ALGO-USDT-SWAP",
+    "ATOM-USDT-SWAP",
     "INJ-USDT-SWAP"
   ],
   "stocks": [],
@@ -67,8 +67,8 @@
     "ETC-USDT-SWAP",
     "ARB-USDT-SWAP",
     "JUP-USDT-SWAP",
-    "ATOM-USDT-SWAP",
     "ALGO-USDT-SWAP",
+    "ATOM-USDT-SWAP",
     "INJ-USDT-SWAP"
   ],
   "instruments": 194,

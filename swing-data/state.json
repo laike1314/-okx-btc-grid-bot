@@ -46,6 +46,29 @@
       "sl_pct": 0.05642635697775886,
       "tp_pct": 0.037617571318505905,
       "tag": "swmom"
+    },
+    "INJ-USDT-SWAP": {
+      "direction": "long",
+      "qty": 4093.0,
+      "entry": 6.303,
+      "sl": 5.586,
+      "tp": 7.348,
+      "opened_at": "2026-11-21T08:19:24+08:00",
+      "opened_ts": 1795220364.8708575,
+      "open_ms": 1795220364870,
+      "score": 0.7024898331404802,
+      "family": "oi",
+      "regime": "range",
+      "mom_score": 0.8620689655172413,
+      "oi_score": 0.4912416335504398,
+      "combined": 0.7024898331404802,
+      "atr": 0.6029147281320826,
+      "atr_pct": 0.0946788203725004,
+      "min_hold_sec": 86400,
+      "max_hold_sec": 172800,
+      "sl_pct": 0.11361458444700048,
+      "tp_pct": 0.1656879356518757,
+      "tag": "swoi"
     }
   },
   "day_start_equity": {},
@@ -77,7 +100,7 @@
     "ADA-USDT-SWAP": 1795186800000
   },
   "swing_start_equity": 10000.0,
-  "swing_peak_equity": 10317.302390441917,
+  "swing_peak_equity": 10343.432286241918,
   "swing_halted": false,
   "margin_cooldown": {},
   "margin_scale": {},
@@ -87,6 +110,6 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1795183601.9261186,
-  "swing_last_our_upl": -26.22599999999993
+  "swing_last_reconcile": 1795212935.3531227,
+  "swing_last_our_upl": -119.24670000000015
 }
