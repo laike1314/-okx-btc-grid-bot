@@ -4,14 +4,14 @@
   "symbol_cooldown": {
     "LIT-USDT-SWAP": 1794947700.787507,
     "ARB-USDT-SWAP": 1794286134.523534,
-    "BNB-USDT-SWAP": 1795229277.9750981,
+    "BNB-USDT-SWAP": 1795289624.6650658,
     "ICP-USDT-SWAP": 1794900102.6981492,
     "HBAR-USDT-SWAP": 1795075794.0178273,
     "ALGO-USDT-SWAP": 1795080999.3499117,
     "AAVE-USDT-SWAP": 1795102591.332444,
     "SUI-USDT-SWAP": 1795116210.602349,
     "XLM-USDT-SWAP": 1795143781.9186106,
-    "ADA-USDT-SWAP": 1795216596.8619213
+    "ADA-USDT-SWAP": 1795289625.1692395
   },
   "daily": {
     "2026-11-08": -7156.3569295,
@@ -21,12 +21,12 @@
     "2026-11-17": -62.8800860085,
     "2026-11-19": 178.92871319349985,
     "2026-11-20": 67.84818931868374,
-    "2026-11-21": 42.8474958
+    "2026-11-21": -29.82903508
   },
   "open_meta": {
     "TRX-USDT-SWAP": {
       "direction": "long",
-      "qty": 6.33,
+      "qty": 8.46,
       "entry": 0.304,
       "sl": 0.2868,
       "tp": 0.3155,
@@ -45,7 +45,8 @@
       "max_hold_sec": 86400,
       "sl_pct": 0.05642635697775886,
       "tp_pct": 0.037617571318505905,
-      "tag": "swmom"
+      "tag": "swmom",
+      "pos_id": "4116750739446988800"
     },
     "INJ-USDT-SWAP": {
       "direction": "long",
@@ -68,15 +69,61 @@
       "max_hold_sec": 172800,
       "sl_pct": 0.11361458444700048,
       "tp_pct": 0.1656879356518757,
-      "tag": "swoi"
+      "tag": "swoi",
+      "pos_id": "4117731544721817600"
+    },
+    "NEAR-USDT-SWAP": {
+      "direction": "long",
+      "qty": 90.9,
+      "entry": 2.793,
+      "sl": 2.479,
+      "tp": 3.25,
+      "opened_at": "2026-11-21T20:22:12+08:00",
+      "opened_ts": 1795263732.6655133,
+      "open_ms": 1795263732665,
+      "score": 0.6700328245508762,
+      "family": "oi",
+      "regime": "range",
+      "mom_score": 0.7241379310344827,
+      "oi_score": 0.5039877789150449,
+      "combined": 0.6700328245508762,
+      "atr": 0.2602898465738028,
+      "atr_pct": 0.09346134526886993,
+      "min_hold_sec": 86400,
+      "max_hold_sec": 172800,
+      "sl_pct": 0.11215361432264391,
+      "tp_pct": 0.16355735422052237,
+      "tag": "swoi",
+      "pos_id": "4119186768661610496"
+    },
+    "DOT-USDT-SWAP": {
+      "direction": "short",
+      "qty": 3932.1,
+      "entry": 0.646,
+      "sl": 0.666,
+      "tp": 0.624,
+      "opened_at": "2026-11-21T20:22:41+08:00",
+      "opened_ts": 1795263761.9049382,
+      "open_ms": 1795263761904,
+      "score": 0.6517241379310345,
+      "family": "momentum",
+      "regime": "trend",
+      "mom_score": 0.9310344827586207,
+      "oi_score": 0,
+      "combined": 0.6517241379310345,
+      "atr": 0.02152398518859606,
+      "atr_pct": 0.033474316000927,
+      "min_hold_sec": 43200,
+      "max_hold_sec": 86400,
+      "sl_pct": 0.0502114740013905,
+      "tp_pct": 0.033474316000927,
+      "tag": "swmom",
+      "pos_id": "4119187743954731008",
+      "peak_px": 0.644
     }
   },
   "day_start_equity": {},
   "pnl_events": [
-    {
-      "ts": 1795114981.918599,
-      "net": 6.441751278683742
-    },
     {
       "ts": 1795187796.8619092,
       "net": 61.40643804
@@ -84,20 +131,28 @@
     {
       "ts": 1795200477.975088,
       "net": 42.8474958
+    },
+    {
+      "ts": 1795260824.6650531,
+      "net": -30.7108746
+    },
+    {
+      "ts": 1795260825.1692243,
+      "net": -41.96565628
     }
   ],
   "last_entry_bar": {},
   "last_exit_trend_bar": {
     "LIT-USDT-SWAP": 1794917700000,
     "ARB-USDT-SWAP": 1794256200000,
-    "BNB-USDT-SWAP": 1795199400000,
+    "BNB-USDT-SWAP": 1795259700000,
     "ICP-USDT-SWAP": 1794870000000,
     "HBAR-USDT-SWAP": 1795045500000,
     "ALGO-USDT-SWAP": 1795050900000,
     "AAVE-USDT-SWAP": 1795072500000,
     "SUI-USDT-SWAP": 1795086000000,
     "XLM-USDT-SWAP": 1795113900000,
-    "ADA-USDT-SWAP": 1795186800000
+    "ADA-USDT-SWAP": 1795259700000
   },
   "swing_start_equity": 10000.0,
   "swing_peak_equity": 10343.432286241918,
@@ -110,6 +165,7 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1795212935.3531227,
-  "swing_last_our_upl": -119.24670000000015
+  "swing_last_reconcile": 1795245660.1581142,
+  "swing_last_our_upl": -92.5146000000001,
+  "residual_orders": {}
 }
