@@ -91,11 +91,47 @@ def monitor_positions(a):
     Net-TP 若在本轮平掉了仓，先把平仓记账完成，再把平仓后的持仓交回开仓逻辑，
     避免用平仓前的列表把刚平掉的合约当成「已有持仓」。
     """
-    positions = a["client"].positions()
+    if config.is_swing():
+        from agents.swing import apply_exchange_position, read_positions, settle_entry_residuals
+        positions, pos_err = read_positions(a["client"])
+        if pos_err:
+            a["journal"].log("swing", "pos_read_fail",
+                             f"读持仓失败，本轮不记账、不平仓、不开新仓: {pos_err}")
+            return None
+    else:
+        positions = a["client"].positions()
+    if config.is_swing():
+        try:
+            positions = settle_entry_residuals(a["client"], a["state"], a["journal"], positions)
+            changed = False
+            book = a["state"].d.setdefault("open_meta", {})
+            for p in positions:
+                meta = book.get(p.get("instId"))
+                if not meta:
+                    continue
+                if apply_exchange_position(meta, p, a["journal"]):
+                    changed = True
+                    ex = a.get("executor")
+                    if ex is not None and meta.get("sl"):
+                        ex.confirm_protection(
+                            p["instId"], meta.get("direction") or p.get("side"),
+                            meta.get("sl"), meta.get("tp"), p.get("qty"), p.get("posSide"),
+                            reason="qty_sync")
+            if changed:
+                a["state"].save()
+        except Exception as e:
+            a["journal"].log("swing", "qty_sync_err", f"持仓数量对齐失败: {e}")
     a["equity"].sync(positions)
     before = {p["instId"] for p in positions}
     a["net_tp"].check(positions)
-    after = a["client"].positions()
+    if config.is_swing():
+        after, after_err = read_positions(a["client"])
+        if after_err:
+            a["journal"].log("swing", "pos_read_fail",
+                             f"平仓后回读持仓失败，不把失败当成已经平仓: {after_err}")
+            return positions
+    else:
+        after = a["client"].positions()
     if {p["instId"] for p in after} != before:
         a["equity"].sync(after)
         return after
