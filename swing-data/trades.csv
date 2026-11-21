@@ -16,3 +16,5 @@ time,instId,direction,qty,entry,exit,gross_pnl,fee,funding,net_pnl,est_net,reaso
 2026-11-21T02:47:57+08:00,BNB-USDT-SWAP,short,246.0,549.7,540.1645299145299,44.626,-1.7785042,0.0,42.8475,,交易所止盈/止损 [momentum/trend],104724.2571,momentum,trend,0.6517241379310345
 2026-11-21T19:33:44+08:00,BNB-USDT-SWAP,short,486.0,526.5,532.5,-29.16,-1.805733,0.2548584,-30.7109,,交易所止盈/止损 [momentum/trend],105537.3992,momentum,trend,0.7
 2026-11-21T19:33:45+08:00,ADA-USDT-SWAP,short,183.67,0.1394,0.1416,-40.4074,-1.81245556,0.25419928,-41.9657,,交易所止盈/止损 [momentum/trend],105539.7009,momentum,trend,0.6517241379310345
+2026-11-22T01:36:50+08:00,DOT-USDT-SWAP,short,3932.1,0.646,0.668,-86.5062,-1.03335588,0.0,-87.5396,,交易所止盈/止损 [momentum/trend],105370.1052,momentum,trend,0.6517241379310345
+2026-11-22T01:36:55+08:00,TRX-USDT-SWAP,long,8.46,0.304,,,,,,,盈亏未验证，不计入虚拟权益 [momentum/trend],105370.7885,momentum,trend,0.9068965517241377
