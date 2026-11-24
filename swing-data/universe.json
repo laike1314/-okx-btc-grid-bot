@@ -28,15 +28,15 @@
     "PEPE-USDT-SWAP",
     "ENA-USDT-SWAP",
     "ASTER-USDT-SWAP",
-    "DOT-USDT-SWAP",
     "ICP-USDT-SWAP",
+    "DOT-USDT-SWAP",
     "ETC-USDT-SWAP",
     "SKY-USDT-SWAP",
     "ARB-USDT-SWAP",
     "JUP-USDT-SWAP",
     "ALGO-USDT-SWAP",
     "ATOM-USDT-SWAP",
-    "INJ-USDT-SWAP"
+    "LIT-USDT-SWAP"
   ],
   "stocks": [],
   "symbols": [
@@ -61,16 +61,16 @@
     "PEPE-USDT-SWAP",
     "ENA-USDT-SWAP",
     "ASTER-USDT-SWAP",
-    "DOT-USDT-SWAP",
     "ICP-USDT-SWAP",
+    "DOT-USDT-SWAP",
     "ETC-USDT-SWAP",
     "SKY-USDT-SWAP",
     "ARB-USDT-SWAP",
     "JUP-USDT-SWAP",
     "ALGO-USDT-SWAP",
     "ATOM-USDT-SWAP",
-    "INJ-USDT-SWAP"
+    "LIT-USDT-SWAP"
   ],
-  "instruments": 195,
+  "instruments": 196,
   "rank_error": ""
 }
