@@ -20,7 +20,8 @@
     "ETH-USDT-SWAP": 1795422364.1695623,
     "ETC-USDT-SWAP": 1795448992.710333,
     "LINK-USDT-SWAP": 1795450004.599738,
-    "ATOM-USDT-SWAP": 1795543324.0468724
+    "ATOM-USDT-SWAP": 1795543324.0468724,
+    "LTC-USDT-SWAP": 1795625234.0930114
   },
   "daily": {
     "2026-11-08": -7156.3569295,
@@ -36,33 +37,7 @@
     "2026-11-24": 172.85930800966094,
     "2026-11-25": -92.4868129163
   },
-  "open_meta": {
-    "LTC-USDT-SWAP": {
-      "direction": "long",
-      "qty": 63.2,
-      "entry": 40.7766,
-      "sl": 39.901,
-      "tp": 41.8526,
-      "opened_at": "2026-11-24T20:54:06+08:00",
-      "opened_ts": 1795524846.6571026,
-      "open_ms": 1795524846657,
-      "score": 0.6517241379310345,
-      "family": "momentum",
-      "regime": "trend",
-      "mom_score": 0.9310344827586208,
-      "oi_score": 0,
-      "combined": 0.6517241379310345,
-      "atr": 1.0892176228686303,
-      "atr_pct": 0.026386916808635696,
-      "min_hold_sec": 43200,
-      "max_hold_sec": 86400,
-      "sl_pct": 0.039580375212953545,
-      "tp_pct": 0.026386916808635696,
-      "tag": "swmom",
-      "pos_id": "4127948288841252864",
-      "peak_px": 40.9903
-    }
-  },
+  "open_meta": {},
   "day_start_equity": {},
   "pnl_events": [
     {
@@ -98,7 +73,8 @@
     "ETH-USDT-SWAP": 1795392000000,
     "ETC-USDT-SWAP": 1795419000000,
     "LINK-USDT-SWAP": 1795419900000,
-    "ATOM-USDT-SWAP": 1795513500000
+    "ATOM-USDT-SWAP": 1795513500000,
+    "LTC-USDT-SWAP": 1795595400000
   },
   "swing_start_equity": 10000.0,
   "swing_peak_equity": 10421.030103481917,
@@ -111,7 +87,7 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1795552897.3210168,
-  "swing_last_our_upl": -21.652320000000284,
+  "swing_last_reconcile": 1795596380.8006794,
+  "swing_last_our_upl": 0.0,
   "residual_orders": {}
 }
