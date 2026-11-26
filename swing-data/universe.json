@@ -32,11 +32,11 @@
     "ICP-USDT-SWAP",
     "SKY-USDT-SWAP",
     "ETC-USDT-SWAP",
+    "NIGHT-USDT-SWAP",
     "ARB-USDT-SWAP",
     "JUP-USDT-SWAP",
     "ALGO-USDT-SWAP",
-    "ATOM-USDT-SWAP",
-    "LIT-USDT-SWAP"
+    "ATOM-USDT-SWAP"
   ],
   "stocks": [],
   "symbols": [
@@ -65,12 +65,12 @@
     "ICP-USDT-SWAP",
     "SKY-USDT-SWAP",
     "ETC-USDT-SWAP",
+    "NIGHT-USDT-SWAP",
     "ARB-USDT-SWAP",
     "JUP-USDT-SWAP",
     "ALGO-USDT-SWAP",
-    "ATOM-USDT-SWAP",
-    "LIT-USDT-SWAP"
+    "ATOM-USDT-SWAP"
   ],
-  "instruments": 196,
+  "instruments": 197,
   "rank_error": ""
 }

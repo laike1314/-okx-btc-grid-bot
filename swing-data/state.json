@@ -85,6 +85,31 @@
       "tp_pct": 0.047960086023904086,
       "tag": "swoi",
       "pos_id": "4131766914165800960"
+    },
+    "LTC-USDT-SWAP": {
+      "direction": "long",
+      "qty": 59.4,
+      "entry": 43.6099,
+      "sl": 42.6414,
+      "tp": 44.6947,
+      "opened_at": "2026-11-26T13:30:47+08:00",
+      "opened_ts": 1795671047.1049569,
+      "open_ms": 1795671047104,
+      "score": 0.65,
+      "family": "momentum",
+      "regime": "trend",
+      "mom_score": 0.9285714285714286,
+      "oi_score": 0,
+      "combined": 0.65,
+      "atr": 1.0892768393375996,
+      "atr_pct": 0.024875013458269,
+      "min_hold_sec": 43200,
+      "max_hold_sec": 86400,
+      "sl_pct": 0.0373125201874035,
+      "tp_pct": 0.024875013458269,
+      "tag": "swmom",
+      "pos_id": "4132853963576868864",
+      "peak_px": 43.7307
     }
   },
   "day_start_equity": {},
@@ -136,7 +161,7 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1795636701.5482519,
-  "swing_last_our_upl": 54.80785999999969,
+  "swing_last_reconcile": 1795661588.9161568,
+  "swing_last_our_upl": 60.35019999999952,
   "residual_orders": {}
 }
