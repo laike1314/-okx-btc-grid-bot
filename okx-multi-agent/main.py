@@ -40,7 +40,7 @@ def _stop(*_):
 
 def build(mock, data_dir):
     os.makedirs(data_dir, exist_ok=True)
-    j = Journal(data_dir)
+    j = Journal(data_dir, replay=bool(mock))
     if mock:
         client = MockOkxClient()
         j.log("main", "mode", "离线冒烟测试模式（Mock 行情，不联网、不需要密钥）")
@@ -65,8 +65,78 @@ def build(mock, data_dir):
     return agents
 
 
+def format_run_activity(opens, closes):
+    """本轮开仓和平仓一览。没有平仓时净盈亏写 +0.00，不把账本里的旧成交算进来。"""
+    def score_of(row):
+        s = row.get("score")
+        if s is None or s == "":
+            return "分数 无"
+        try:
+            return f"分数 {float(s):.2f}"
+        except (TypeError, ValueError):
+            return f"分数 {s}"
+
+    def direction_of(row):
+        return row.get("direction") or "方向无"
+
+    close_left = {}
+    for c in closes or []:
+        key = (c.get("inst"), c.get("direction"))
+        close_left[key] = close_left.get(key, 0) + 1
+    open_bits = []
+    for o in opens or []:
+        key = (o.get("inst"), o.get("direction"))
+        if close_left.get(key, 0) > 0:
+            close_left[key] -= 1
+            tail = ""
+        else:
+            tail = " 未平仓"
+        open_bits.append(f"开 {o.get('inst')} {direction_of(o)} {score_of(o)}{tail}")
+    close_bits = []
+    verified = []
+    unverified = 0
+    for c in closes or []:
+        net = c.get("net")
+        if net is None or net == "":
+            pnl = "净盈亏 未验证"
+            unverified += 1
+        else:
+            net_f = float(net)
+            verified.append(net_f)
+            pnl = f"净盈亏 {net_f:+.2f}"
+        close_bits.append(f"平 {c.get('inst')} {direction_of(c)} {score_of(c)} {pnl}")
+    parts = open_bits + close_bits
+    body = "无开仓，无平仓" if not parts else "；".join(parts)
+    if not closes:
+        total = "平仓 0 笔，净盈亏 +0.00"
+    else:
+        total = f"平仓 {len(list(closes))} 笔，净盈亏 {sum(verified):+.2f}"
+        if unverified:
+            total += f"（{unverified} 笔未验证未计入）"
+    return f"本轮开平汇总：{body}。{total}"
+
+
+def _run_activity_self_check():
+    empty = format_run_activity([], [])
+    assert "无开仓" in empty and "无平仓" in empty and "净盈亏 +0.00" in empty, empty
+    held = format_run_activity(
+        [{"inst": "HBAR-USDT-SWAP", "direction": "long", "score": 0.77}], [])
+    assert "HBAR-USDT-SWAP" in held and "long" in held and "分数 0.77" in held, held
+    assert "未平仓" in held and "净盈亏 +0.00" in held and "平仓 0 笔" in held, held
+    flat = format_run_activity(
+        [{"inst": "ETH-USDT-SWAP", "direction": "short", "score": 0.66}],
+        [{"inst": "ETH-USDT-SWAP", "direction": "short", "score": 0.66, "net": 0}])
+    assert "ETH-USDT-SWAP" in flat and "short" in flat and "分数 0.66" in flat, flat
+    assert "净盈亏 +0.00" in flat and "平仓 1 笔" in flat and "未平仓" not in flat, flat
+    none_score = format_run_activity(
+        [], [{"inst": "SOL-USDT-SWAP", "direction": "long", "score": None, "net": None}])
+    assert "分数 无" in none_score and "净盈亏 未验证" in none_score, none_score
+    assert "净盈亏 +0.00" in none_score and "1 笔未验证未计入" in none_score, none_score
+
+
 def _offline_self_checks():
     """冒烟启动前跑纯本地断言。剥头皮断言固定在 scalp 下跑，避免 STRATEGY=swing_combo 串味。"""
+    from agents.journal import offline_self_check as journal_check
     from agents.risk import offline_self_check as risk_check
     from agents.net_tp import offline_self_check as mon_check
     from agents.executor import offline_self_check as exec_check
@@ -75,6 +145,8 @@ def _offline_self_checks():
     saved = config.STRATEGY
     config.STRATEGY = "scalp"
     try:
+        journal_check()
+        _run_activity_self_check()
         universe.offline_self_check()
         risk_check()
         mon_check()
@@ -320,6 +392,8 @@ def run(args):
                 if not wait_flat or not c.positions():
                     if config.is_swing():
                         j.log("main", "stop", "到达运行时长，波段持仓保留在交易所（止损止盈仍挂着）")
+                        j.log("main", "run_activity", format_run_activity(
+                            a["equity"].run_opens, a["equity"].run_closes))
                     else:
                         j.log("main", "stop", "到达运行时长" + ("，且已无持仓" if args.stop_after_flat else ""))
                     break

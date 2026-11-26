@@ -309,6 +309,7 @@ def migrate_swing_capital(state, journal, our_upl=None):
             f"trades.csv 和 daily 历史都保留。"
             f"起点 {prev_start} → {cap:.2f}，峰值 {prev_peak} → {state.d['swing_peak_equity']:.2f}。"
             f"此前本金设置 {prev_capital}。已有停机标记不自动解开。",
+            historical="migrate",
             capital=cap, virtual=round(veq, 4), upl=round(upl, 4),
             realized_basis=round(basis, 4), prev_start=prev_start, prev_peak=prev_peak,
             prev_capital=prev_capital, start=cap, peak=state.d["swing_peak_equity"])
@@ -731,6 +732,8 @@ def _virtual_capital_checks(j):
         assert "capital_migrate" in blob
         rows = [json.loads(line) for line in blob.splitlines() if line.strip()]
         assert any(r.get("event") == "capital_migrate" and r.get("capital") == 10000 for r in rows)
+        assert any(r.get("event") == "capital_migrate" and str(r.get("msg") or "").startswith("【历史迁移】")
+                   for r in rows)
     finally:
         jv.close()
 

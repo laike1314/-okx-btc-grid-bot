@@ -151,6 +151,9 @@ class EquityTracker:
         self.dir = data_dir
         self.known = set(self.s.d["open_meta"].keys())
         self._last_live = None
+        self._synced_once = False
+        self.run_opens = []
+        self.run_closes = []
         self.trades_csv = os.path.join(data_dir, "trades.csv")
         self.equity_csv = os.path.join(data_dir, "equity.csv")
         self.equity_json = os.path.join(data_dir, "equity.json")
@@ -180,10 +183,14 @@ class EquityTracker:
         if fill.get("close_reason"):
             self.s.d["open_meta"][inst]["close_reason"] = fill["close_reason"]
         self.known.add(inst)
+        self.run_opens.append({
+            "inst": inst, "direction": plan.get("direction"), "score": plan.get("score")})
         self.s.save()
         return True
 
     def sync(self, positions):
+        # 这一进程第一次对账时，账本里已经不在交易所的仓是上一轮留下的，不是本轮新平的。
+        startup = not self._synced_once
         positions = list(positions or [])
         live_ids, seen = [], set()
         for p in positions:
@@ -198,7 +205,7 @@ class EquityTracker:
             self.j.log(AGENT, "positions", f"交易所当前持仓 {len(live)} 个: {shown}")
         for inst in list(self.known - live):
             try:
-                self._on_closed(inst)
+                self._on_closed(inst, historical="cleanup" if startup else None)
             except Exception as e:
                 self.j.log(AGENT, "close_sync_error", f"{inst} 平仓记账失败，下轮重试: {e}", inst=inst)
         for p in positions:                       # 程序重启后接管已有仓位；逐个做，一笔失败不挡后面的
@@ -218,6 +225,7 @@ class EquityTracker:
                 except (TypeError, ValueError):
                     pass
             self.s.d["swing_last_our_upl"] = upl
+        self._synced_once = True
 
     def _adopt_if_needed(self, p):
         if p["instId"] in self.known:
@@ -248,11 +256,16 @@ class EquityTracker:
                    inst=p["instId"])
         self.s.save()
 
-    def _on_closed(self, inst):
+    def _on_closed(self, inst, historical=None):
+        def log(agent, event, msg, **fields):
+            if historical:
+                fields["historical"] = historical
+            self.j.log(agent, event, msg, **fields)
+
         meta = self.s.d["open_meta"].pop(inst, {})
         self.known.discard(inst)
         if float(meta.get("qty") or 0) <= 0:
-            self.j.log(AGENT, "skip_zero_close", f"{inst} 记录张数为 0，不写 trade_closed", inst=inst)
+            log(AGENT, "skip_zero_close", f"{inst} 记录张数为 0，不写 trade_closed", inst=inst)
             self.s.save()
             return
         from .risk import note_exit_trend_bar
@@ -271,9 +284,9 @@ class EquityTracker:
                 except Exception as e:
                     read_failed = True
                     rows = None
-                    self.j.log(AGENT, "pnl_read_fail",
-                               f"{inst} 平仓历史读取失败，不能把失败或其中一条当成完整盈亏: {e}",
-                               inst=inst)
+                    log(AGENT, "pnl_read_fail",
+                        f"{inst} 平仓历史读取失败，不能把失败或其中一条当成完整盈亏: {e}",
+                        inst=inst)
             if read_failed:
                 how = "read_failed"
                 res = None
@@ -306,22 +319,22 @@ class EquityTracker:
                 "uTime": res.get("uTime"), "posId": (res.get("posId") if isinstance(res, dict) else ""),
                 "closeQty": res.get("closeQty"), "pnl_source": how,
             }
-            self.j.log(AGENT, "pnl_unverified",
-                       f"{inst} 平仓历史不能唯一对上本次持仓（{how}）。"
-                       f"候选净盈亏 {candidate} 不计入虚拟权益，也不能当成最终准确值",
-                       inst=inst, pnl_unverified=True, candidate_net=candidate, **trace)
+            log(AGENT, "pnl_unverified",
+                f"{inst} 平仓历史不能唯一对上本次持仓（{how}）。"
+                f"候选净盈亏 {candidate} 不计入虚拟权益，也不能当成最终准确值",
+                inst=inst, pnl_unverified=True, candidate_net=candidate, **trace)
             res = None
         elif how == "latest_unverified":
-            self.j.log(AGENT, "pnl_unverified",
-                       f"{inst} 平仓历史不能唯一对上本次持仓，不计入虚拟权益",
-                       inst=inst, pnl_unverified=True, pnl_source=how, candidate_net=candidate)
+            log(AGENT, "pnl_unverified",
+                f"{inst} 平仓历史不能唯一对上本次持仓，不计入虚拟权益",
+                inst=inst, pnl_unverified=True, pnl_source=how, candidate_net=candidate)
         if how in ("matched", "summed") and res and float(res.get("closeQty") or 0) > 0:
             book_qty = float(meta.get("qty") or 0)
             exch_qty = float(res["closeQty"])
             if book_qty <= 0 or abs(book_qty - exch_qty) > max(1e-6, exch_qty * 1e-4):
-                self.j.log(AGENT, "close_qty",
-                           f"{inst} 平仓张数以交易所 closeTotalPos {exch_qty} 为准，账本原为 {book_qty}",
-                           inst=inst, book_qty=book_qty, exch_qty=exch_qty, pnl_source=how)
+                log(AGENT, "close_qty",
+                    f"{inst} 平仓张数以交易所 closeTotalPos {exch_qty} 为准，账本原为 {book_qty}",
+                    inst=inst, book_qty=book_qty, exch_qty=exch_qty, pnl_source=how)
                 meta["qty"] = exch_qty
             open_px = float(res.get("openAvgPx") or 0)
             if open_px > 0:
@@ -338,12 +351,12 @@ class EquityTracker:
             res = {"realizedPnl": net, "pnl": gross, "fee": fee, "fundingFee": 0.0,
                    "closeAvgPx": exit_px, "why": "估算"}
             reason = (meta.get("close_reason") or "平仓") + "（交易所盈亏未对齐，按成交价估算）"
-            self.j.log(AGENT, "pnl_estimated", f"{inst} 交易所盈亏不可用或为 0，按价格估算净盈亏 {net:+.2f}",
-                       inst=inst, est_net=net)
+            log(AGENT, "pnl_estimated", f"{inst} 交易所盈亏不可用或为 0，按价格估算净盈亏 {net:+.2f}",
+                inst=inst, est_net=net)
         else:
             net = 0.0
             reason = meta.get("close_reason") or "交易所止盈/止损"
-            self.j.log(AGENT, "pnl_unknown", f"{inst} 无法取得平仓盈亏，记 0 并保留原因 {reason}", inst=inst)
+            log(AGENT, "pnl_unknown", f"{inst} 无法取得平仓盈亏，记 0 并保留原因 {reason}", inst=inst)
         if meta.get("family"):
             reason = f"{reason} [{meta.get('family')}/{meta.get('regime') or '-'}]"
         try:
@@ -362,9 +375,13 @@ class EquityTracker:
                        combined=meta.get("combined"))
         self._append_trade(row)
         shown = "未验证" if net is None else f"{net:+.2f}"
-        self.j.log(AGENT, "trade_closed", f"{inst} 平仓（{reason}）净盈亏 {shown} USDT，权益 "
-                   f"{eq if eq is None else round(eq, 2)}", **row, pnl_source=how or "",
-                   pnl_unverified=bool(unverified), candidate_net=candidate)
+        if not historical:
+            self.run_closes.append({
+                "inst": inst, "direction": meta.get("direction"),
+                "score": meta.get("score"), "net": net})
+        log(AGENT, "trade_closed", f"{inst} 平仓（{reason}）净盈亏 {shown} USDT，权益 "
+            f"{eq if eq is None else round(eq, 2)}", **row, pnl_source=how or "",
+            pnl_unverified=bool(unverified), candidate_net=candidate)
         self.risk.on_trade_closed(inst, net)
         self.snapshot(eq)
 
@@ -487,5 +504,62 @@ def offline_self_check():
         assert len(rows) == 1
         assert abs(float(rows[0]["net_pnl"])) > 1
         assert float(rows[0]["qty"]) > 0
+    finally:
+        j.close()
+    _startup_cleanup_self_check()
+
+
+def _startup_cleanup_self_check():
+    """进程第一次对账补记的旧仓不算本轮平仓，日志要标成历史清理。之后本轮开平才计入。"""
+    import tempfile
+    from agents.journal import Journal
+    from agents.state import SharedState
+
+    d = tempfile.mkdtemp(prefix="ma-eq-startup-")
+    j = Journal(d, echo=False)
+
+    class C:
+        is_mock = True
+
+        def equity(self):
+            return 10000.0
+
+        def last_closed(self, inst):
+            return {"realizedPnl": 1.5, "pnl": 2, "fee": -0.5, "fundingFee": 0,
+                    "closeAvgPx": 101, "uTime": 10**13, "why": "超时平仓"}
+
+        def ticker(self, inst):
+            return {"bid": 101.0, "ask": 101.1, "last": 101.0}
+
+        def instrument(self, inst):
+            return {"ctVal": 0.01}
+
+    class Risk:
+        def on_trade_closed(self, inst, net):
+            return None
+
+    try:
+        st = SharedState(d, clock=lambda: 1000)
+        st.d["open_meta"]["ETH-USDT-SWAP"] = {
+            "direction": "long", "qty": 1, "entry": 100, "score": 0.7,
+            "open_ms": 1000, "opened_ts": 1}
+        eq = EquityTracker(C(), j, st, Risk(), d)
+        eq.sync([])
+        assert eq.run_opens == [] and eq.run_closes == []
+        text = open(j.jsonl.name, encoding="utf-8").read()
+        assert "【历史清理】" in text and "ETH-USDT-SWAP" in text and "超时平仓" in text
+        eq.register_open(
+            {"instId": "SOL-USDT-SWAP", "direction": "short", "score": 0.8, "sl": 1, "tp": 2},
+            {"qty": 2, "fill_px": 100})
+        assert eq.run_opens == [{"inst": "SOL-USDT-SWAP", "direction": "short", "score": 0.8}]
+        eq.sync([])
+        assert len(eq.run_closes) == 1
+        assert eq.run_closes[0]["inst"] == "SOL-USDT-SWAP"
+        assert eq.run_closes[0]["direction"] == "short"
+        assert eq.run_closes[0]["score"] == 0.8
+        assert abs(eq.run_closes[0]["net"] - 1.5) < 1e-6
+        rows = [json.loads(line) for line in open(j.jsonl.name, encoding="utf-8") if line.strip()]
+        sol = [r for r in rows if r.get("event") == "trade_closed" and "SOL-USDT-SWAP" in r.get("msg", "")]
+        assert sol and not sol[-1]["msg"].startswith("【历史"), sol[-1]["msg"]
     finally:
         j.close()
