@@ -37,7 +37,56 @@
     "2026-11-24": 172.85930800966094,
     "2026-11-25": -92.4868129163
   },
-  "open_meta": {},
+  "open_meta": {
+    "XLM-USDT-SWAP": {
+      "direction": "long",
+      "qty": 201.33,
+      "entry": 0.12742,
+      "sl": 0.12281,
+      "tp": 0.13414,
+      "opened_at": "2026-11-26T04:14:55+08:00",
+      "opened_ts": 1795637695.2361202,
+      "open_ms": 1795637695236,
+      "score": 0.7969988731099337,
+      "family": "oi",
+      "regime": "range",
+      "mom_score": 0.7241379310344827,
+      "oi_score": 0.6853678482851271,
+      "combined": 0.7969988731099337,
+      "atr": 0.003831920243850211,
+      "atr_pct": 0.030122791005818814,
+      "min_hold_sec": 86400,
+      "max_hold_sec": 172800,
+      "sl_pct": 0.03614734920698257,
+      "tp_pct": 0.05271488426018292,
+      "tag": "swoi",
+      "pos_id": "4131734860690653184"
+    },
+    "XRP-USDT-SWAP": {
+      "direction": "long",
+      "qty": 27.41,
+      "entry": 0.9353,
+      "sl": 0.9045,
+      "tp": 0.9802,
+      "opened_at": "2026-11-26T04:30:59+08:00",
+      "opened_ts": 1795638659.8918839,
+      "open_ms": 1795638659891,
+      "score": 0.7015595385352065,
+      "family": "oi",
+      "regime": "range",
+      "mom_score": 0.5862068965517242,
+      "oi_score": 0.6081392422424132,
+      "combined": 0.7015595385352065,
+      "atr": 0.025720308990533704,
+      "atr_pct": 0.027405763442230904,
+      "min_hold_sec": 86400,
+      "max_hold_sec": 172800,
+      "sl_pct": 0.03288691613067708,
+      "tp_pct": 0.047960086023904086,
+      "tag": "swoi",
+      "pos_id": "4131766914165800960"
+    }
+  },
   "day_start_equity": {},
   "pnl_events": [
     {
@@ -87,7 +136,7 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1795596380.8006794,
-  "swing_last_our_upl": 0.0,
+  "swing_last_reconcile": 1795636701.5482519,
+  "swing_last_our_upl": 54.80785999999969,
   "residual_orders": {}
 }
