@@ -3,7 +3,7 @@
   "global_cooldown_until": 0,
   "symbol_cooldown": {
     "LIT-USDT-SWAP": 1794947700.787507,
-    "ARB-USDT-SWAP": 1794286134.523534,
+    "ARB-USDT-SWAP": 1795865656.749677,
     "BNB-USDT-SWAP": 1795518444.9069676,
     "ICP-USDT-SWAP": 1795588266.6588223,
     "HBAR-USDT-SWAP": 1795075794.0178273,
@@ -21,7 +21,8 @@
     "ETC-USDT-SWAP": 1795448992.710333,
     "LINK-USDT-SWAP": 1795450004.599738,
     "ATOM-USDT-SWAP": 1795780898.3251173,
-    "LTC-USDT-SWAP": 1795776925.2948992
+    "LTC-USDT-SWAP": 1795776925.2948992,
+    "DOGE-USDT-SWAP": 1795866557.023674
   },
   "daily": {
     "2026-11-08": -7156.3569295,
@@ -39,55 +40,29 @@
     "2026-11-27": 102.6761087330303
   },
   "open_meta": {
-    "ARB-USDT-SWAP": {
-      "direction": "short",
-      "qty": 800.8,
-      "entry": 0.1139,
-      "sl": 0.1282,
-      "tp": 0.098,
-      "opened_at": "2026-11-27T23:29:22+08:00",
-      "opened_ts": 1795793362.5624564,
-      "open_ms": 1795793362562,
-      "score": 0.65,
-      "family": "momentum",
-      "regime": "trend",
-      "mom_score": 0.9285714285714286,
-      "oi_score": 0,
-      "combined": 0.65,
-      "atr": 0.015185429330427538,
-      "atr_pct": 0.13957196075760606,
-      "min_hold_sec": 43200,
-      "max_hold_sec": 86400,
-      "sl_pct": 0.2093579411364091,
-      "tp_pct": 0.13957196075760606,
-      "tag": "swmom",
-      "pos_id": "4136957797446221824",
-      "peak_px": 0.113
-    },
-    "DOGE-USDT-SWAP": {
+    "LTC-USDT-SWAP": {
       "direction": "long",
-      "qty": 44.86,
-      "entry": 0.0577,
-      "sl": 0.0567352,
-      "tp": 0.0589509,
-      "opened_at": "2026-11-27T23:44:54+08:00",
-      "opened_ts": 1795794294.1755307,
-      "open_ms": 1795794294175,
-      "score": 0.65,
+      "qty": 57.9,
+      "entry": 44.6995,
+      "sl": 43.0804,
+      "tp": 45.7789,
+      "opened_at": "2026-11-28T12:20:40+08:00",
+      "opened_ts": 1795839640.485888,
+      "open_ms": 1795839640485,
+      "score": 0.8360989587302671,
       "family": "momentum",
       "regime": "trend",
-      "mom_score": 0.9285714285714286,
-      "oi_score": 0,
-      "combined": 0.65,
-      "atr": 0.001275359225472485,
-      "atr_pct": 0.02167872217359315,
+      "mom_score": 0.7857142857142858,
+      "oi_score": 0.6203298624342236,
+      "combined": 0.8360989587302671,
+      "atr": 1.0771956830719511,
+      "atr_pct": 0.02414673894589493,
       "min_hold_sec": 43200,
       "max_hold_sec": 86400,
-      "sl_pct": 0.03251808326038973,
-      "tp_pct": 0.02167872217359315,
+      "sl_pct": 0.03622010841884239,
+      "tp_pct": 0.02414673894589493,
       "tag": "swmom",
-      "pos_id": "4136989359684485120",
-      "peak_px": 0.0580107
+      "pos_id": "4138511022708260864"
     }
   },
   "day_start_equity": {},
@@ -112,7 +87,7 @@
   "last_entry_bar": {},
   "last_exit_trend_bar": {
     "LIT-USDT-SWAP": 1794917700000,
-    "ARB-USDT-SWAP": 1794256200000,
+    "ARB-USDT-SWAP": 1795835700000,
     "BNB-USDT-SWAP": 1795488300000,
     "ICP-USDT-SWAP": 1795558500000,
     "HBAR-USDT-SWAP": 1795045500000,
@@ -130,7 +105,8 @@
     "ETC-USDT-SWAP": 1795419000000,
     "LINK-USDT-SWAP": 1795419900000,
     "ATOM-USDT-SWAP": 1795751100000,
-    "LTC-USDT-SWAP": 1795746600000
+    "LTC-USDT-SWAP": 1795746600000,
+    "DOGE-USDT-SWAP": 1795836600000
   },
   "swing_start_equity": 10000.0,
   "swing_peak_equity": 10421.030103481917,
@@ -143,7 +119,7 @@
   "swing_capital_usdt": 10000.0,
   "swing_capital_since": 1794674285.012799,
   "swing_realized_basis": -7001.610332689302,
-  "swing_last_reconcile": 1795792351.4875927,
-  "swing_last_our_upl": 3.7302559999998532,
+  "swing_last_reconcile": 1795822255.747972,
+  "swing_last_our_upl": -8.673419999999945,
   "residual_orders": {}
 }

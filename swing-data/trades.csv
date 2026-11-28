@@ -36,3 +36,5 @@ time,instId,direction,qty,entry,exit,gross_pnl,fee,funding,net_pnl,est_net,reaso
 2026-11-27T04:36:11+08:00,XRP-USDT-SWAP,long,27.41,0.9353,0.9531,48.7898,-1.81895501,-0.4425598694688618,46.5283,,信号变弱 [oi/range],107036.5682,oi,range,0.7015595385352065
 2026-11-27T10:55:25+08:00,LTC-USDT-SWAP,long,59.4,43.6099,44.6806734006734,63.60394,-1.845101612,-0.646823232,61.112,,交易所止盈/止损 [momentum/trend],106908.0347,momentum,trend,0.65
 2026-11-27T12:01:38+08:00,ATOM-USDT-SWAP,short,11.0,1.207,1.267,-0.66,-0.0096239,0.0020174,-0.6676,,交易所止盈/止损 [oi/range],106898.9199,oi,range,0.781862289369205
+2026-11-28T11:34:16+08:00,ARB-USDT-SWAP,short,800.8,0.1139,,,,,,,盈亏未验证，不计入虚拟权益 [momentum/trend],107592.9569,momentum,trend,0.65
+2026-11-28T11:49:17+08:00,DOGE-USDT-SWAP,long,44.86,0.0577,,,,,,,盈亏未验证，不计入虚拟权益 [momentum/trend],107598.8963,momentum,trend,0.65
